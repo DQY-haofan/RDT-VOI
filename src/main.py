@@ -9,6 +9,8 @@ from datetime import datetime
 import json
 import pickle
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -124,6 +126,124 @@ def run_milestone_m1(cfg, output_dir):
     return m1_summary
 
 
+def run_single_fold_parallel(args):
+    """
+    单个 fold 的包装函数，用于并行执行
+    """
+    fold_idx, train_idx, test_idx, geom, Q_pr, mu_pr, x_true, sensors, method_func, k, cv_dict, decision_config, seed = args
+
+    # 每个进程需要自己的 RNG
+    rng = np.random.default_rng(seed + fold_idx)
+
+    print(f"  Fold {fold_idx + 1}: Starting...")
+
+    from inference import compute_posterior, compute_posterior_variance_diagonal
+    from sensors import get_observation, assemble_H_R
+    from evaluation import compute_metrics, morans_i
+
+    # 选择传感器
+    selection_result = method_func(sensors, k, Q_pr)
+    selected_sensors = [sensors[i] for i in selection_result.selected_ids]
+
+    # 生成观测
+    y, H, R = get_observation(x_true, selected_sensors, rng)
+
+    # 计算后验
+    mu_post, factor = compute_posterior(Q_pr, mu_pr, H, R, y)
+
+    # 后验方差
+    var_post_test = compute_posterior_variance_diagonal(factor, test_idx)
+    sigma_post_test = np.sqrt(var_post_test)
+
+    sigma_post = np.zeros(len(mu_post))
+    sigma_post[test_idx] = sigma_post_test
+
+    # 计算指标
+    metrics = compute_metrics(
+        mu_post, sigma_post, x_true, test_idx, decision_config
+    )
+
+    # Moran's I
+    residuals = mu_post - x_true
+    I_stat, I_pval = morans_i(
+        residuals[test_idx],
+        geom.adjacency[test_idx][:, test_idx],
+        n_permutations=cv_dict.get('morans_permutations', 999),
+        rng=rng
+    )
+    metrics['morans_i'] = I_stat
+    metrics['morans_pval'] = I_pval
+
+    print(f"  Fold {fold_idx + 1}: RMSE={metrics['rmse']:.3f}, Loss=£{metrics['expected_loss_gbp']:.0f}")
+
+    return fold_idx, metrics, selection_result
+
+
+def run_cv_experiment_parallel(geom, Q_pr, mu_pr, x_true, sensors,
+                               selection_method, k, cv_config,
+                               decision_config, seed, n_workers=None):
+    """
+    并行版本的 CV 实验
+    """
+    from evaluation import spatial_block_cv
+
+    if hasattr(cv_config, '__dict__'):
+        cv_dict = cv_config.__dict__
+    else:
+        cv_dict = cv_config
+
+    # 生成 CV folds
+    corr_length = np.sqrt(8.0) / 0.08
+    buffer_width = cv_dict.get('buffer_width_multiplier', 1.5) * corr_length
+
+    folds = spatial_block_cv(
+        geom.coords,
+        cv_dict.get('k_folds', 5),
+        buffer_width,
+        cv_dict.get('block_strategy', 'kmeans'),
+        np.random.default_rng(seed)
+    )
+
+    # 准备并行任务
+    tasks = [
+        (fold_idx, train_idx, test_idx, geom, Q_pr, mu_pr, x_true,
+         sensors, selection_method, k, cv_dict, decision_config, seed)
+        for fold_idx, (train_idx, test_idx) in enumerate(folds)
+    ]
+
+    # 并行执行
+    if n_workers is None:
+        n_workers = min(len(folds), mp.cpu_count())
+
+    print(f"\n  Running {len(folds)} folds in parallel with {n_workers} workers...")
+
+    fold_results = [None] * len(folds)
+
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(run_single_fold_parallel, task): task[0]
+                   for task in tasks}
+
+        for future in as_completed(futures):
+            fold_idx, metrics, selection_result = future.result()
+            fold_results[fold_idx] = metrics
+
+    # 聚合结果
+    aggregated = {}
+    for key in fold_results[0].keys():
+        values = np.array([fr[key] for fr in fold_results])
+        aggregated[key] = {
+            'mean': values.mean(),
+            'std': values.std(),
+            'values': values
+        }
+
+    return {
+        'fold_results': fold_results,
+        'aggregated': aggregated,
+        'selection_result': selection_result
+    }
+
+
 def run_milestone_m2(cfg, output_dir):
     """
     Milestone M2: Baseline comparison with spatial CV.
@@ -168,10 +288,11 @@ def run_milestone_m2(cfg, output_dir):
             print(f"\nBudget k={k}")
 
             # Run CV experiment
-            cv_results = run_cv_experiment(
+            cv_results = run_cv_experiment_parallel(
                 geom, Q_pr, mu_pr, x_true, sensors,
                 method_func, k,
-                cfg.cv.__dict__, cfg.decision, rng
+                cfg.cv, cfg.decision, cfg.experiment.seed,
+                n_workers=19  # 使用 4 个 CPU 核心
             )
 
             all_results[method_name][k] = cv_results
