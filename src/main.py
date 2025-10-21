@@ -27,30 +27,71 @@ from visualization import (setup_style, plot_budget_curves, plot_marginal_mi,
 
 
 # ✅ 在顶层定义方法映射函数（可以被 pickle）
-def get_selection_method(method_name, geom=None, rng_seed=None):
+def get_selection_method(method_name: str, cfg, geom, rng_seed: int = None):
     """
-    根据方法名返回选择函数
+    获取选择方法的工厂函数
 
     Args:
         method_name: 方法名称
-        geom: 几何对象（Uniform 方法需要）
-        rng_seed: 随机种子（Random 方法需要）
+        cfg: 配置对象
+        geom: 几何对象
+        rng_seed: 随机种子
 
     Returns:
-        selection_function
+        selection_function: 选择函数
     """
+    from selection import greedy_mi, greedy_aopt, uniform_selection, random_selection
+
     if method_name == "Greedy-MI":
-        return lambda s, k, Q: greedy_mi(s, k, Q, lazy=True)
+        # 🔥 获取Greedy-MI参数
+        mi_params = cfg.selection.greedy_mi.copy()
+        batch_size = mi_params.get('batch_size', 64)
+        lazy = mi_params.get('lazy', True)
+
+        def mi_wrapper(sensors, k, Q_pr):
+            # 获取成本
+            costs = np.array([s.cost for s in sensors])
+            return greedy_mi(
+                sensors, k, Q_pr,
+                costs=costs,
+                lazy=lazy,
+                batch_size=batch_size
+            )
+
+        return mi_wrapper
+
     elif method_name == "Greedy-A":
-        return lambda s, k, Q: greedy_aopt(s, k, Q)
+        # 🔥 获取Greedy-A参数
+        aopt_params = cfg.selection.greedy_aopt.copy()
+        hutchpp_probes = aopt_params.get('hutchpp_probes', 20)
+        batch_size = aopt_params.get('batch_size', 32)
+        max_candidates = aopt_params.get('max_candidates', None)
+        early_stop_ratio = aopt_params.get('early_stop_ratio', 0.0)
+
+        def aopt_wrapper(sensors, k, Q_pr):
+            # 获取成本
+            costs = np.array([s.cost for s in sensors])
+            return greedy_aopt(
+                sensors, k, Q_pr,
+                costs=costs,
+                hutchpp_probes=hutchpp_probes,
+                batch_size=batch_size,
+                max_candidates=max_candidates,
+                early_stop_ratio=early_stop_ratio
+            )
+
+        return aopt_wrapper
+
     elif method_name == "Uniform":
         return lambda s, k, Q: uniform_selection(s, k, geom)
+
     elif method_name == "Random":
         rng = np.random.default_rng(rng_seed)
         return lambda s, k, Q: random_selection(s, k, rng)
+
     else:
         raise ValueError(f"Unknown method: {method_name}")
-
+    
 
 def run_single_fold_worker(args):
     """
