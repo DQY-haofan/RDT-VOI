@@ -151,6 +151,21 @@ class PlotsConfig:
     budget_curves: Dict[str, Any]
     performance_profile: Dict[str, float]
     critical_difference: Dict[str, Any]
+    expert_plots: Dict[str, Any] = None  # 🔥 新增字段（可选）
+
+    def __post_init__(self):
+        """处理可选的expert_plots字段"""
+        if self.expert_plots is None:
+            self.expert_plots = {
+                'enable_all': False,
+                'marginal_efficiency': {'enable': False},
+                'type_composition': {'enable': False},
+                'mi_voi_correlation': {'enable': False},
+                'calibration_plots': {'enable': False},
+                'spatial_diagnostics': {'enable': False},
+                'ablation_study': {'enable': False},
+                'sensor_placement_map': {'enable': False}
+            }
 
 
 @dataclass
