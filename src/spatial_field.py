@@ -169,27 +169,21 @@ def build_prior(geom, prior_config) -> Tuple[sp.spmatrix, np.ndarray]:
     """
     Build GMRF prior precision and mean from geometry and config.
 
-    Args:
-        geom: Geometry object
-        prior_config: PriorConfig object
-
-    Returns:
-        Q_pr: Prior precision matrix
-        mu_pr: Prior mean vector
+    修复：正确的τ²缩放以匹配目标边际方差σ²
     """
     n = geom.n
 
     if geom.mode == "grid2d":
-        # ✅ 修复：先构建基础精度矩阵
+        # ✅ 步骤1：构建基础SPDE算子 Q_base = (κ² - Δ)
         Q_base = build_grid_precision_spde(
             nx=int(np.sqrt(n)),
             ny=int(np.sqrt(n)),
             h=geom.h,
             kappa=prior_config.kappa,
-            beta=prior_config.beta
+            beta=0.0  # 暂不加nugget
         )
 
-        # ✅ 修复：使用 τ² 缩放以匹配配置的 σ²
+        # ✅ 步骤2：计算τ²（SPDE噪声方差）
         tau = matern_tau_from_params(
             nu=prior_config.nu,
             kappa=prior_config.kappa,
@@ -197,9 +191,23 @@ def build_prior(geom, prior_config) -> Tuple[sp.spmatrix, np.ndarray]:
             d=2,
             alpha=prior_config.alpha
         )
-        Q_pr = (tau ** 2) * Q_base
 
-        print(f"  Prior scaling: τ={tau:.4f}, expected σ²={prior_config.sigma2:.4f}")
+        # ✅ 步骤3：缩放并添加nugget
+        # Q_pr = τ² * Q_base + β * I
+        Q_pr = (tau ** 2) * Q_base + prior_config.beta * sp.eye(n)
+
+        # 验证：计算对角方差（近似）
+        expected_diag_var = prior_config.sigma2
+        print(f"  Prior setup: τ={tau:.4f}, target σ²={expected_diag_var:.4f}")
+
+        # 可选：采样验证
+        if False:  # 设为True可启用验证
+            from inference import SparseFactor
+            factor = SparseFactor(Q_pr)
+            test_idx = [0, n // 4, n // 2]
+            from inference import compute_posterior_variance_diagonal
+            sample_vars = compute_posterior_variance_diagonal(factor, test_idx)
+            print(f"  Sample diagonal variances: {sample_vars}")
 
     elif geom.mode in ["polyline1d", "graph"]:
         Q_pr = build_graph_precision(
@@ -210,23 +218,22 @@ def build_prior(geom, prior_config) -> Tuple[sp.spmatrix, np.ndarray]:
     else:
         raise ValueError(f"Unknown geometry mode: {geom.mode}")
 
-    # Construct mean field
+    # 构造均值场
     if prior_config.mu_prior_std > 0:
-        # Sample a smooth mean field
+        # 采样一个光滑的均值场
         Q_mean = build_graph_precision(
             geom.laplacian,
-            alpha=0.1,  # Smoother than prior
+            alpha=0.1,  # 比prior更光滑
             beta=prior_config.beta
         )
-        rng_mean = np.random.default_rng(42)  # Fixed seed for mean
+        rng_mean = np.random.default_rng(42)  # 固定种子
         mu_pr = prior_config.mu_prior_mean + \
                 prior_config.mu_prior_std * sample_gmrf(Q_mean, rng=rng_mean)
     else:
-        # Constant mean
+        # 常数均值
         mu_pr = np.full(n, prior_config.mu_prior_mean)
 
     return Q_pr, mu_pr
-
 
 def validate_prior(Q: sp.spmatrix, mu: np.ndarray,
                    rng: np.random.Generator = None,

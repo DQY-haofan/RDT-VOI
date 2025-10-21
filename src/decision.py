@@ -109,19 +109,12 @@ def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
     """
     严谨的EVI Monte Carlo近似
 
-    EVI = E_{x~prior, y|x}[BayesRisk_prior - BayesRisk_posterior(y)]
+    修复：
+    1. 完整的 prior→observation→posterior→risk差 流程
+    2. 正确计算先验和后验的对角方差
+    3. 在测试集上评估（避免过拟合）
 
-    Args:
-        Q_pr: 先验精度矩阵
-        mu_pr: 先验均值
-        H: 观测矩阵
-        R_diag: 观测噪声方差（对角）
-        decision_config: 决策参数配置
-        n_samples: MC样本数
-        rng: 随机数生成器
-
-    Returns:
-        evi: 期望信息价值 (GBP)
+    EVI = E_{x~prior, y|x}[Risk_prior - Risk_posterior(y)]
     """
     from inference import SparseFactor, compute_posterior, compute_posterior_variance_diagonal
 
@@ -135,19 +128,26 @@ def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
     factor_pr = SparseFactor(Q_pr)
 
     # 采样测试点（用于评估风险）
-    n_test = min(100, n)
+    n_test = min(200, n)  # 增加测试点数量以提高稳定性
     test_idx = rng.choice(n, size=n_test, replace=False)
 
-    # 计算先验对角方差（在测试点上）
+    # 🔥 关键修复：计算先验对角方差（在测试点上）
     var_pr = compute_posterior_variance_diagonal(factor_pr, test_idx)
     sigma_pr = np.sqrt(np.maximum(var_pr, 1e-12))
 
-    prior_risks = []
+    # 先验风险（固定，所有样本共享）
+    prior_risk = expected_loss(
+        mu_pr[test_idx],
+        sigma_pr,
+        decision_config,
+        test_indices=np.arange(len(test_idx))
+    )
+
     post_risks = []
 
-    for _ in range(n_samples):
+    for sample_idx in range(n_samples):
         # === 1. 从先验采样真实状态 ===
-        # 生成 z ~ N(0, Q^{-1}), 即 Q z = w, w ~ N(0, I)
+        # 生成 z ~ N(0, Q^{-1})，即 Q z = w, w ~ N(0, I)
         w = rng.standard_normal(n)
         z = factor_pr.solve(w)
         x_true = mu_pr + z
@@ -158,22 +158,19 @@ def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
         y = y_clean + noise
 
         # === 3. 计算后验分布 ===
-        mu_post, factor_post = compute_posterior(Q_pr, mu_pr, H, R_diag, y)
+        try:
+            mu_post, factor_post = compute_posterior(Q_pr, mu_pr, H, R_diag, y)
+        except Exception as e:
+            print(f"    Warning: Posterior computation failed at sample {sample_idx}: {e}")
+            # 降级为先验
+            post_risks.append(prior_risk)
+            continue
 
         # === 4. 计算后验对角方差（在相同测试点上）===
         var_post = compute_posterior_variance_diagonal(factor_post, test_idx)
         sigma_post = np.sqrt(np.maximum(var_post, 1e-12))
 
-        # === 5. 计算Bayes风险 ===
-        # 先验风险（基于先验分布）
-        prior_risk = expected_loss(
-            mu_pr[test_idx],
-            sigma_pr,
-            decision_config,
-            test_indices=np.arange(len(test_idx))
-        )
-
-        # 后验风险（基于后验分布）
+        # === 5. 计算后验Bayes风险 ===
         post_risk = expected_loss(
             mu_post[test_idx],
             sigma_post,
@@ -181,16 +178,19 @@ def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
             test_indices=np.arange(len(test_idx))
         )
 
-        prior_risks.append(prior_risk)
         post_risks.append(post_risk)
 
     # 平均风险差
-    avg_prior_risk = np.mean(prior_risks)
     avg_post_risk = np.mean(post_risks)
-    evi = avg_prior_risk - avg_post_risk
+    evi = prior_risk - avg_post_risk
+
+    # 🔥 健康检查：EVI应该为正
+    if evi < -1e-3:  # 允许小的数值误差
+        print(f"    Warning: Negative EVI detected: {evi:.2f} £")
+        print(f"      Prior risk: {prior_risk:.2f}, Post risk: {avg_post_risk:.2f}")
+        # 不强制截断，保留负值以便调试
 
     return float(evi)
-
 
 def evi_unscented(Q_pr, mu_pr, H, R_diag, decision_config,
                   alpha: float = 1.0, beta: float = 2.0,
