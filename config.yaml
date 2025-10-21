@@ -1,14 +1,6 @@
 # =====================================================================
 # 快速实验配置 - 针对Colab环境优化
 # =====================================================================
-#
-# 主要改动：
-# 1. 减少CV折数：5→3（减少40%计算）
-# 2. 减少预算点：6→4（减少33%计算）
-# 3. 优化选择算法参数
-# 4. 启用快速EVI近似
-#
-# 预期总耗时：从160h → 15h（10倍加速）
 
 experiment:
   name: rdt_fast_experiment
@@ -16,10 +8,10 @@ experiment:
   seed: 202501
 
 numerics:
-  linear_solver_tol: 1.0e-07  # 🔧 放宽（原1e-8）
-  cholesky_nugget: 1.0e-08    # 🔧 放宽（原1e-9）
+  linear_solver_tol: 1.0e-07
+  cholesky_nugget: 1.0e-08
   logdet_method: cholesky
-  pcg_max_iter: 500           # 🔧 减半（原1000）
+  pcg_max_iter: 500
 
 geometry:
   mode: grid2d
@@ -67,84 +59,122 @@ decision:
 selection:
   methods:
     - greedy_mi        # 必跑
-    # - greedy_aopt    # 🔧 注释掉（最慢的方法）
+    - greedy_aopt      # 🔥 启用但大幅优化
     - uniform          # 快速基线
     - random           # 快速基线
 
   budgets:
-    # - 5              # 🔧 删除小预算
     - 10
     - 20
     - 40
-    # - 60            # 🔧 删除大预算
-    # - 80
 
   greedy_mi:
     lazy: true
     cost_normalized: true
     warmstart_enum: false
-    batch_size: 64           # 🔥 新增：批量评估大小
+    batch_size: 64           # 批量评估大小
 
   greedy_aopt:
     lazy: true
     trace_estimator: hutchpp
-    hutchpp_probes: 10       # 🔧 减半（原20）
-    batch_size: 32           # 🔥 新增
+    hutchpp_probes: 5        # 🔥 减少到5（原10）
+    batch_size: 16           # 🔥 减少到16（原32）
+    max_candidates: 150      # 🔥 新增：只评估150个候选
+    early_stop_ratio: 0.15   # 🔥 新增：当最佳增益<初始15%时停止
 
 # =====================================================================
-# 🔥 EVI计算优化
+# EVI计算优化
 # =====================================================================
 evi:
   compute_for:
     - greedy_mi
   method: monte_carlo
-  monte_carlo_samples: 500   # 🔧 减半（原1000）
+  monte_carlo_samples: 500
   unscented_alpha: 1.0
   unscented_beta: 2.0
   unscented_kappa: 0.0
 
 # =====================================================================
-# 🔥 CV优化（最大加速点）
+# CV优化
 # =====================================================================
 cv:
   scheme: spatial_block
-  k_folds: 3                 # 🔧 减少（原5）
+  k_folds: 3
   buffer_width_multiplier: 1.5
   block_strategy: kmeans
   ensure_connected: true
 
 # =====================================================================
-# 🔥 UQ优化
+# UQ优化
 # =====================================================================
 uq:
   bootstrap_method: spatial_block
-  bootstrap_samples: 500     # 🔧 减半（原1000）
+  bootstrap_samples: 500
   confidence_level: 0.95
   coverage_percentile: 90
   compute_crps: false
 
 diagnostics:
   morans_i:
-    permutations: 499        # 🔧 减半（原999）
+    permutations: 499
     weight_type: adjacency
   calibration:
     compute_coverage: true
     compute_msse: true
 
+# =====================================================================
+# 🔥 增强的可视化配置（专家建议）
+# =====================================================================
 plots:
-  save_formats: [png]        # 🔧 只保存png（原png+pdf）
-  dpi: 150                   # 🔧 降低（原300）
+  save_formats: [png, pdf]   # 🔥 恢复pdf（论文需要）
+  dpi: 300                    # 🔥 恢复高分辨率
   style: seaborn-v0_8-paper
+
   budget_curves:
     show_ci: true
     metrics:
       - expected_loss
       - rmse
+      - coverage_90
+
   performance_profile:
     tau_max: 3.0
+
   critical_difference:
     alpha: 0.05
     test: nemenyi
+
+  # 🔥 新增：专家建议的图像
+  expert_plots:
+    enable_all: true           # 启用所有专家建议的图
+
+    marginal_efficiency:       # F2: 单位成本效率曲线
+      enable: true
+      show_cost_normalized: true
+
+    type_composition:          # F3: 传感器类型堆叠
+      enable: true
+      show_stacked: true
+
+    mi_voi_correlation:        # F4: MI vs VoI相关性
+      enable: true
+      compute_r2: true
+
+    calibration_plots:         # F5: 校准图
+      enable: true
+      coverage_curve: true
+      msse_distribution: true
+
+    spatial_diagnostics:       # F6: 空间诊断
+      enable: true
+      show_test_blocks: true
+
+    ablation_study:            # F8: 消融实验
+      enable: false            # 暂不启用（耗时）
+
+    sensor_placement_map:      # F10: 选址可视化
+      enable: true
+      show_budget_evolution: true
 
 logging:
   level: INFO
@@ -165,21 +195,3 @@ acceptance:
   m4_morans_alpha: 0.05
   m4_coverage_tolerance: 0.05
   m4_msse_tolerance: 0.2
-
-# =====================================================================
-# 计算量分析
-# =====================================================================
-#
-# 原配置：
-#   5 folds × 4 methods × 6 budgets = 120 experiments
-#   每个实验：k×N solve，k=80, N=1200
-#   预估：160小时（SPLU）
-#
-# 优化后：
-#   3 folds × 3 methods × 3 budgets = 27 experiments (-77%)
-#   每个实验：k×N/batch_size solve（批量）
-#   预估：15小时（SPLU + batch）→ 3小时（CHOLMOD + batch）
-#
-# 如需进一步加速：
-#   - 先跑M1（单折，快速验证）
-#   - 确认效果后再跑完整M2

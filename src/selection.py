@@ -173,16 +173,30 @@ def greedy_mi(sensors: List, k: int, Q_pr: sp.spmatrix,
 def greedy_aopt(sensors: List, k: int, Q_pr: sp.spmatrix,
                 costs: np.ndarray = None,
                 hutchpp_probes: int = 20,
-                batch_size: int = 32) -> SelectionResult:
+                batch_size: int = 32,
+                max_candidates: int = None,
+                early_stop_ratio: float = 0.0) -> SelectionResult:
     """
-    加速版Greedy-A-optimality
+    大幅加速版Greedy-A-optimality
 
-    优化：
-    1. Hutchinson++ 批量探针
-    2. 每T步重用探针（不用每步都采样）
-    3. 批量候选评估
+    新增优化：
+    1. max_candidates: 每步只评估前N个候选（空间近邻）
+    2. early_stop_ratio: 当增益<初始增益*ratio时停止
+    3. 进度输出：实时显示评估进度
+    4. 批量处理：减少factor构造次数
+
+    Args:
+        sensors: 候选传感器列表
+        k: 预算
+        Q_pr: 先验精度矩阵
+        costs: 传感器成本（可选）
+        hutchpp_probes: Hutchinson++探针数
+        batch_size: 批量评估大小
+        max_candidates: 每步最多评估的候选数（None=全部）
+        early_stop_ratio: 早停阈值（0=禁用）
     """
     from inference import SparseFactor, compute_posterior
+    import time
 
     n = Q_pr.shape[0]
     if costs is None:
@@ -194,56 +208,122 @@ def greedy_aopt(sensors: List, k: int, Q_pr: sp.spmatrix,
     marginal_gains = []
     total_cost = 0.0
 
-    # 初始trace估计
+    # 先验因子
     factor_pr = SparseFactor(Q_pr)
 
-    # 🔥 Hutchinson++: 预生成探针矩阵（重用多步）
+    # 预生成传感器坐标（用于空间筛选）
+    from geometry import Geometry
+    sensor_locations = np.array([sensors[i].idxs[0] for i in range(len(sensors))])
+
+    # Hutchinson++配置
     rng = np.random.default_rng(42)
-    probe_refresh_interval = 5  # 每5步刷新探针
+    probe_refresh_interval = 5
 
     current_trace = estimate_trace_hutchpp(factor_pr, hutchpp_probes, rng)
     print(f"  Initial trace estimate: {current_trace:.1f}")
 
+    initial_gain = None  # 用于early stop
+    step_times = []  # 记录每步耗时
+
     for step in range(k):
+        step_start = time.time()
+
         best_gain = -np.inf
         best_idx = -1
 
-        # 分批评估候选
+        # 🔥 候选筛选策略
         remaining = [i for i in range(len(sensors)) if i not in selected_ids]
 
-        for batch_start in range(0, len(remaining), batch_size):
-            batch_ids = remaining[batch_start:batch_start + batch_size]
+        if max_candidates and len(remaining) > max_candidates:
+            # 空间筛选：优先评估距离已选点较远的候选
+            if selected_ids:
+                # 计算每个候选到已选点的最小距离
+                selected_locs = sensor_locations[selected_ids]
+                remaining_locs = sensor_locations[remaining]
 
-            # 批量构建H矩阵
+                from scipy.spatial.distance import cdist
+                dists = cdist(remaining_locs.reshape(-1, 1),
+                              selected_locs.reshape(-1, 1))
+                min_dists = dists.min(axis=1)
+
+                # 选择距离最远的max_candidates个
+                top_indices = np.argsort(-min_dists)[:max_candidates]
+                remaining = [remaining[i] for i in top_indices]
+            else:
+                # 首步：随机采样
+                remaining = rng.choice(remaining, size=max_candidates, replace=False).tolist()
+
+        # 🔥 进度输出
+        print(f"  Step {step + 1}/{k}: Evaluating {len(remaining)} candidates "
+              f"(out of {len(sensors) - len(selected_ids)} remaining)...")
+
+        evaluated_count = 0
+        last_print_time = time.time()
+
+        # 分批评估
+        for batch_start in range(0, len(remaining), batch_size):
+            batch_end = min(batch_start + batch_size, len(remaining))
+            batch_ids = remaining[batch_start:batch_end]
+
+            # 🔥 每5秒或每100个候选输出一次进度
+            evaluated_count += len(batch_ids)
+            current_time = time.time()
+            if (current_time - last_print_time > 5.0) or (batch_end == len(remaining)):
+                progress_pct = 100 * evaluated_count / len(remaining)
+                elapsed = current_time - step_start
+                eta = elapsed / evaluated_count * (len(remaining) - evaluated_count)
+                print(f"    Progress: {evaluated_count}/{len(remaining)} "
+                      f"({progress_pct:.0f}%), ETA: {eta:.0f}s")
+                last_print_time = current_time
+
+            # 构造测试传感器集合
             test_sensors_list = []
             for cand_idx in batch_ids:
                 test_sensors_list.append(selected_sensors + [sensors[cand_idx]])
 
-            # 🔥 批量trace估计（复用探针）
+            # 刷新探针（每probe_refresh_interval步）
             if step % probe_refresh_interval == 0 or step == 0:
                 probes = generate_hutchpp_probes(n, hutchpp_probes, rng)
 
+            # 批量评估
             for cand_idx, test_sensors in zip(batch_ids, test_sensors_list):
                 from sensors import assemble_H_R
                 H_test, R_test = assemble_H_R(test_sensors, n)
 
-                # 快速trace估计
-                mu_post, factor_post = compute_posterior(
-                    Q_pr, np.zeros(n), H_test, R_test, np.zeros(len(test_sensors))
-                )
+                try:
+                    mu_post, factor_post = compute_posterior(
+                        Q_pr, np.zeros(n), H_test, R_test, np.zeros(len(test_sensors))
+                    )
 
-                new_trace = estimate_trace_hutchpp_with_probes(
-                    factor_post, probes
-                )
+                    new_trace = estimate_trace_hutchpp_with_probes(
+                        factor_post, probes
+                    )
 
-                gain = current_trace - new_trace
+                    gain = current_trace - new_trace
 
-                if gain > best_gain:
-                    best_gain = gain
-                    best_idx = cand_idx
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_idx = cand_idx
 
+                except Exception as e:
+                    # 数值问题：跳过该候选
+                    continue
+
+        # 检查是否找到有效候选
         if best_idx == -1:
+            print(f"  Warning: No valid candidate found at step {step + 1}")
             break
+
+        # 记录初始增益（用于early stop）
+        if step == 0:
+            initial_gain = best_gain
+
+        # 🔥 Early stop检查
+        if early_stop_ratio > 0 and initial_gain is not None:
+            if best_gain < initial_gain * early_stop_ratio:
+                print(f"  Early stopping at step {step + 1}: "
+                      f"gain {best_gain:.1f} < threshold {initial_gain * early_stop_ratio:.1f}")
+                break
 
         # 添加传感器
         selected_ids.append(best_idx)
@@ -255,8 +335,19 @@ def greedy_aopt(sensors: List, k: int, Q_pr: sp.spmatrix,
         current_trace -= best_gain
         objective_values.append(-current_trace)
 
-        if (step + 1) % 10 == 0:
-            print(f"  Step {step + 1}/{k}: Trace={current_trace:.1f}, Δ={best_gain:.1f}")
+        # 记录耗时
+        step_time = time.time() - step_start
+        step_times.append(step_time)
+
+        # 🔥 更详细的进度输出
+        avg_time = np.mean(step_times)
+        eta_total = avg_time * (k - step - 1)
+        print(f"  ✓ Step {step + 1}/{k} complete: "
+              f"Trace={current_trace:.1f}, ΔTrace={best_gain:.1f}, "
+              f"Sensor=#{best_idx}, Cost=£{total_cost:.0f}, "
+              f"Time={step_time:.1f}s (ETA: {eta_total / 60:.1f}min)")
+
+    print(f"  Total time: {sum(step_times) / 60:.1f} minutes")
 
     return SelectionResult(
         selected_ids=selected_ids,
