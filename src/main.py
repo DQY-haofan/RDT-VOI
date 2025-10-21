@@ -29,20 +29,29 @@ from visualization import (setup_style, plot_budget_curves, plot_marginal_mi,
 # ✅ 在顶层定义方法映射函数（可以被 pickle）
 def get_selection_method(method_name: str, geom, rng_seed: int = None):
     """
-    获取选择方法的工厂函数（无需cfg参数版本）
+    获取选择方法的工厂函数（硬编码优化参数版本）
 
-    直接硬编码优化参数
+    Args:
+        method_name: 方法名称 ("Greedy-MI" | "Greedy-A" | "Uniform" | "Random")
+        geom: 几何对象
+        rng_seed: 随机种子
+
+    Returns:
+        selection_function: (sensors, k, Q_pr) -> SelectionResult
     """
+    import numpy as np
     from selection import greedy_mi, greedy_aopt, uniform_selection, random_selection
 
     if method_name == "Greedy-MI":
         def mi_wrapper(sensors, k, Q_pr):
             costs = np.array([s.cost for s in sensors])
             return greedy_mi(
-                sensors, k, Q_pr,
+                sensors=sensors,
+                k=k,
+                Q_pr=Q_pr,
                 costs=costs,
                 lazy=True,
-                batch_size=64  # 硬编码
+                batch_size=64
             )
 
         return mi_wrapper
@@ -51,12 +60,14 @@ def get_selection_method(method_name: str, geom, rng_seed: int = None):
         def aopt_wrapper(sensors, k, Q_pr):
             costs = np.array([s.cost for s in sensors])
             return greedy_aopt(
-                sensors, k, Q_pr,
+                sensors=sensors,
+                k=k,
+                Q_pr=Q_pr,
                 costs=costs,
-                hutchpp_probes=3,  # 🔥 硬编码优化值
-                batch_size=8,  # 🔥 硬编码优化值
-                max_candidates=50,  # 🔥 硬编码优化值
-                early_stop_ratio=0.3  # 🔥 硬编码优化值
+                hutchpp_probes=3,  # 🔥 加速：从20减到3
+                batch_size=8,  # 🔥 加速：从32减到8
+                max_candidates=50,  # 🔥 加速：只评估50个候选
+                early_stop_ratio=0.3  # 🔥 加速：早停阈值
             )
 
         return aopt_wrapper
@@ -70,8 +81,6 @@ def get_selection_method(method_name: str, geom, rng_seed: int = None):
 
     else:
         raise ValueError(f"Unknown method: {method_name}")
-
-
 
 def run_single_fold_worker(args):
     """
