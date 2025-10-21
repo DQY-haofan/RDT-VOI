@@ -150,7 +150,23 @@ def compute_posterior(Q_pr: sp.spmatrix,
                       tol: float = 1e-8) -> Tuple[np.ndarray, SparseFactor]:
     """
     Compute Gaussian posterior for linear observation model.
-    ...
+
+    Posterior: N(μ_post, Σ_post) where
+        Q_post = Q_pr + H^T R^{-1} H
+        μ_post = Q_post^{-1} (H^T R^{-1} y + Q_pr μ_pr)
+
+    Args:
+        Q_pr: Prior precision (n × n sparse)
+        mu_pr: Prior mean (n,)
+        H: Observation matrix (m × n sparse)
+        R_diag: Observation noise variances (m,)
+        y: Observations (m,)
+        method: Solver method
+        tol: Solver tolerance
+
+    Returns:
+        mu_post: Posterior mean (n,)
+        factor: SparseFactor for Q_post
     """
     n, m = Q_pr.shape[0], len(y)
 
@@ -166,22 +182,21 @@ def compute_posterior(Q_pr: sp.spmatrix,
     factor = SparseFactor(Q_post, method=method)
     mu_post = factor.solve(rhs, tol=tol)
 
-    # Validate solution - 添加零检查
+    # ✅ 修复：Validate solution with zero-check
     residual = Q_post @ mu_post - rhs
     rhs_norm = np.linalg.norm(rhs)
 
-    if rhs_norm > 1e-14:  # ✅ 添加这个检查
+    if rhs_norm > 1e-14:
         rel_residual = np.linalg.norm(residual) / rhs_norm
         if rel_residual > tol:
             warnings.warn(f"High relative residual: {rel_residual:.2e} > {tol:.2e}")
     else:
-        # rhs 接近零，检查绝对残差
+        # rhs close to zero, check absolute residual
         abs_residual = np.linalg.norm(residual)
         if abs_residual > tol:
             warnings.warn(f"High absolute residual: {abs_residual:.2e} > {tol:.2e}")
 
     return mu_post, factor
-
 
 def compute_posterior_variance_diagonal(factor: SparseFactor,
                                        indices: np.ndarray = None) -> np.ndarray:

@@ -1,0 +1,382 @@
+F:\Anaconda_2025\envs\isac_dl\python.exe F:\Github-repositories\RDT-VOI\src\main.py 
+Found config at: F:\Github-repositories\RDT-VOI\config.yaml
+✓ Configuration validated: rdt_sensor_optimization_v1
+  Domain: grid2d, n=1600
+  Correlation length: 35.36 m
+  CV: 5-fold spatial_block
+  Methods: greedy_mi, greedy_aopt, uniform, random
+
+======================================================================
+ RDT-VoI SIMULATION: FULL EXPERIMENTAL PIPELINE
+======================================================================
+
+Experiment: rdt_sensor_optimization_v1
+Random seed: 202501
+Output directory: runs
+  Config saved to runs\rdt_sensor_optimization_v1_20251020_225448\config.yaml
+
+Output directory: runs\rdt_sensor_optimization_v1_20251020_225448
+
+============================================================
+MILESTONE M1: Small-scale validation
+============================================================
+Grid: 40×40 = 1600 locations
+F:\Github-repositories\RDT-VOI\src\spatial_field.py:162: SparseEfficiencyWarning: splu converted its input to CSC format
+  lu = spla.splu(Q)
+Sensor pool: 400 candidates
+
+Running Greedy-MI with budget k=40
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+  Step 10/40: MI=34.725, Δ=3.472, cost=£10
+  Step 20/40: MI=69.438, Δ=3.470, cost=£20
+  Step 30/40: MI=104.133, Δ=3.468, cost=£30
+  Step 40/40: MI=138.808, Δ=3.466, cost=£40
+  Saved: runs\rdt_sensor_optimization_v1_20251020_225448\curves\m1_marginal_voi_full.png
+
+------------------------------------------------------------
+M1 RESULTS:
+  Total steps: 40
+  Final MI: 138.808 nats
+  Monotonic increase: ✓ PASS
+  Diminishing returns: ✓ PASS
+
+  First 5 marginal gains: [np.float64(3.472674366221494), np.float64(3.4726651253097396), np.float64(3.4726645426936478), np.float64(3.472662792974958), np.float64(3.4726611924225708)]
+  Last 5 marginal gains: [np.float64(3.467709026077283), np.float64(3.46728580762688), np.float64(3.4672256029662236), np.float64(3.4668814744248015), np.float64(3.4663007800105654)]
+------------------------------------------------------------
+
+============================================================
+MILESTONE M2: Baseline comparison
+============================================================
+Grid: 40×40 = 1600 locations
+Sensor pool: 400 candidates
+
+============================================================
+Method: Greedy-MI
+============================================================
+
+Budget k=5
+F:\Anaconda_2025\envs\isac_dl\Lib\site-packages\sklearn\cluster\_kmeans.py:1419: UserWarning: KMeans is known to have a memory leak on Windows with MKL, when there are less chunks than available threads. You can avoid it by setting the environment variable OMP_NUM_THREADS=7.
+  warnings.warn(
+  Fold 1: train=767, test=379
+  Fold 2: train=915, test=276
+  Fold 3: train=769, test=378
+  Fold 4: train=915, test=276
+  Fold 5: train=551, test=291
+
+  Running 5 folds in parallel with 5 workers...
+    Fold 1: Starting...
+    Fold 2: Starting...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+    Fold 3: Starting...
+    Fold 4: Starting...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+    Fold 5: Starting...
+  Step 5/5: MI=17.363, Δ=3.473, cost=£5
+  Step 5/5: MI=17.363, Δ=3.473, cost=£5
+  Step 5/5: MI=17.363, Δ=3.473, cost=£5
+  Step 5/5: MI=17.363, Δ=3.473, cost=£5
+  Step 5/5: MI=17.363, Δ=3.473, cost=£5
+    Fold 2: RMSE=15.438, Loss=£6793
+    Fold 4: RMSE=17.293, Loss=£6794
+    Fold 5: RMSE=15.526, Loss=£6749
+    Fold 3: RMSE=20.659, Loss=£6842
+    Fold 1: RMSE=15.232, Loss=£6755
+F:\Anaconda_2025\envs\isac_dl\Lib\site-packages\sklearn\cluster\_kmeans.py:1419: UserWarning: KMeans is known to have a memory leak on Windows with MKL, when there are less chunks than available threads. You can avoid it by setting the environment variable OMP_NUM_THREADS=7.
+  warnings.warn(
+
+Budget k=10
+  Fold 1: train=767, test=379
+  Fold 2: train=915, test=276
+  Fold 3: train=769, test=378
+  Fold 4: train=915, test=276
+  Fold 5: train=551, test=291
+
+  Running 5 folds in parallel with 5 workers...
+    Fold 1: Starting...
+    Fold 2: Starting...
+    Fold 3: Starting...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+    Fold 4: Starting...
+    Fold 5: Starting...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+  Step 10/10: MI=34.725, Δ=3.472, cost=£10
+  Step 10/10: MI=34.725, Δ=3.472, cost=£10
+  Step 10/10: MI=34.725, Δ=3.472, cost=£10
+  Step 10/10: MI=34.725, Δ=3.472, cost=£10
+  Step 10/10: MI=34.725, Δ=3.472, cost=£10
+    Fold 2: RMSE=15.149, Loss=£6556
+    Fold 4: RMSE=17.073, Loss=£6728
+    Fold 5: RMSE=14.498, Loss=£6430
+    Fold 1: RMSE=15.153, Loss=£6538
+    Fold 3: RMSE=19.111, Loss=£5978
+
+Budget k=20
+F:\Anaconda_2025\envs\isac_dl\Lib\site-packages\sklearn\cluster\_kmeans.py:1419: UserWarning: KMeans is known to have a memory leak on Windows with MKL, when there are less chunks than available threads. You can avoid it by setting the environment variable OMP_NUM_THREADS=7.
+  warnings.warn(
+  Fold 1: train=767, test=379
+  Fold 2: train=915, test=276
+  Fold 3: train=769, test=378
+  Fold 4: train=915, test=276
+  Fold 5: train=551, test=291
+
+  Running 5 folds in parallel with 5 workers...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+    Fold 1: Starting...
+    Fold 2: Starting...
+    Fold 3: Starting...
+    Fold 4: Starting...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+    Fold 5: Starting...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+  Step 10/20: MI=34.725, Δ=3.472, cost=£10
+  Step 10/20: MI=34.725, Δ=3.472, cost=£10
+  Step 10/20: MI=34.725, Δ=3.472, cost=£10
+  Step 10/20: MI=34.725, Δ=3.472, cost=£10
+  Step 10/20: MI=34.725, Δ=3.472, cost=£10
+  Step 20/20: MI=69.438, Δ=3.470, cost=£20
+  Step 20/20: MI=69.438, Δ=3.470, cost=£20
+  Step 20/20: MI=69.438, Δ=3.470, cost=£20
+  Step 20/20: MI=69.438, Δ=3.470, cost=£20
+  Step 20/20: MI=69.438, Δ=3.470, cost=£20
+    Fold 4: RMSE=16.779, Loss=£6385
+    Fold 2: RMSE=13.385, Loss=£6156
+    Fold 5: RMSE=14.281, Loss=£6300
+    Fold 1: RMSE=15.093, Loss=£6452
+    Fold 3: RMSE=18.753, Loss=£5805
+
+Budget k=40
+F:\Anaconda_2025\envs\isac_dl\Lib\site-packages\sklearn\cluster\_kmeans.py:1419: UserWarning: KMeans is known to have a memory leak on Windows with MKL, when there are less chunks than available threads. You can avoid it by setting the environment variable OMP_NUM_THREADS=7.
+  warnings.warn(
+  Fold 1: train=767, test=379
+  Fold 2: train=915, test=276
+  Fold 3: train=769, test=378
+  Fold 4: train=915, test=276
+  Fold 5: train=551, test=291
+
+  Running 5 folds in parallel with 5 workers...
+    Fold 1: Starting...
+    Fold 2: Starting...
+    Fold 3: Starting...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+    Fold 4: Starting...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+    Fold 5: Starting...
+  Step 10/40: MI=34.725, Δ=3.472, cost=£10
+  Step 10/40: MI=34.725, Δ=3.472, cost=£10
+  Step 10/40: MI=34.725, Δ=3.472, cost=£10
+  Step 10/40: MI=34.725, Δ=3.472, cost=£10
+  Step 10/40: MI=34.725, Δ=3.472, cost=£10
+  Step 20/40: MI=69.438, Δ=3.470, cost=£20
+  Step 20/40: MI=69.438, Δ=3.470, cost=£20
+  Step 20/40: MI=69.438, Δ=3.470, cost=£20
+  Step 20/40: MI=69.438, Δ=3.470, cost=£20
+  Step 20/40: MI=69.438, Δ=3.470, cost=£20
+  Step 30/40: MI=104.133, Δ=3.468, cost=£30
+  Step 30/40: MI=104.133, Δ=3.468, cost=£30
+  Step 30/40: MI=104.133, Δ=3.468, cost=£30
+  Step 30/40: MI=104.133, Δ=3.468, cost=£30
+  Step 30/40: MI=104.133, Δ=3.468, cost=£30
+  Step 40/40: MI=138.808, Δ=3.466, cost=£40
+  Step 40/40: MI=138.808, Δ=3.466, cost=£40
+  Step 40/40: MI=138.808, Δ=3.466, cost=£40
+  Step 40/40: MI=138.808, Δ=3.466, cost=£40
+  Step 40/40: MI=138.808, Δ=3.466, cost=£40
+    Fold 2: RMSE=12.635, Loss=£5742
+    Fold 4: RMSE=15.147, Loss=£5434
+    Fold 5: RMSE=13.064, Loss=£4965
+    Fold 1: RMSE=14.749, Loss=£6049
+    Fold 3: RMSE=16.866, Loss=£4857
+
+Budget k=60
+F:\Anaconda_2025\envs\isac_dl\Lib\site-packages\sklearn\cluster\_kmeans.py:1419: UserWarning: KMeans is known to have a memory leak on Windows with MKL, when there are less chunks than available threads. You can avoid it by setting the environment variable OMP_NUM_THREADS=7.
+  warnings.warn(
+  Fold 1: train=767, test=379
+  Fold 2: train=915, test=276
+  Fold 3: train=769, test=378
+  Fold 4: train=915, test=276
+  Fold 5: train=551, test=291
+
+  Running 5 folds in parallel with 5 workers...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+    Fold 1: Starting...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+    Fold 2: Starting...
+    Fold 3: Starting...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+    Fold 4: Starting...
+    Fold 5: Starting...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+  Step 10/60: MI=34.725, Δ=3.472, cost=£10
+  Step 10/60: MI=34.725, Δ=3.472, cost=£10
+  Step 10/60: MI=34.725, Δ=3.472, cost=£10
+  Step 10/60: MI=34.725, Δ=3.472, cost=£10
+  Step 10/60: MI=34.725, Δ=3.472, cost=£10
+  Step 20/60: MI=69.438, Δ=3.470, cost=£20
+  Step 20/60: MI=69.438, Δ=3.470, cost=£20
+  Step 20/60: MI=69.438, Δ=3.470, cost=£20
+  Step 20/60: MI=69.438, Δ=3.470, cost=£20
+  Step 20/60: MI=69.438, Δ=3.470, cost=£20
+  Step 30/60: MI=104.133, Δ=3.468, cost=£30
+  Step 30/60: MI=104.133, Δ=3.468, cost=£30
+  Step 30/60: MI=104.133, Δ=3.468, cost=£30
+  Step 30/60: MI=104.133, Δ=3.468, cost=£30
+  Step 30/60: MI=104.133, Δ=3.468, cost=£30
+  Step 40/60: MI=138.808, Δ=3.466, cost=£40
+  Step 40/60: MI=138.808, Δ=3.466, cost=£40
+  Step 40/60: MI=138.808, Δ=3.466, cost=£40
+  Step 40/60: MI=138.808, Δ=3.466, cost=£40
+  Step 40/60: MI=138.808, Δ=3.466, cost=£40
+  Step 50/60: MI=173.455, Δ=3.464, cost=£50
+  Step 50/60: MI=173.455, Δ=3.464, cost=£50
+  Step 50/60: MI=173.455, Δ=3.464, cost=£50
+  Step 50/60: MI=173.455, Δ=3.464, cost=£50
+  Step 50/60: MI=173.455, Δ=3.464, cost=£50
+  Step 60/60: MI=208.065, Δ=3.459, cost=£60
+  Step 60/60: MI=208.065, Δ=3.459, cost=£60
+  Step 60/60: MI=208.065, Δ=3.459, cost=£60
+  Step 60/60: MI=208.065, Δ=3.459, cost=£60
+  Step 60/60: MI=208.065, Δ=3.459, cost=£60
+    Fold 4: RMSE=14.362, Loss=£4529
+    Fold 2: RMSE=12.097, Loss=£5530
+    Fold 5: RMSE=12.936, Loss=£4494
+    Fold 1: RMSE=14.463, Loss=£5598
+    Fold 3: RMSE=15.104, Loss=£3539
+F:\Anaconda_2025\envs\isac_dl\Lib\site-packages\sklearn\cluster\_kmeans.py:1419: UserWarning: KMeans is known to have a memory leak on Windows with MKL, when there are less chunks than available threads. You can avoid it by setting the environment variable OMP_NUM_THREADS=7.
+  warnings.warn(
+
+Budget k=80
+  Fold 1: train=767, test=379
+  Fold 2: train=915, test=276
+  Fold 3: train=769, test=378
+  Fold 4: train=915, test=276
+  Fold 5: train=551, test=291
+
+  Running 5 folds in parallel with 5 workers...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+    Fold 1: Starting...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+    Fold 2: Starting...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+    Fold 3: Starting...
+    Fold 4: Starting...
+    Fold 5: Starting...
+  Step 10/80: MI=34.725, Δ=3.472, cost=£10
+  Step 10/80: MI=34.725, Δ=3.472, cost=£10
+  Step 10/80: MI=34.725, Δ=3.472, cost=£10
+  Step 10/80: MI=34.725, Δ=3.472, cost=£10
+  Step 10/80: MI=34.725, Δ=3.472, cost=£10
+  Step 20/80: MI=69.438, Δ=3.470, cost=£20
+  Step 20/80: MI=69.438, Δ=3.470, cost=£20
+  Step 20/80: MI=69.438, Δ=3.470, cost=£20
+  Step 20/80: MI=69.438, Δ=3.470, cost=£20
+  Step 20/80: MI=69.438, Δ=3.470, cost=£20
+  Step 30/80: MI=104.133, Δ=3.468, cost=£30
+  Step 30/80: MI=104.133, Δ=3.468, cost=£30
+  Step 30/80: MI=104.133, Δ=3.468, cost=£30
+  Step 30/80: MI=104.133, Δ=3.468, cost=£30
+  Step 30/80: MI=104.133, Δ=3.468, cost=£30
+  Step 40/80: MI=138.808, Δ=3.466, cost=£40
+  Step 40/80: MI=138.808, Δ=3.466, cost=£40
+  Step 40/80: MI=138.808, Δ=3.466, cost=£40
+  Step 40/80: MI=138.808, Δ=3.466, cost=£40
+  Step 40/80: MI=138.808, Δ=3.466, cost=£40
+  Step 50/80: MI=173.455, Δ=3.464, cost=£50
+  Step 50/80: MI=173.455, Δ=3.464, cost=£50
+  Step 50/80: MI=173.455, Δ=3.464, cost=£50
+  Step 50/80: MI=173.455, Δ=3.464, cost=£50
+  Step 50/80: MI=173.455, Δ=3.464, cost=£50
+  Step 60/80: MI=208.065, Δ=3.459, cost=£60
+  Step 60/80: MI=208.065, Δ=3.459, cost=£60
+  Step 60/80: MI=208.065, Δ=3.459, cost=£60
+  Step 60/80: MI=208.065, Δ=3.459, cost=£60
+  Step 60/80: MI=208.065, Δ=3.459, cost=£60
+  Step 70/80: MI=242.620, Δ=3.453, cost=£70
+  Step 70/80: MI=242.620, Δ=3.453, cost=£70
+  Step 70/80: MI=242.620, Δ=3.453, cost=£70
+  Step 70/80: MI=242.620, Δ=3.453, cost=£70
+  Step 70/80: MI=242.620, Δ=3.453, cost=£70
+  Step 80/80: MI=277.071, Δ=3.438, cost=£80
+  Step 80/80: MI=277.071, Δ=3.438, cost=£80
+  Step 80/80: MI=277.071, Δ=3.438, cost=£80
+  Step 80/80: MI=277.071, Δ=3.438, cost=£80
+  Step 80/80: MI=277.071, Δ=3.438, cost=£80
+    Fold 2: RMSE=11.951, Loss=£5448
+    Fold 4: RMSE=14.084, Loss=£4270
+    Fold 5: RMSE=11.732, Loss=£4065
+    Fold 1: RMSE=13.597, Loss=£5044
+    Fold 3: RMSE=14.763, Loss=£3566
+
+============================================================
+Method: Greedy-A
+============================================================
+
+Budget k=5
+F:\Anaconda_2025\envs\isac_dl\Lib\site-packages\sklearn\cluster\_kmeans.py:1419: UserWarning: KMeans is known to have a memory leak on Windows with MKL, when there are less chunks than available threads. You can avoid it by setting the environment variable OMP_NUM_THREADS=7.
+  warnings.warn(
+  Fold 1: train=767, test=379
+  Fold 2: train=915, test=276
+  Fold 3: train=769, test=378
+  Fold 4: train=915, test=276
+  Fold 5: train=551, test=291
+
+  Running 5 folds in parallel with 5 workers...
+    Fold 1: Starting...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+    Fold 2: Starting...
+    Fold 3: Starting...
+    Fold 4: Starting...
+    Fold 5: Starting...
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")
+F:\Github-repositories\RDT-VOI\src\inference.py:37: UserWarning: cholmod not available, falling back to splu
+  warnings.warn("cholmod not available, falling back to splu")

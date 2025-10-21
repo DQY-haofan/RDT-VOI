@@ -32,7 +32,7 @@ def greedy_mi(sensors: List, k: int, Q_pr: sp.spmatrix,
         sensors: List of Sensor objects
         k: Budget (number of sensors)
         Q_pr: Prior precision matrix
-        costs: Optional cost vector (if None, uniform cost)
+        costs: Optional cost vector (if None, extract from sensors)
         lazy: Use lazy-greedy optimization
 
     Returns:
@@ -44,8 +44,10 @@ def greedy_mi(sensors: List, k: int, Q_pr: sp.spmatrix,
     n = Q_pr.shape[0]
     n_candidates = len(sensors)
 
+    # ✅ 修复：如果没有提供成本，从传感器对象中提取真实成本
     if costs is None:
-        costs = np.ones(n_candidates)
+        costs = np.array([s.cost for s in sensors], dtype=float)
+        print(f"  Using real sensor costs: min=£{costs.min():.0f}, max=£{costs.max():.0f}, mean=£{costs.mean():.0f}")
 
     # Initialize
     selected_ids = []
@@ -145,8 +147,8 @@ def greedy_mi(sensors: List, k: int, Q_pr: sp.spmatrix,
         objective_values.append(current_obj)
 
         if (step + 1) % 10 == 0 or step == k - 1:
-            print(f"  Step {step + 1}/{k}: MI={current_obj:.3f}, "
-                  f"Δ={best_gain:.3f}, cost=£{total_cost:.0f}")
+            print(f"  Step {step + 1}/{k}: MI={current_obj:.3f} nats ({current_obj/np.log(2):.2f} bits), "
+                  f"ΔMI={best_gain:.3f}, cost=£{total_cost:.0f}, sensor_type={sensors[best_idx].type_name}")
 
     return SelectionResult(
         selected_ids=selected_ids,

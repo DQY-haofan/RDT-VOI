@@ -73,10 +73,9 @@ def plot_budget_curves(results_by_method: Dict,
 
     print(f"  Saved: {output_path}")
 
-
-def plot_marginal_voi(selection_result, output_path: Path):
+def plot_marginal_mi(selection_result, output_path: Path):
     """
-    Plot marginal Value of Information curve.
+    Plot marginal Mutual Information curve (showing diminishing returns).
 
     Args:
         selection_result: SelectionResult object
@@ -85,14 +84,16 @@ def plot_marginal_voi(selection_result, output_path: Path):
     fig, ax = plt.subplots(figsize=(8, 5))
 
     steps = np.arange(1, len(selection_result.marginal_gains) + 1)
-    gains = selection_result.marginal_gains
+    gains_nats = np.array(selection_result.marginal_gains)
+    gains_bits = gains_nats / np.log(2)  # Convert to bits
 
-    ax.plot(steps, gains, marker='o', color='steelblue', linewidth=2)
-    ax.fill_between(steps, 0, gains, alpha=0.3, color='steelblue')
+    ax.plot(steps, gains_bits, marker='o', color='steelblue', linewidth=2, label='Marginal MI')
+    ax.fill_between(steps, 0, gains_bits, alpha=0.3, color='steelblue')
 
     ax.set_xlabel('Sensor Addition Step')
-    ax.set_ylabel('Marginal MI Gain (nats)')
+    ax.set_ylabel('Marginal MI Gain (bits)')
     ax.set_title(f'Diminishing Returns: {selection_result.method_name}')
+    ax.legend()
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()

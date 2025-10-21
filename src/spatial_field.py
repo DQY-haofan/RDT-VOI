@@ -180,13 +180,27 @@ def build_prior(geom, prior_config) -> Tuple[sp.spmatrix, np.ndarray]:
     n = geom.n
 
     if geom.mode == "grid2d":
-        Q_pr = build_grid_precision_spde(
+        # ✅ 修复：先构建基础精度矩阵
+        Q_base = build_grid_precision_spde(
             nx=int(np.sqrt(n)),
             ny=int(np.sqrt(n)),
             h=geom.h,
             kappa=prior_config.kappa,
             beta=prior_config.beta
         )
+
+        # ✅ 修复：使用 τ² 缩放以匹配配置的 σ²
+        tau = matern_tau_from_params(
+            nu=prior_config.nu,
+            kappa=prior_config.kappa,
+            sigma2=prior_config.sigma2,
+            d=2,
+            alpha=prior_config.alpha
+        )
+        Q_pr = (tau ** 2) * Q_base
+
+        print(f"  Prior scaling: τ={tau:.4f}, expected σ²={prior_config.sigma2:.4f}")
+
     elif geom.mode in ["polyline1d", "graph"]:
         Q_pr = build_graph_precision(
             L=geom.laplacian,
@@ -249,7 +263,8 @@ def validate_prior(Q: sp.spmatrix, mu: np.ndarray,
         'min_eigenvalue': min_eig,
         'is_spd': min_eig > 0,
         'mean_deviation': np.abs(emp_mean - mu).max(),
-        'empirical_std_range': (emp_std.min(), emp_std.max())
+        'empirical_std_range': (emp_std.min(), emp_std.max()),
+        'empirical_var_mean': (emp_std ** 2).mean()
     }
 
     return stats
@@ -271,9 +286,11 @@ if __name__ == "__main__":
 
     # Validate
     rng = cfg.get_rng()
-    stats = validate_prior(Q_pr, mu_pr, rng)
+    stats = validate_prior(Q_pr, mu_pr, rng, n_samples=50)
     print(f"  Min eigenvalue: {stats['min_eigenvalue']:.6f}")
     print(f"  Is SPD: {stats['is_spd']}")
+    print(f"  Empirical variance (mean): {stats['empirical_var_mean']:.4f}")
+    print(f"  Target σ²: {cfg.prior.sigma2:.4f}")
 
     # Sample true state
     x_true = sample_gmrf(Q_pr, mu_pr, rng)
