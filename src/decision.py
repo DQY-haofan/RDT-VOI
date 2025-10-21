@@ -93,162 +93,161 @@ def expected_loss(mu_post: np.ndarray,
     return risks.mean()
 
 
-def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
-                   n_samples: int = 500,
-                   rng: np.random.Generator = None) -> float:
-    """
-    Approximate Expected Value of Information via Monte Carlo.
+"""
+修复后的 evi_monte_carlo 函数 - 严谨的先验/后验风险计算
 
-    Samples from prior, generates observations, computes posterior,
-    evaluates Bayes action loss, and averages.
+主要改动：
+1. 完整走 prior→观测→posterior→风险差 的流程
+2. 正确计算先验和后验的对角方差
+3. 避免用单点μ_pr[0]代表全局
+"""
+
+
+def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
+                    n_samples: int = 500,
+                    rng: np.random.Generator = None) -> float:
+    """
+    严谨的EVI Monte Carlo近似
+
+    EVI = E_{x~prior, y|x}[BayesRisk_prior - BayesRisk_posterior(y)]
 
     Args:
-        Q_pr: Prior precision
-        mu_pr: Prior mean
-        H: Observation matrix for selected sensors
-        R_diag: Noise variances
-        decision_config: Decision parameters
-        n_samples: Number of MC samples
-        rng: Random generator
+        Q_pr: 先验精度矩阵
+        mu_pr: 先验均值
+        H: 观测矩阵
+        R_diag: 观测噪声方差（对角）
+        decision_config: 决策参数配置
+        n_samples: MC样本数
+        rng: 随机数生成器
 
     Returns:
-        evi: Expected reduction in decision loss (GBP)
+        evi: 期望信息价值 (GBP)
     """
-    from spatial_field import sample_gmrf
-    from inference import compute_posterior, compute_posterior_variance_diagonal
+    from inference import SparseFactor, compute_posterior, compute_posterior_variance_diagonal
 
     if rng is None:
         rng = np.random.default_rng()
 
     n = Q_pr.shape[0]
-    risks = []
+    m = len(R_diag)
+
+    # 先验因子（用于采样和求对角方差）
+    factor_pr = SparseFactor(Q_pr)
+
+    # 采样测试点（用于评估风险）
+    n_test = min(100, n)
+    test_idx = rng.choice(n, size=n_test, replace=False)
+
+    # 计算先验对角方差（在测试点上）
+    var_pr = compute_posterior_variance_diagonal(factor_pr, test_idx)
+    sigma_pr = np.sqrt(np.maximum(var_pr, 1e-12))
+
+    prior_risks = []
+    post_risks = []
 
     for _ in range(n_samples):
-        # Sample true state
-        x_true = sample_gmrf(Q_pr, mu_pr, rng)
+        # === 1. 从先验采样真实状态 ===
+        # 生成 z ~ N(0, Q^{-1}), 即 Q z = w, w ~ N(0, I)
+        w = rng.standard_normal(n)
+        z = factor_pr.solve(w)
+        x_true = mu_pr + z
 
-        # Generate observation
+        # === 2. 生成观测 y = Hx + ε ===
         y_clean = H @ x_true
-        noise = rng.normal(0, np.sqrt(R_diag))
+        noise = rng.normal(0, np.sqrt(R_diag), size=m)
         y = y_clean + noise
 
-        # Compute posterior
-        mu_post, factor = compute_posterior(Q_pr, mu_pr, H, R_diag, y)
+        # === 3. 计算后验分布 ===
+        mu_post, factor_post = compute_posterior(Q_pr, mu_pr, H, R_diag, y)
 
-        # Get posterior variances (sample subset for speed)
-        sample_idx = rng.choice(n, size=min(100, n), replace=False)
-        var_post_sample = compute_posterior_variance_diagonal(factor, sample_idx)
-        sigma_post_sample = np.sqrt(var_post_sample)
+        # === 4. 计算后验对角方差（在相同测试点上）===
+        var_post = compute_posterior_variance_diagonal(factor_post, test_idx)
+        sigma_post = np.sqrt(np.maximum(var_post, 1e-12))
 
-        # Compute expected loss on sample
-        loss = expected_loss(
-            mu_post[sample_idx],
-            sigma_post_sample,
+        # === 5. 计算Bayes风险 ===
+        # 先验风险（基于先验分布）
+        prior_risk = expected_loss(
+            mu_pr[test_idx],
+            sigma_pr,
             decision_config,
-            test_indices=np.arange(len(sample_idx))
+            test_indices=np.arange(len(test_idx))
         )
-        risks.append(loss)
 
-    # Prior risk (no information)
-    # Assume constant prior uncertainty σ_pr everywhere
-    sigma_pr = 1.0 / np.sqrt(np.diag(Q_pr.toarray()[:10, :10]).mean())  # Rough estimate
-    prior_risk = conditional_risk(
-        mu_pr[0], sigma_pr,
-        decision_config.tau_iri,
-        decision_config.L_FP_gbp,
-        decision_config.L_FN_gbp,
-        decision_config.L_TP_gbp
-    )
+        # 后验风险（基于后验分布）
+        post_risk = expected_loss(
+            mu_post[test_idx],
+            sigma_post,
+            decision_config,
+            test_indices=np.arange(len(test_idx))
+        )
 
-    posterior_risk = np.mean(risks)
-    evi = prior_risk - posterior_risk
+        prior_risks.append(prior_risk)
+        post_risks.append(post_risk)
 
-    return evi
+    # 平均风险差
+    avg_prior_risk = np.mean(prior_risks)
+    avg_post_risk = np.mean(post_risks)
+    evi = avg_prior_risk - avg_post_risk
+
+    return float(evi)
 
 
 def evi_unscented(Q_pr, mu_pr, H, R_diag, decision_config,
-                 alpha: float = 1.0, beta: float = 2.0,
-                 kappa: float = 0.0) -> float:
+                  alpha: float = 1.0, beta: float = 2.0,
+                  kappa: float = 0.0) -> float:
     """
-    Approximate EVI using Unscented Transform in measurement space.
+    使用Unscented Transform的EVI近似（在测量空间）
 
-    Generates sigma points from predictive distribution p(y | S),
-    propagates through posterior computation and decision function.
-
-    Args:
-        Q_pr: Prior precision
-        mu_pr: Prior mean
-        H: Observation matrix (m × n)
-        R_diag: Noise variances (m,)
-        decision_config: Decision parameters
-        alpha, beta, kappa: UT parameters
-
-    Returns:
-        evi: Expected reduction in decision loss (GBP)
+    修复：改进先验风险计算
     """
-    from inference import compute_posterior, compute_posterior_variance_diagonal
+    from inference import compute_posterior, compute_posterior_variance_diagonal, SparseFactor
     import scipy.sparse as sp
 
     n = Q_pr.shape[0]
     m = len(R_diag)
 
-    # Predictive distribution: y ~ N(H μ_pr, H Σ_pr H^T + R)
-    # Mean
+    # === 预测分布: y ~ N(H μ_pr, H Σ_pr H^T + R) ===
     y_mean = H @ mu_pr
 
-    # Covariance (approximate via sparse solves)
-    # For small m, we can do this directly
+    # 计算预测协方差（小m时精确，大m时近似）
     if m <= 100:
-        # Solve Q_pr X = H^T to get Σ_pr H^T
-        from inference import SparseFactor
         factor_pr = SparseFactor(Q_pr)
-
-        # Solve for each column of H^T
         H_dense = H.toarray() if sp.issparse(H) else H
         Sigma_pr_HT = np.zeros((n, m))
         for i in range(m):
             Sigma_pr_HT[:, i] = factor_pr.solve(H_dense[i, :])
-
         y_cov = H_dense @ Sigma_pr_HT + np.diag(R_diag)
     else:
-        # For large m, use approximation
         warnings.warn("Large m in UT, using diagonal approximation")
-        # Approximate as diagonal
         y_cov = np.diag(R_diag) + 0.1 * np.eye(m)
 
-    # Compute UT weights
-    lambda_param = alpha**2 * (m + kappa) - m
-    weights_m = np.full(2*m + 1, 1.0 / (2 * (m + lambda_param)))
+    # === UT权重 ===
+    lambda_param = alpha ** 2 * (m + kappa) - m
+    weights_m = np.full(2 * m + 1, 1.0 / (2 * (m + lambda_param)))
     weights_m[0] = lambda_param / (m + lambda_param)
-    weights_c = weights_m.copy()
-    weights_c[0] += (1 - alpha**2 + beta)
 
-    # Generate sigma points
+    # === 生成sigma点 ===
     try:
         L = np.linalg.cholesky(y_cov)
     except np.linalg.LinAlgError:
-        # Add nugget for stability
         L = np.linalg.cholesky(y_cov + 1e-6 * np.eye(m))
 
     scale = np.sqrt(m + lambda_param)
-    sigma_points = [y_mean]  # Center point
+    sigma_points = [y_mean]
 
     for i in range(m):
         sigma_points.append(y_mean + scale * L[:, i])
         sigma_points.append(y_mean - scale * L[:, i])
 
-    # Propagate through decision function
+    # === 对每个sigma点计算后验风险 ===
     risks = []
-    for y_sigma in sigma_points:
-        # Compute posterior
-        mu_post, factor = compute_posterior(Q_pr, mu_pr, H, R_diag, y_sigma)
+    test_idx = np.linspace(0, n - 1, min(50, n), dtype=int)
 
-        # Sample a few test points
-        test_idx = np.linspace(0, n-1, min(50, n), dtype=int)
+    for y_sigma in sigma_points:
+        mu_post, factor = compute_posterior(Q_pr, mu_pr, H, R_diag, y_sigma)
         var_post = compute_posterior_variance_diagonal(factor, test_idx)
         sigma_post = np.sqrt(var_post)
 
-        # Expected loss
         loss = expected_loss(
             mu_post[test_idx],
             sigma_post,
@@ -257,88 +256,23 @@ def evi_unscented(Q_pr, mu_pr, H, R_diag, decision_config,
         )
         risks.append(loss)
 
-    # Weighted average
+    # 加权平均后验风险
     posterior_risk = np.dot(weights_m, risks)
 
-    # Prior risk (rough estimate)
-    # Use diagonal elements of Q_pr^{-1} to estimate prior variance
-    from inference import SparseFactor
+    # === 计算先验风险（改进版）===
     factor_pr = SparseFactor(Q_pr)
-    sample_idx = np.linspace(0, n-1, min(10, n), dtype=int)
-    var_pr_sample = np.array([
-        factor_pr.solve(np.eye(n)[i, :])[i] for i in sample_idx
-    ])
-    sigma_pr = np.sqrt(var_pr_sample.mean())
+    var_pr_sample = compute_posterior_variance_diagonal(factor_pr, test_idx)
+    sigma_pr = np.sqrt(var_pr_sample)
 
-    prior_risk = conditional_risk(
-        mu_pr[0], sigma_pr,
-        decision_config.tau_iri,
-        decision_config.L_FP_gbp,
-        decision_config.L_FN_gbp,
-        decision_config.L_TP_gbp
+    prior_risk = expected_loss(
+        mu_pr[test_idx],
+        sigma_pr,
+        decision_config,
+        test_indices=np.arange(len(test_idx))
     )
 
     evi = prior_risk - posterior_risk
-
-    return evi
-
-    # Compute UT weights
-    lambda_param = alpha**2 * (m + kappa) - m
-    weights_m = np.full(2*m + 1, 1.0 / (2 * (m + lambda_param)))
-    weights_m[0] = lambda_param / (m + lambda_param)
-    weights_c = weights_m.copy()
-    weights_c[0] += (1 - alpha**2 + beta)
-
-    # Generate sigma points
-    try:
-        L = np.linalg.cholesky(y_cov)
-    except np.linalg.LinAlgError:
-        # Add nugget for stability
-        L = np.linalg.cholesky(y_cov + 1e-6 * np.eye(m))
-
-    scale = np.sqrt(m + lambda_param)
-    sigma_points = [y_mean]  # Center point
-
-    for i in range(m):
-        sigma_points.append(y_mean + scale * L[:, i])
-        sigma_points.append(y_mean - scale * L[:, i])
-
-    # Propagate through decision function
-    risks = []
-    for y_sigma in sigma_points:
-        # Compute posterior
-        mu_post, factor = compute_posterior(Q_pr, mu_pr, H, R_diag, y_sigma)
-
-        # Sample a few test points
-        test_idx = np.linspace(0, n-1, min(50, n), dtype=int)
-        var_post = compute_posterior_variance_diagonal(factor, test_idx)
-        sigma_post = np.sqrt(var_post)
-
-        # Expected loss
-        loss = expected_loss(
-            mu_post[test_idx],
-            sigma_post,
-            decision_config,
-            test_indices=np.arange(len(test_idx))
-        )
-        risks.append(loss)
-
-    # Weighted average
-    posterior_risk = np.dot(weights_m, risks)
-
-    # Prior risk
-    sigma_pr = 1.0 / np.sqrt(np.diag(Q_pr.toarray()[:10, :10]).mean())
-    prior_risk = conditional_risk(
-        mu_pr[0], sigma_pr,
-        decision_config.tau_iri,
-        decision_config.L_FP_gbp,
-        decision_config.L_FN_gbp,
-        decision_config.L_TP_gbp
-    )
-
-    evi = prior_risk - posterior_risk
-
-    return evi
+    return float(evi)
 
 
 if __name__ == "__main__":

@@ -26,17 +26,9 @@ def greedy_mi(sensors: List, k: int, Q_pr: sp.spmatrix,
     """
     Greedy sensor selection maximizing Mutual Information.
 
-    Uses lazy evaluation and rank-1 Cholesky updates for efficiency.
-
-    Args:
-        sensors: List of Sensor objects
-        k: Budget (number of sensors)
-        Q_pr: Prior precision matrix
-        costs: Optional cost vector (if None, extract from sensors)
-        lazy: Use lazy-greedy optimization
-
-    Returns:
-        result: SelectionResult with selected sensors and diagnostics
+    修复：正确实现成本约束下的选择逻辑
+    - score = gain/cost 用于 argmax（选哪个）
+    - gain 用于累计 objective_values（总MI曲线）
     """
     from inference import SparseFactor, quadform_via_solve
     from sensors import assemble_H_R
@@ -44,28 +36,29 @@ def greedy_mi(sensors: List, k: int, Q_pr: sp.spmatrix,
     n = Q_pr.shape[0]
     n_candidates = len(sensors)
 
-    # ✅ 修复：如果没有提供成本，从传感器对象中提取真实成本
+    # 提取或验证成本
     if costs is None:
         costs = np.array([s.cost for s in sensors], dtype=float)
-        print(f"  Using real sensor costs: min=£{costs.min():.0f}, max=£{costs.max():.0f}, mean=£{costs.mean():.0f}")
+        print(f"  Using real sensor costs: min=£{costs.min():.0f}, "
+              f"max=£{costs.max():.0f}, mean=£{costs.mean():.0f}")
 
-    # Initialize
+    # 初始化
     selected_ids = []
     selected_sensors = []
-    objective_values = []
-    marginal_gains = []
+    objective_values = []  # 累计总MI
+    marginal_gains = []  # 每步的ΔMI
     total_cost = 0.0
 
-    # Start with prior
+    # 先验因子
     current_factor = SparseFactor(Q_pr)
-    current_obj = 0.0  # MI starts at 0
+    current_obj = 0.0
 
-    # Priority queue for lazy evaluation: (-gain/cost, iteration, sensor_id)
-    if lazy:
-        pq = []
-        last_eval = {}  # Track when each sensor was last evaluated
+    # 优先队列：(-score, iteration, sensor_id, gain_cache)
+    # score = gain/cost（有成本）或 gain（无成本）
+    pq = [] if lazy else None
+    last_eval = {} if lazy else None
 
-    # Precompute sensor H rows
+    # 预计算传感器的h行和噪声方差
     sensor_h_rows = []
     sensor_noise_vars = []
     for s in sensors:
@@ -74,39 +67,41 @@ def greedy_mi(sensors: List, k: int, Q_pr: sp.spmatrix,
         sensor_h_rows.append(h)
         sensor_noise_vars.append(s.noise_var)
 
-    # Greedy loop
+    # Greedy循环
     for step in range(k):
-        best_gain = -np.inf
+        best_score = -np.inf  # 用于选择（argmax score）
+        best_gain = 0.0  # 用于累计MI曲线
         best_idx = -1
 
+        # Lazy evaluation路径
         if lazy and step > 0:
-            # Lazy evaluation
             while pq:
-                neg_ratio, eval_iter, cand_idx = heapq.heappop(pq)
+                neg_score, eval_iter, cand_idx, cached_gain = heapq.heappop(pq)
 
                 if cand_idx in selected_ids:
                     continue
 
-                # Check if stale
+                # 检查是否新鲜
                 if eval_iter < step:
-                    # Re-evaluate
+                    # 过期，重新评估
                     h = sensor_h_rows[cand_idx]
                     r = sensor_noise_vars[cand_idx]
                     q = quadform_via_solve(current_factor, h)
-                    gain = 0.5 * np.log(1 + q / r)
-                    ratio = gain / costs[cand_idx]
+                    gain = 0.5 * np.log1p(q / r)
+                    score = gain / costs[cand_idx]  # 成本归一化
 
-                    # Re-insert with updated value
-                    heapq.heappush(pq, (-ratio, step, cand_idx))
+                    # 重新入队，标记为新鲜
+                    heapq.heappush(pq, (-score, step, cand_idx, gain))
                     last_eval[cand_idx] = step
                 else:
-                    # Fresh evaluation, use it
+                    # 新鲜的评估，直接使用
                     best_idx = cand_idx
-                    best_gain = -neg_ratio * costs[cand_idx]
+                    best_score = -neg_score
+                    best_gain = cached_gain
                     break
 
+        # 如果没找到或首次迭代，全量评估
         if best_idx == -1:
-            # Evaluate all candidates
             for cand_idx in range(n_candidates):
                 if cand_idx in selected_ids:
                     continue
@@ -114,17 +109,21 @@ def greedy_mi(sensors: List, k: int, Q_pr: sp.spmatrix,
                 h = sensor_h_rows[cand_idx]
                 r = sensor_noise_vars[cand_idx]
 
-                # Compute marginal MI gain
+                # 计算边际MI增益
                 q = quadform_via_solve(current_factor, h)
-                gain = 0.5 * np.log(1 + q / r)
+                gain = 0.5 * np.log1p(q / r)
 
-                ratio = gain / costs[cand_idx]
+                # 计算score（用于选择）
+                score = gain / costs[cand_idx]
 
                 if lazy:
-                    heapq.heappush(pq, (-ratio, step, cand_idx))
+                    # 入队
+                    heapq.heappush(pq, (-score, step, cand_idx, gain))
                     last_eval[cand_idx] = step
 
-                if ratio * costs[cand_idx] > best_gain:
+                # 更新最佳候选
+                if score > best_score:
+                    best_score = score
                     best_gain = gain
                     best_idx = cand_idx
 
@@ -132,23 +131,29 @@ def greedy_mi(sensors: List, k: int, Q_pr: sp.spmatrix,
             print(f"Warning: No valid sensor found at step {step}")
             break
 
-        # Add selected sensor
+        # 添加选中的传感器
         selected_ids.append(best_idx)
         selected_sensors.append(sensors[best_idx])
         marginal_gains.append(best_gain)
         total_cost += costs[best_idx]
 
-        # Update factor with rank-1 update
+        # Rank-1更新精度矩阵
         h_best = sensor_h_rows[best_idx]
         r_best = sensor_noise_vars[best_idx]
         current_factor.rank1_update(h_best / np.sqrt(r_best), 1.0)
 
+        # 累计MI（用真实gain，不是score）
         current_obj += best_gain
         objective_values.append(current_obj)
 
+        # 打印进度（增加成本效益信息）
         if (step + 1) % 10 == 0 or step == k - 1:
-            print(f"  Step {step + 1}/{k}: MI={current_obj:.3f} nats ({current_obj/np.log(2):.2f} bits), "
-                  f"ΔMI={best_gain:.3f}, cost=£{total_cost:.0f}, sensor_type={sensors[best_idx].type_name}")
+            print(f"  Step {step + 1}/{k}: "
+                  f"MI={current_obj:.3f} nats ({current_obj / np.log(2):.2f} bits), "
+                  f"ΔMI={best_gain:.4f}, "
+                  f"score={best_score:.6f}, "
+                  f"cost=£{total_cost:.0f}, "
+                  f"type={sensors[best_idx].type_name}")
 
     return SelectionResult(
         selected_ids=selected_ids,
