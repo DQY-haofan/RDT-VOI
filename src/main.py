@@ -26,6 +26,19 @@ from visualization import (setup_style, plot_budget_curves, plot_marginal_mi,
                           plot_critical_difference)
 
 
+# 🔥 添加自定义JSON encoder
+class NumpyEncoder(json.JSONEncoder):
+    """处理numpy类型的JSON encoder"""
+    def default(self, obj):
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
 # ✅ 在顶层定义方法映射函数（可以被 pickle）
 def get_selection_method(method_name: str, geom, rng_seed: int = None):
     """
@@ -397,7 +410,7 @@ def run_milestone_m1(cfg, output_dir):
     }
 
     with open(output_dir / "m1_summary.json", 'w', encoding='utf-8') as f:
-        json.dump(m1_summary, f, indent=2)
+        json.dump(m1_summary, f, indent=2, cls=NumpyEncoder)
 
     return m1_summary
 
@@ -508,7 +521,8 @@ def run_milestone_m2(cfg, output_dir):
     }
 
     with open(output_dir / "m2_summary.json", 'w', encoding='utf-8') as f:
-        json.dump(m2_summary, f, indent=2)
+        json.dump(m2_summary, f, indent=2, cls=NumpyEncoder)
+
 
     return m2_summary, all_results
 
@@ -559,7 +573,7 @@ def run_full_experiment(cfg):
         }
 
         with open(output_dir / "final_summary.json", 'w', encoding='utf-8') as f:
-            json.dump(final_summary, f, indent=2)
+            json.dump(final_summary, f, indent=2, cls=NumpyEncoder)
 
         print(f"\n✓ Summary saved: {output_dir / 'final_summary.json'}")
 
