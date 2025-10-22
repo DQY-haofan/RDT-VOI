@@ -99,8 +99,25 @@ def get_selection_method(method_name: str, geom, rng_seed: int = None):
 def run_single_fold_worker(method_name, geom, Q_pr, mu_pr, x_true,
                            sensors, k, train_idx, test_idx,
                            decision_config, fold_idx, seed):
-    """单个fold的worker函数"""
+    """
+    单个fold的worker函数
 
+    Args:
+        method_name: 方法名称
+        geom: 几何对象
+        Q_pr, mu_pr: 先验参数
+        x_true: 真实状态
+        sensors: 候选传感器列表
+        k: 预算
+        train_idx: 训练集索引
+        test_idx: 测试集索引
+        decision_config: 决策配置
+        fold_idx: Fold索引
+        seed: 随机种子
+
+    Returns:
+        (fold_idx, metrics): Fold索引和指标字典
+    """
     print(f"    Fold {fold_idx + 1}: Starting...")
 
     # 获取方法
@@ -112,6 +129,7 @@ def run_single_fold_worker(method_name, geom, Q_pr, mu_pr, x_true,
 
     # 生成观测
     from sensors import get_observation
+    import numpy as np
     rng = np.random.default_rng(seed + fold_idx)
     y, H, R = get_observation(x_true, selected_sensors, rng)
 
@@ -119,25 +137,41 @@ def run_single_fold_worker(method_name, geom, Q_pr, mu_pr, x_true,
     from inference import compute_posterior, compute_posterior_variance_diagonal
     mu_post, factor = compute_posterior(Q_pr, mu_pr, H, R, y)
 
-    # 计算后验方差
+    # 计算后验方差（仅在测试集上）
     var_post_test = compute_posterior_variance_diagonal(factor, test_idx)
-    sigma_post_test = np.sqrt(var_post_test)
+    sigma_post_test = np.sqrt(np.maximum(var_post_test, 1e-12))
 
-    # 扩展到全数组
+    # 扩展到全数组（用于compute_metrics）
     sigma_post = np.zeros(len(mu_post))
     sigma_post[test_idx] = sigma_post_test
 
     # 计算指标
-    from evaluation import compute_metrics
+    from evaluation import compute_metrics, morans_i
     metrics = compute_metrics(
         mu_post, sigma_post, x_true, test_idx, decision_config
     )
 
-    # 🔥 关键修复：返回 selection_result
-    metrics['selection_result'] = selection_result  # 🔥 添加这行
-    metrics['mu_post'] = mu_post  # 🔥 添加这行（用于F6）
-    metrics['x_true'] = x_true  # 🔥 添加这行（用于F6）
-    metrics['test_idx'] = test_idx  # 🔥 添加这行（用于F6）
+    # 计算Moran's I
+    residuals = mu_post - x_true
+    try:
+        I_stat, I_pval = morans_i(
+            residuals[test_idx],
+            geom.adjacency[test_idx][:, test_idx],
+            n_permutations=499,
+            rng=rng
+        )
+        metrics['morans_i'] = float(I_stat)
+        metrics['morans_pval'] = float(I_pval)
+    except:
+        metrics['morans_i'] = 0.0
+        metrics['morans_pval'] = 1.0
+
+    # 🔥 保存额外数据用于可视化
+    metrics['selection_result'] = selection_result
+    metrics['mu_post'] = mu_post
+    metrics['x_true'] = x_true
+    metrics['test_idx'] = test_idx
+    metrics['fold_idx'] = fold_idx
 
     print(f"    Fold {fold_idx + 1}: RMSE={metrics['rmse']:.3f}, "
           f"Loss=£{metrics['expected_loss_gbp']:.0f}")
@@ -188,87 +222,96 @@ def serialize_sensors(sensors):
 
 def run_cv_experiment_parallel(geom, Q_pr, mu_pr, x_true, sensors,
                                method_name, k, cv_config,
-                               decision_config, seed, n_workers=None):
+                               decision_config, seed, n_workers=5):
     """
-    并行版本的 CV 实验
+    并行运行CV实验
 
     Args:
-        method_name: 方法名称字符串（如 "Greedy-MI"）
+        geom: 几何对象
+        Q_pr, mu_pr: 先验参数
+        x_true: 真实状态
+        sensors: 候选传感器池
+        method_name: 方法名称
+        k: 预算
+        cv_config: CV配置
+        decision_config: 决策配置
+        seed: 随机种子
+        n_workers: 并行worker数量
+
+    Returns:
+        results: CV结果字典
     """
-    if hasattr(cv_config, '__dict__'):
-        cv_dict = cv_config.__dict__
-    else:
-        cv_dict = cv_config
+    from evaluation import spatial_block_cv
+    import numpy as np
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    # 生成 CV folds
-    corr_length = np.sqrt(8.0) / 0.08
-    buffer_width = cv_dict.get('buffer_width_multiplier', 1.5) * corr_length
-
+    # 生成CV折
+    buffer_width = 15.0  # 或从 cv_config 获取
     folds = spatial_block_cv(
         geom.coords,
-        cv_dict.get('k_folds', 5),
-        buffer_width,
-        cv_dict.get('block_strategy', 'kmeans'),
-        np.random.default_rng(seed)
+        k_folds=cv_config.get('k_folds', 3),
+        buffer_width=buffer_width,
+        block_strategy=cv_config.get('block_strategy', 'kmeans'),
+        rng=np.random.default_rng(seed)
     )
-
-    # 序列化数据
-    geom_dict = serialize_geometry(geom)
-    Q_pr_data = serialize_sparse_matrix(Q_pr)
-    sensors_data = serialize_sensors(sensors)
-    decision_dict = decision_config.__dict__
-
-    # 准备并行任务
-    tasks = [
-        (fold_idx, train_idx, test_idx, geom_dict, Q_pr_data, mu_pr, x_true,
-         sensors_data, method_name, k, cv_dict, decision_dict, seed)
-        for fold_idx, (train_idx, test_idx) in enumerate(folds)
-    ]
-
-    # 并行执行
-    if n_workers is None:
-        n_workers = min(len(folds), max(1, mp.cpu_count() - 1))
 
     print(f"\n  Running {len(folds)} folds in parallel with {n_workers} workers...")
 
-    fold_results = [None] * len(folds)
-
+    # 提交所有任务
+    futures = []
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        futures = {executor.submit(run_single_fold_worker, task): task[0]
-                   for task in tasks}
+        for fold_idx, (train_idx, test_idx) in enumerate(folds):
+            # 🔥 关键修复：传递所有参数
+            future = executor.submit(
+                run_single_fold_worker,
+                method_name,  # 参数1
+                geom,  # 参数2
+                Q_pr,  # 参数3
+                mu_pr,  # 参数4
+                x_true,  # 参数5
+                sensors,  # 参数6
+                k,  # 参数7
+                train_idx,  # 参数8
+                test_idx,  # 参数9
+                decision_config,  # 参数10
+                fold_idx,  # 参数11
+                seed  # 参数12
+            )
+            futures.append(future)
 
+        # 收集结果
+        fold_results = []
         for future in as_completed(futures):
-            fold_idx, metrics = future.result()
-            fold_results[fold_idx] = metrics
+            try:
+                fold_idx, metrics = future.result()
+                fold_results.append(metrics)
+            except Exception as e:
+                print(f"\n✗ ERROR: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+
+    # 按fold_idx排序
+    # fold_results.sort(key=lambda x: x.get('fold_idx', 0))
 
     # 聚合结果
     aggregated = {}
     for key in fold_results[0].keys():
-        if key in ['selection_result', 'mu_post', 'x_true', 'test_idx']:
+        # 跳过非数值字段
+        if key in ['selection_result', 'mu_post', 'x_true', 'test_idx', 'fold_idx']:
             continue
+
         values = np.array([fr[key] for fr in fold_results])
         aggregated[key] = {
-            'mean': values.mean(),
-            'std': values.std(),
-            'values': values
+            'mean': float(values.mean()),
+            'std': float(values.std()),
+            'values': values.tolist()
         }
-
-    # 返回一个简化的 selection_result（因为我们不需要它的详细信息）
-    from selection import SelectionResult
-    selection_result = SelectionResult(
-        selected_ids=[],
-        objective_values=[],
-        marginal_gains=[],
-        total_cost=0.0,
-        method_name=method_name
-    )
 
     return {
         'fold_results': fold_results,
-        'aggregated': aggregated,
-        'selection_result': selection_result
+        'aggregated': aggregated
     }
-
 
 def create_output_dir(cfg) -> Path:
     """Create timestamped output directory."""
@@ -407,10 +450,17 @@ def run_milestone_m2(cfg, output_dir):
 
             # 使用并行版本
             cv_results = run_cv_experiment_parallel(
-                geom, Q_pr, mu_pr, x_true, sensors,
-                method_name, k,
-                cfg.cv, cfg.decision, cfg.experiment.seed,
-                n_workers=5  # 使用 5 个worker（对应 5 个 fold）
+                geom=geom,
+                Q_pr=Q_pr,
+                mu_pr=mu_pr,
+                x_true=x_true,
+                sensors=sensors,
+                method_name=method_name,
+                k=k,
+                cv_config=cfg.cv.__dict__,  # 或直接传cfg.cv
+                decision_config=cfg.decision,
+                seed=cfg.experiment.seed,
+                n_workers=5
             )
 
             all_results[method_name][k] = cv_results
