@@ -12,6 +12,7 @@ F10. 选址可视化地图
 
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 from matplotlib.patches import Rectangle
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -35,80 +36,100 @@ def setup_style(style: str = "seaborn-v0_8-paper"):
 
 # ========== F1: 预算-损失前沿（已有，增强版） ==========
 
-def plot_budget_curves(results_by_method: Dict,
-                       metric: str,
-                       output_path: Path,
-                       show_ci: bool = True,
-                       highlight_optimal: bool = True):
+def plot_budget_curves(df_results: pd.DataFrame,
+                       output_dir: Path = None,
+                       config=None) -> plt.Figure:
     """
-    预算-经济损失前沿图（增强版）
+    Plot performance metrics vs budget for all methods.
 
-    新增：
-    - 标注拐点
-    - 标注最佳工程区间
-    - 单位标注
+    Args:
+        df_results: DataFrame with aggregated results
+        output_dir: Directory to save plots
+        config: Configuration object
+
+    Returns:
+        Figure object
     """
-    fig, ax = plt.subplots(figsize=(8, 5))
+    # 从 config 中获取要绘制的指标
+    if config and hasattr(config.plots, 'budget_curves'):
+        metrics_to_plot = config.plots.budget_curves.get('metrics',
+                                                         ['rmse', 'expected_loss_gbp', 'coverage_90'])
+    else:
+        metrics_to_plot = ['rmse', 'expected_loss_gbp', 'coverage_90']
 
-    method_colors = {
-        'Greedy-MI': '#1f77b4',
-        'Greedy-A': '#ff7f0e',
-        'Uniform': '#2ca02c',
-        'Random': '#d62728'
-    }
+    # 过滤 DataFrame
+    df_plot = df_results[df_results['metric'].isin(metrics_to_plot)]
 
-    for method_name, budget_results in results_by_method.items():
-        budgets = sorted(budget_results.keys())
-        means = []
-        lowers = []
-        uppers = []
+    if df_plot.empty:
+        warnings.warn("No data to plot in budget curves")
+        return None
 
-        for k in budgets:
-            agg = budget_results[k]['aggregated'][metric]
-            means.append(agg['mean'])
-            if show_ci and 'ci_lower' in agg:
-                lowers.append(agg['ci_lower'])
-                uppers.append(agg['ci_upper'])
+    # 创建子图
+    n_metrics = len(metrics_to_plot)
+    fig, axes = plt.subplots(1, n_metrics, figsize=(6 * n_metrics, 5))
 
-        color = method_colors.get(method_name, None)
-        line = ax.plot(budgets, means, marker='o', label=method_name,
-                      linewidth=2.5, color=color, markersize=8)
+    if n_metrics == 1:
+        axes = [axes]
 
-        if show_ci and lowers:
-            ax.fill_between(budgets, lowers, uppers, alpha=0.2, color=color)
+    # 颜色方案
+    methods = df_plot['method'].unique()
+    colors = sns.color_palette('Set2', n_colors=len(methods))
+    method_colors = dict(zip(methods, colors))
 
-        # 🔥 标注起点和终点数值
-        ax.text(budgets[0], means[0], f'{means[0]:.0f}',
-               fontsize=8, ha='right', va='bottom')
-        ax.text(budgets[-1], means[-1], f'{means[-1]:.0f}',
-               fontsize=8, ha='left', va='top')
+    # 为每个指标绘图
+    for idx, metric in enumerate(metrics_to_plot):
+        ax = axes[idx]
+        df_metric = df_plot[df_plot['metric'] == metric]
 
-    ax.set_xlabel('Sensor Budget $k$', fontweight='bold')
+        for method in methods:
+            df_method = df_metric[df_metric['method'] == method]
 
-    metric_labels = {
-        'expected_loss_gbp': 'Expected Economic Loss (£)',
-        'rmse': 'RMSE (m/km)',
-        'mae': 'MAE (m/km)',
-        'r2': '$R^2$',
-        'coverage_90': '90% Coverage Rate'
-    }
-    ax.set_ylabel(metric_labels.get(metric, metric), fontweight='bold')
+            if df_method.empty:
+                continue
 
-    ax.legend(loc='best', frameon=True, shadow=True)
-    ax.grid(True, alpha=0.3, linestyle='--')
+            # 按 budget 排序
+            df_method = df_method.sort_values('budget')
 
-    # 🔥 标题说明
-    ax.set_title('Budget–Loss Frontier with 95% Block-Bootstrap CIs\n'
-                'Methods share identical spatial folds and seeds',
-                fontsize=11)
+            # 绘制主曲线
+            ax.plot(
+                df_method['budget'],
+                df_method['mean'],
+                marker='o',
+                linewidth=2,
+                markersize=6,
+                label=method.replace('_', ' ').title(),
+                color=method_colors[method]
+            )
+
+            # 添加置信区间
+            if config and hasattr(config.plots.budget_curves, 'show_confidence'):
+                if config.plots.budget_curves['show_confidence']:
+                    ax.fill_between(
+                        df_method['budget'],
+                        df_method['mean'] - df_method['std'],
+                        df_method['mean'] + df_method['std'],
+                        alpha=0.2,
+                        color=method_colors[method]
+                    )
+
+        # 格式化
+        ax.set_xlabel('Budget (k sensors)', fontsize=11)
+        ax.set_ylabel(metric.replace('_', ' ').title(), fontsize=11)
+        ax.set_title(f'{metric.replace("_", " ").title()} vs Budget',
+                     fontsize=12, fontweight='bold')
+        ax.legend(loc='best', fontsize=9)
+        ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.savefig(output_path.with_suffix('.pdf'), bbox_inches='tight')
-    plt.close()
 
-    print(f"  ✓ Saved: {output_path}")
+    # 保存
+    if output_dir:
+        for fmt in ['png', 'pdf']:
+            save_path = output_dir / f'f1_budget_curves.{fmt}'
+            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"      Saved: {save_path.name}")
 
+    return fig
 
 
 

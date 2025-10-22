@@ -14,6 +14,8 @@ import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 
+from matplotlib import pyplot as plt
+
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 from typing import Dict, List
@@ -60,62 +62,8 @@ class NumpyEncoder(json.JSONEncoder):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         return super(NumpyEncoder, self).default(obj)
+
 # ✅ 在顶层定义方法映射函数（可以被 pickle）
-def get_selection_method(method_name: str, geom, rng_seed: int = None):
-    """
-    获取选择方法的工厂函数（硬编码优化参数版本）
-
-    Args:
-        method_name: 方法名称 ("Greedy-MI" | "Greedy-A" | "Uniform" | "Random")
-        geom: 几何对象
-        rng_seed: 随机种子
-
-    Returns:
-        selection_function: (sensors, k, Q_pr) -> SelectionResult
-    """
-    import numpy as np
-    from selection import greedy_mi, greedy_aopt, uniform_selection, random_selection
-
-    if method_name == "Greedy-MI":
-        def mi_wrapper(sensors, k, Q_pr):
-            costs = np.array([s.cost for s in sensors])
-            return greedy_mi(
-                sensors=sensors,
-                k=k,
-                Q_pr=Q_pr,
-                costs=costs,
-                lazy=True,
-                batch_size=64
-            )
-
-        return mi_wrapper
-
-    elif method_name == "Greedy-A":
-        def aopt_wrapper(sensors, k, Q_pr):
-            costs = np.array([s.cost for s in sensors])
-            return greedy_aopt(
-                sensors=sensors,
-                k=k,
-                Q_pr=Q_pr,
-                costs=costs,
-                hutchpp_probes=3,  # 🔥 加速：从20减到3
-                batch_size=8,  # 🔥 加速：从32减到8
-                max_candidates=50,  # 🔥 加速：只评估50个候选
-                early_stop_ratio=0.3  # 🔥 加速：早停阈值
-            )
-
-        return aopt_wrapper
-
-    elif method_name == "Uniform":
-        return lambda s, k, Q: uniform_selection(s, k, geom)
-
-    elif method_name == "Random":
-        rng = np.random.default_rng(rng_seed)
-        return lambda s, k, Q: random_selection(s, k, rng)
-
-    else:
-        raise ValueError(f"Unknown method: {method_name}")
-
 
 def run_single_fold_worker(fold_data: Dict) -> Dict:
     """
@@ -239,12 +187,18 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
 
     rng = cfg.get_rng()
 
-    # Get selection method wrapper
-    selection_method = get_selection_method(
-        method_name, cfg, geom,
-        x_true=x_true,
-        test_idx=test_idx_global
-    )
+    # 🔥 修复：传递所有参数给 get_selection_method
+    try:
+        selection_method = get_selection_method(
+            method_name=method_name,
+            config=cfg,
+            geom=geom,
+            x_true=x_true,
+            test_idx=test_idx_global
+        )
+    except Exception as e:
+        print(f"  ✗ Failed to create method wrapper: {e}")
+        raise
 
     # Generate CV folds
     buffer_width = cfg.cv.buffer_width_multiplier * cfg.prior.correlation_length
@@ -356,7 +310,12 @@ def aggregate_results_for_visualization(all_results: Dict) -> pd.DataFrame:
     rows = []
 
     for method_name, method_data in all_results.items():
+        # 检查是否有 budgets 数据
+        if 'budgets' not in method_data:
+            continue
+
         for k, budget_data in method_data['budgets'].items():
+            # 检查是否有聚合数据
             if 'aggregated' not in budget_data:
                 continue
 
@@ -369,6 +328,10 @@ def aggregate_results_for_visualization(all_results: Dict) -> pd.DataFrame:
                     'std': metric_data['std'],
                     'values': metric_data['values']
                 })
+
+    if not rows:
+        # 如果没有数据，返回空 DataFrame 但保留必要的列
+        return pd.DataFrame(columns=['method', 'budget', 'metric', 'mean', 'std', 'values'])
 
     return pd.DataFrame(rows)
 
@@ -1115,7 +1078,7 @@ def main():
         try:
             results = run_method_evaluation(
                 method_name=method_name,
-                cfg=cfg,
+                cfg=cfg,  # 🔥 确保参数名与函数定义匹配
                 geom=geom,
                 Q_pr=Q_pr,
                 mu_pr=mu_pr,
@@ -1131,6 +1094,8 @@ def main():
         except Exception as e:
             print(f"\n  ✗ {method_name} FAILED: {str(e)}")
             warnings.warn(f"Method {method_name} failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
             continue
 
     # ========================================================================
@@ -1143,10 +1108,19 @@ def main():
         pickle.dump(all_results, f)
     print(f"    Saved: results_raw.pkl")
 
-    # Convert to DataFrame for easy analysis
-    df_results = aggregate_results_for_visualization(all_results)
-    df_results.to_csv(output_dir / 'results_aggregated.csv', index=False)
-    print(f"    Saved: results_aggregated.csv")
+    # 🔥 Convert to DataFrame with error handling
+    print("    Converting results to DataFrame...")
+    try:
+        df_results = aggregate_results_for_visualization(all_results)
+
+        if df_results.empty:
+            print("    ⚠️  Warning: No results to aggregate (all methods may have failed)")
+        else:
+            df_results.to_csv(output_dir / 'results_aggregated.csv', index=False)
+            print(f"    Saved: results_aggregated.csv ({len(df_results)} rows)")
+    except Exception as e:
+        print(f"    ✗ Failed to create aggregated DataFrame: {e}")
+        df_results = pd.DataFrame()  # Empty DataFrame
 
     # ========================================================================
     # 9. VISUALIZATION
@@ -1156,76 +1130,99 @@ def main():
     plots_dir = output_dir / 'plots'
     plots_dir.mkdir(exist_ok=True)
 
-    try:
-        # 🔥 F1: Budget-performance curves
-        print("    [F1] Budget-performance curves...")
-        fig = plot_budget_curves(
-            df_results,
-            metrics=['rmse', 'expected_loss_gbp', 'coverage_90'],
-            output_dir=plots_dir,
-            config=cfg
-        )
+    # 🔥 只有在有数据时才尝试可视化
+    if df_results.empty:
+        print("    ⚠️  Skipping visualization: no data available")
+    else:
+        try:
+            # F1: Budget-performance curves
+            print("    [F1] Budget-performance curves...")
+            try:
+                fig = plot_budget_curves(
+                    df_results,
+                    output_dir=plots_dir,
+                    config=cfg
+                )
+                if fig:
+                    plt.close(fig)
+            except Exception as e:
+                print(f"      Skipped: {e}")
 
-        # 🔥 F2: Marginal efficiency
-        print("    [F2] Marginal efficiency...")
-        fig = plot_marginal_efficiency(
-            all_results,
-            output_dir=plots_dir,
-            config=cfg
-        )
+            # F2: Marginal efficiency
+            print("    [F2] Marginal efficiency...")
+            try:
+                fig = plot_marginal_efficiency(
+                    all_results,
+                    output_dir=plots_dir,
+                    config=cfg
+                )
+                if fig:
+                    plt.close(fig)
+            except Exception as e:
+                print(f"      Skipped: {e}")
 
-        # 🔥 F7a: Performance profile
-        print("    [F7a] Performance profile...")
-        fig = plot_performance_profile(
-            df_results,
-            metric='expected_loss_gbp',
-            output_dir=plots_dir,
-            config=cfg
-        )
+            # F7a: Performance profile
+            print("    [F7a] Performance profile...")
+            try:
+                fig = plot_performance_profile(
+                    df_results,
+                    metric='expected_loss_gbp',
+                    output_dir=plots_dir,
+                    config=cfg
+                )
+                if fig:
+                    plt.close(fig)
+            except Exception as e:
+                print(f"      Skipped: {e}")
 
-        # 🔥 F7b: Critical difference diagram
-        print("    [F7b] Critical difference diagram...")
-        fig = plot_critical_difference(
-            df_results,
-            metric='expected_loss_gbp',
-            output_dir=plots_dir,
-            config=cfg
-        )
+            # F7b: Critical difference diagram
+            print("    [F7b] Critical difference diagram...")
+            try:
+                fig = plot_critical_difference(
+                    df_results,
+                    metric='expected_loss_gbp',
+                    output_dir=plots_dir,
+                    config=cfg
+                )
+                if fig:
+                    plt.close(fig)
+            except Exception as e:
+                print(f"      Skipped: {e}")
 
-        # 🔥 F4: MI-EVI correlation (if both methods ran)
-        if 'greedy_mi' in all_results and 'greedy_evi' in all_results:
-            print("    [F4] MI-EVI correlation...")
-            fig = plot_mi_evi_correlation(
-                all_results['greedy_mi'],
-                all_results['greedy_evi'],
-                output_dir=plots_dir,
-                config=cfg
-            )
+            # F4: MI-EVI correlation (if both methods ran)
+            if 'greedy_mi' in all_results and 'greedy_evi' in all_results:
+                print("    [F4] MI-EVI correlation...")
+                try:
+                    fig = plot_mi_evi_correlation(
+                        all_results['greedy_mi'],
+                        all_results['greedy_evi'],
+                        output_dir=plots_dir,
+                        config=cfg
+                    )
+                    if fig:
+                        plt.close(fig)
+                except Exception as e:
+                    print(f"      Skipped: {e}")
 
-        # 🔥 F5: Calibration diagnostics
-        print("    [F5] Calibration diagnostics...")
-        fig = plot_calibration_diagnostics(
-            all_results,
-            output_dir=plots_dir,
-            config=cfg
-        )
+            # F5: Calibration diagnostics
+            print("    [F5] Calibration diagnostics...")
+            try:
+                fig = plot_calibration_diagnostics(
+                    all_results,
+                    output_dir=plots_dir,
+                    config=cfg
+                )
+                if fig:
+                    plt.close(fig)
+            except Exception as e:
+                print(f"      Skipped: {e}")
 
-        # 🔥 F8: Sensor placement maps
-        if cfg.plots.expert_plots.get('sensor_placement_map', {}).get('enable', False):
-            print("    [F8] Sensor placement maps...")
-            fig = plot_sensor_placement_map(
-                all_results,
-                geom,
-                x_true,
-                output_dir=plots_dir,
-                config=cfg
-            )
+            print(f"    ✓ Visualization complete")
 
-        print(f"    ✓ All plots saved to: {plots_dir}")
-
-    except Exception as e:
-        print(f"    ✗ Visualization failed: {str(e)}")
-        warnings.warn(f"Visualization error: {str(e)}")
+        except Exception as e:
+            print(f"    ✗ Visualization phase failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
     # ========================================================================
     # 10. SUMMARY REPORT
@@ -1235,37 +1232,41 @@ def main():
     print("=" * 70)
 
     print("\nSummary:")
-    print(f"  Methods evaluated: {len(all_results)}")
+    print(f"  Methods attempted: {len(methods)}")
+    print(f"  Methods completed: {len(all_results)}")
     print(f"  Budgets: {cfg.selection.budgets}")
     print(f"  CV folds: {cfg.cv.k_folds}")
     print(f"  Total domain size: {geom.n}")
     print(f"  Candidate pool: {len(sensors)}")
 
     print(f"\nResults saved to: {output_dir}")
-    print(f"  - results_raw.pkl (Python pickle)")
-    print(f"  - results_aggregated.csv (tabular)")
-    print(f"  - plots/ (all figures)")
+    print(f"  - results_raw.pkl")
+    if not df_results.empty:
+        print(f"  - results_aggregated.csv")
+        print(f"  - plots/ directory")
 
-    # Print best method per metric
-    print("\nBest methods (at k=30):")
-    for metric in ['rmse', 'expected_loss_gbp', 'coverage_90']:
-        try:
-            df_k30 = df_results[
-                (df_results['budget'] == 30) &
-                (df_results['metric'] == metric)
-                ]
-            if not df_k30.empty:
-                if metric == 'coverage_90':
-                    # Closer to 0.90 is better
-                    df_k30['score'] = -np.abs(df_k30['mean'] - 0.90)
-                    best_row = df_k30.loc[df_k30['score'].idxmax()]
-                else:
-                    # Lower is better
-                    best_row = df_k30.loc[df_k30['mean'].idxmin()]
-                print(f"  {metric:20s}: {best_row['method']:15s} "
-                      f"({best_row['mean']:.3f} ± {best_row['std']:.3f})")
-        except:
-            pass
+    # Print best method per metric (if data available)
+    if not df_results.empty and 30 in cfg.selection.budgets:
+        print("\nBest methods (at k=30):")
+        for metric in ['rmse', 'expected_loss_gbp', 'coverage_90']:
+            try:
+                df_k30 = df_results[
+                    (df_results['budget'] == 30) &
+                    (df_results['metric'] == metric)
+                    ]
+                if not df_k30.empty:
+                    if metric == 'coverage_90':
+                        # Closer to 0.90 is better
+                        df_k30 = df_k30.copy()
+                        df_k30['score'] = -np.abs(df_k30['mean'] - 0.90)
+                        best_row = df_k30.loc[df_k30['score'].idxmax()]
+                    else:
+                        # Lower is better
+                        best_row = df_k30.loc[df_k30['mean'].idxmin()]
+                    print(f"  {metric:20s}: {best_row['method']:15s} "
+                          f"({best_row['mean']:.3f} ± {best_row['std']:.3f})")
+            except Exception:
+                pass
 
     print("\n" + "=" * 70)
 

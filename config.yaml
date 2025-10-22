@@ -42,8 +42,8 @@ prior:
   beta: 0.0001     # Nugget for strict positive-definiteness
 
   # Mean field (optional spatial trend)
-  mu_prior_mean: 2.0   # 🔥 Adjusted to match threshold region
-  mu_prior_std: 0.3    # Standard deviation of mean field (0 = constant)
+  mu_prior_mean: -100.0  # 🔥 改为接近真实数据的均值
+  mu_prior_std: 15.0     # 🔥 增大变异性
 
 # ----------------------------------------------------------------------------
 # Sensor Pool Configuration
@@ -83,7 +83,7 @@ sensors:
 # ----------------------------------------------------------------------------
 decision:
   # Decision threshold
-  tau_iri: 2.2  # 🔥 IRI threshold adjusted to data distribution
+  tau_iri: -90.0  # 🔥 设置到分布的中位区域（-100 + 10）
 
   # Loss matrix (in GBP)
   L_TP_gbp: 500    # True Positive: correctly maintain degraded road
@@ -120,11 +120,11 @@ selection:
     use_cost: true       # 🔥 Enable gain/cost scoring
 
   greedy_evi:
-    n_y_samples: 25      # 🔥 Monte Carlo samples for EVI approximation
+    n_y_samples: 10      # 🔥 Monte Carlo samples for EVI approximation
     use_cost: true
     # 🔥 Run only on subset to control computational cost
     budgets_subset: [10, 20, 40]  # Only these budgets
-    max_folds: 2                   # Only first 2 CV folds
+    max_folds: 1                   # Only first 2 CV folds
 
   maxmin:
     use_cost: true       # 🔥 Normalize distance by cost

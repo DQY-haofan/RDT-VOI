@@ -101,8 +101,31 @@ class SelectionConfig:
     methods: List[str]
     budgets: List[int]
     greedy_mi: Dict[str, Any]
-    greedy_aopt: Dict[str, Any]
+    greedy_aopt: Dict[str, Any] = None  # 🔥 新增
+    greedy_evi: Dict[str, Any] = None  # 🔥 新增
+    maxmin: Dict[str, Any] = None  # 🔥 新增
 
+    def __post_init__(self):
+        """处理可选的配置字段"""
+        # 🔥 为新方法设置默认值
+        if self.greedy_aopt is None:
+            self.greedy_aopt = {
+                'n_probes': 16,
+                'use_cost': True
+            }
+
+        if self.greedy_evi is None:
+            self.greedy_evi = {
+                'n_y_samples': 25,
+                'use_cost': True,
+                'budgets_subset': [],  # Empty means run on all budgets
+                'max_folds': None  # None means run on all folds
+            }
+
+        if self.maxmin is None:
+            self.maxmin = {
+                'use_cost': True
+            }
 
 @dataclass
 class EVIConfig:
@@ -123,7 +146,7 @@ class CVConfig:
     buffer_width_multiplier: float
     block_strategy: str
     ensure_connected: bool
-
+    morans_permutations: int
 
 @dataclass
 class UQConfig:
