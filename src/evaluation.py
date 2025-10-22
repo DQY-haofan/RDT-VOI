@@ -62,10 +62,10 @@ def spatial_block_cv(coords: np.ndarray,
 
 
 def compute_metrics(mu_post: np.ndarray,
-                   sigma_post: np.ndarray,
-                   x_true: np.ndarray,
-                   test_idx: np.ndarray,
-                   decision_config) -> Dict[str, float]:
+                    sigma_post: np.ndarray,
+                    x_true: np.ndarray,
+                    test_idx: np.ndarray,
+                    decision_config) -> Dict[str, float]:
     """
     Compute performance metrics on test set.
 
@@ -88,20 +88,22 @@ def compute_metrics(mu_post: np.ndarray,
 
     # Reconstruction metrics
     errors = mu_test - x_test
-    rmse = np.sqrt(np.mean(errors**2))
+    rmse = np.sqrt(np.mean(errors ** 2))
     mae = np.mean(np.abs(errors))
-    r2 = 1.0 - np.sum(errors**2) / np.sum((x_test - x_test.mean())**2)
+    r2 = 1.0 - np.sum(errors ** 2) / np.sum((x_test - x_test.mean()) ** 2)
 
     # Decision-aware loss
     exp_loss = expected_loss(mu_test, sigma_test, decision_config)
 
+    # 🔥 Z-scores for calibration (prevent division by zero)
+    z_scores = errors / np.maximum(sigma_test, 1e-12)
+
     # Calibration: coverage
-    z_scores = np.abs(errors) / sigma_test
-    coverage_90 = np.mean(z_scores <= 1.645)  # 90% CI
+    coverage_90 = np.mean(np.abs(z_scores) <= 1.645)  # 90% CI
 
     # MSSE (Mean Squared Standardized Error)
-    standardized_errors = errors / sigma_test
-    msse = np.mean(standardized_errors**2)
+    standardized_errors = errors / np.maximum(sigma_test, 1e-12)
+    msse = np.mean(standardized_errors ** 2)
 
     return {
         'rmse': rmse,
@@ -110,7 +112,8 @@ def compute_metrics(mu_post: np.ndarray,
         'expected_loss_gbp': exp_loss,
         'coverage_90': coverage_90,
         'msse': msse,
-        'n_test': len(test_idx)
+        'n_test': len(test_idx),
+        'z_scores': z_scores.astype(float)  # 🔥 新增：用于校准图
     }
 
 

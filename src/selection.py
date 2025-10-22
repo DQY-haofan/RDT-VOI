@@ -170,191 +170,432 @@ def greedy_mi(sensors: List, k: int, Q_pr: sp.spmatrix,
     )
 
 
+# =====================================================================
+# 🔥 新增/替换：快速 Greedy A-optimality (Hutch++ + rank-1)
+# =====================================================================
+
 def greedy_aopt(sensors: List, k: int, Q_pr: sp.spmatrix,
                 costs: np.ndarray = None,
-                hutchpp_probes: int = 20,
-                batch_size: int = 32,
-                max_candidates: int = None,
-                early_stop_ratio: float = 0.0) -> SelectionResult:
+                n_probes: int = 16,
+                use_cost: bool = True) -> SelectionResult:
     """
-    大幅加速版Greedy-A-optimality
+    Fast Greedy A-opt via Hutch++ + rank-1 update (no per-candidate factorization).
 
-    新增优化：
-    1. max_candidates: 每步只评估前N个候选（空间近邻）
-    2. early_stop_ratio: 当增益<初始增益*ratio时停止
-    3. 进度输出：实时显示评估进度
-    4. 批量处理：减少factor构造次数
+    Each step:
+    - Δtr ≈ (1/m) * sum_j (h^T Σ v_j)^2 / (r + h^T Σ h)
+    - Only ONE sparse solve per step: Q z_h = h
+    - All candidates evaluated in O(1) using precomputed probe responses
 
     Args:
-        sensors: 候选传感器列表
-        k: 预算
-        Q_pr: 先验精度矩阵
-        costs: 传感器成本（可选）
-        hutchpp_probes: Hutchinson++探针数
-        batch_size: 批量评估大小
-        max_candidates: 每步最多评估的候选数（None=全部）
-        early_stop_ratio: 早停阈值（0=禁用）
+        sensors: List of candidate sensors
+        k: Budget (number of sensors to select)
+        Q_pr: Prior precision matrix (sparse)
+        costs: Cost array for each sensor (if None, use sensor.cost)
+        n_probes: Number of Hutchinson probes for trace estimation
+        use_cost: Whether to normalize gain by cost (gain/cost scoring)
+
+    Returns:
+        SelectionResult with selected indices and diagnostics
     """
-    from inference import SparseFactor, compute_posterior
-    import time
+    from inference import SparseFactor
+    rng = np.random.default_rng(42)
 
     n = Q_pr.shape[0]
-    if costs is None:
-        costs = np.ones(len(sensors))
+    m = len(sensors)
 
-    selected_ids = []
-    selected_sensors = []
-    objective_values = []
-    marginal_gains = []
+    # Extract costs
+    if costs is None:
+        costs = np.array([s.cost for s in sensors], dtype=float)
+
+    # --- Prior factorization (one time only)
+    print(f"  Factorizing prior precision (n={n})...")
+    F = SparseFactor(Q_pr)
+
+    # --- Generate Rademacher probes and solve Z = Σ V
+    print(f"  Generating {n_probes} Hutchinson probes...")
+    V = rng.choice([-1.0, 1.0], size=(n, n_probes))
+    Z = F.solve(V)  # (n × m): one batched solve
+
+    # --- Approximate diag(Σ) using probes
+    diag_Sigma = np.mean(Z * V, axis=1)
+
+    # --- Precompute candidate representations
+    print(f"  Precomputing {m} candidate footprints...")
+    cand_info = []
+    for s in sensors:
+        idxs = s.idxs
+        weights = s.weights
+        r = s.noise_var
+        cand_info.append((idxs, weights, r))
+
+    # --- Greedy selection
+    selected = []
+    obj_vals = []
+    gains = []
     total_cost = 0.0
 
-    # 先验因子
-    factor_pr = SparseFactor(Q_pr)
+    # Initial trace estimate: tr(Σ) ≈ mean(V^T Z)
+    cur_trace_est = float(np.mean(np.einsum('ij,ij->j', V, Z)))
 
-    # 预生成传感器坐标（用于空间筛选）
-    from geometry import Geometry
-    sensor_locations = np.array([sensors[i].idxs[0] for i in range(len(sensors))])
-
-    # Hutchinson++配置
-    rng = np.random.default_rng(42)
-    probe_refresh_interval = 5
-
-    current_trace = estimate_trace_hutchpp(factor_pr, hutchpp_probes, rng)
-    print(f"  Initial trace estimate: {current_trace:.1f}")
-
-    initial_gain = None  # 用于early stop
-    step_times = []  # 记录每步耗时
-
+    print(f"  Starting greedy selection for k={k}...")
     for step in range(k):
-        step_start = time.time()
-
-        best_gain = -np.inf
         best_idx = -1
+        best_gain = -np.inf
+        best_score = -np.inf
 
-        # 🔥 候选筛选策略
-        remaining = [i for i in range(len(sensors)) if i not in selected_ids]
+        # --- Evaluate all remaining candidates
+        for i, (idxs, w, r) in enumerate(cand_info):
+            if i in selected:
+                continue
 
-        if max_candidates and len(remaining) > max_candidates:
-            # 空间筛选：优先评估距离已选点较远的候选
-            if selected_ids:
-                # 计算每个候选到已选点的最小距离
-                selected_locs = sensor_locations[selected_ids]
-                remaining_locs = sensor_locations[remaining]
+            # Numerator: (1/m) * sum_j (h^T Z_j)^2
+            # h^T Z = sum_{l in footprint} w_l * Z[l, :]
+            hz = (Z[idxs, :] * w[:, None]).sum(axis=0)  # (n_probes,)
+            num = float(np.mean(hz * hz))
 
-                from scipy.spatial.distance import cdist
-                dists = cdist(remaining_locs.reshape(-1, 1),
-                              selected_locs.reshape(-1, 1))
-                min_dists = dists.min(axis=1)
+            # Denominator: r + h^T Σ h ≈ r + sum_{l} w_l^2 * diag_Sigma[l]
+            denom = float(r + np.dot(w * w, diag_Sigma[idxs]))
 
-                # 选择距离最远的max_candidates个
-                top_indices = np.argsort(-min_dists)[:max_candidates]
-                remaining = [remaining[i] for i in top_indices]
-            else:
-                # 首步：随机采样
-                remaining = rng.choice(remaining, size=max_candidates, replace=False).tolist()
+            if denom <= 0:
+                continue
 
-        # 🔥 进度输出
-        print(f"  Step {step + 1}/{k}: Evaluating {len(remaining)} candidates "
-              f"(out of {len(sensors) - len(selected_ids)} remaining)...")
+            # Gain: Δtr (larger is better, means more trace reduction)
+            gain = num / denom
 
-        evaluated_count = 0
-        last_print_time = time.time()
+            # Score: gain per unit cost
+            score = gain / costs[i] if use_cost else gain
 
-        # 分批评估
-        for batch_start in range(0, len(remaining), batch_size):
-            batch_end = min(batch_start + batch_size, len(remaining))
-            batch_ids = remaining[batch_start:batch_end]
+            if score > best_score:
+                best_score = score
+                best_gain = gain
+                best_idx = i
 
-            # 🔥 每5秒或每100个候选输出一次进度
-            evaluated_count += len(batch_ids)
-            current_time = time.time()
-            if (current_time - last_print_time > 5.0) or (batch_end == len(remaining)):
-                progress_pct = 100 * evaluated_count / len(remaining)
-                elapsed = current_time - step_start
-                eta = elapsed / evaluated_count * (len(remaining) - evaluated_count)
-                print(f"    Progress: {evaluated_count}/{len(remaining)} "
-                      f"({progress_pct:.0f}%), ETA: {eta:.0f}s")
-                last_print_time = current_time
-
-            # 构造测试传感器集合
-            test_sensors_list = []
-            for cand_idx in batch_ids:
-                test_sensors_list.append(selected_sensors + [sensors[cand_idx]])
-
-            # 刷新探针（每probe_refresh_interval步）
-            if step % probe_refresh_interval == 0 or step == 0:
-                probes = generate_hutchpp_probes(n, hutchpp_probes, rng)
-
-            # 批量评估
-            for cand_idx, test_sensors in zip(batch_ids, test_sensors_list):
-                from sensors import assemble_H_R
-                H_test, R_test = assemble_H_R(test_sensors, n)
-
-                try:
-                    mu_post, factor_post = compute_posterior(
-                        Q_pr, np.zeros(n), H_test, R_test, np.zeros(len(test_sensors))
-                    )
-
-                    new_trace = estimate_trace_hutchpp_with_probes(
-                        factor_post, probes
-                    )
-
-                    gain = current_trace - new_trace
-
-                    if gain > best_gain:
-                        best_gain = gain
-                        best_idx = cand_idx
-
-                except Exception as e:
-                    # 数值问题：跳过该候选
-                    continue
-
-        # 检查是否找到有效候选
-        if best_idx == -1:
-            print(f"  Warning: No valid candidate found at step {step + 1}")
+        if best_idx < 0:
+            print(f"    Step {step + 1}: No valid candidate found, stopping early")
             break
 
-        # 记录初始增益（用于early stop）
-        if step == 0:
-            initial_gain = best_gain
+        # --- Commit best candidate: exact rank-1 update
+        idxs, w, r = cand_info[best_idx]
 
-        # 🔥 Early stop检查
-        if early_stop_ratio > 0 and initial_gain is not None:
-            if best_gain < initial_gain * early_stop_ratio:
-                print(f"  Early stopping at step {step + 1}: "
-                      f"gain {best_gain:.1f} < threshold {initial_gain * early_stop_ratio:.1f}")
-                break
+        # Build full h vector
+        h = np.zeros(n)
+        h[idxs] = w
 
-        # 添加传感器
-        selected_ids.append(best_idx)
-        selected_sensors.append(sensors[best_idx])
-        marginal_gains.append(best_gain)
+        # Solve Q z_h = h (one sparse solve per step)
+        z_h = F.solve(h)
+        denom_exact = float(r + h @ z_h)
+
+        if denom_exact <= 0:
+            print(f"    Step {step + 1}: Invalid denominator, stopping")
+            break
+
+        # --- Update Z and diag(Σ) via rank-1 formula
+        # Z' = Z - z_h * (h^T Z) / denom
+        hz_all = Z[idxs, :].T @ w  # (n_probes,) = h^T Z
+        Z -= np.outer(z_h, hz_all) / denom_exact
+
+        # diag(Σ') = diag(Σ) - z_h^2 / denom
+        diag_Sigma -= (z_h * z_h) / denom_exact
+
+        # --- Update trace estimate and record
+        cur_trace_est -= best_gain
         total_cost += costs[best_idx]
+        selected.append(best_idx)
+        gains.append(best_gain)
+        obj_vals.append(-cur_trace_est)  # maximize -tr(Σ)
 
-        # 更新trace
-        current_trace -= best_gain
-        objective_values.append(-current_trace)
+        if (step + 1) % 10 == 0 or step == 0:
+            print(f"    Step {step + 1}/{k}: selected sensor {best_idx}, "
+                  f"gain={best_gain:.4f}, score={best_score:.4f}, "
+                  f"cumulative_cost=£{total_cost:.0f}")
 
-        # 记录耗时
-        step_time = time.time() - step_start
-        step_times.append(step_time)
-
-        # 🔥 更详细的进度输出
-        avg_time = np.mean(step_times)
-        eta_total = avg_time * (k - step - 1)
-        print(f"  ✓ Step {step + 1}/{k} complete: "
-              f"Trace={current_trace:.1f}, ΔTrace={best_gain:.1f}, "
-              f"Sensor=#{best_idx}, Cost=£{total_cost:.0f}, "
-              f"Time={step_time:.1f}s (ETA: {eta_total / 60:.1f}min)")
-
-    print(f"  Total time: {sum(step_times) / 60:.1f} minutes")
+    print(f"  ✓ Selected {len(selected)} sensors, total cost=£{total_cost:.0f}")
 
     return SelectionResult(
-        selected_ids=selected_ids,
-        objective_values=objective_values,
-        marginal_gains=marginal_gains,
+        selected_ids=selected,
+        objective_values=obj_vals,
+        marginal_gains=gains,
         total_cost=total_cost,
         method_name="Greedy-A"
+    )
+
+
+# =====================================================================
+# 🔥 新增：Myopic EVI (决策感知选址)
+# =====================================================================
+
+def greedy_evi_myopic(sensors: List, k: int, Q_pr: sp.spmatrix,
+                      mu_pr: np.ndarray,
+                      decision_config,
+                      test_idx: np.ndarray = None,
+                      costs: np.ndarray = None,
+                      n_y_samples: int = 25,
+                      use_cost: bool = True,
+                      rng: np.random.Generator = None) -> SelectionResult:
+    """
+    Greedy Expected Value of Information (EVI) sensor selection.
+
+    At each step, selects the sensor that maximizes expected reduction in
+    decision loss (economic risk) per unit cost.
+
+    Uses rank-1 posterior update formula for fast candidate evaluation:
+    - Prior: μ, Σ
+    - Observation model: y ~ N(h^T μ, h^T Σ h + r)
+    - Posterior (given y): μ'(y) = μ + (Σh)(y - h^T μ)/(r + h^T Σ h)
+    - EVI ≈ E_y[Risk_prior - Risk_posterior(y)]
+
+    Args:
+        sensors: List of candidate sensors
+        k: Budget (number to select)
+        Q_pr: Prior precision matrix
+        mu_pr: Prior mean vector
+        decision_config: Decision configuration with tau_iri, L_FP, L_FN, etc.
+        test_idx: Test set indices (if None, use random subset)
+        costs: Cost array (if None, use sensor.cost)
+        n_y_samples: Number of Monte Carlo samples for EVI approximation
+        use_cost: Whether to use gain/cost scoring
+        rng: Random number generator
+
+    Returns:
+        SelectionResult with selected sensors
+    """
+    from inference import SparseFactor, compute_posterior_variance_diagonal
+    from decision import expected_loss
+
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    n = len(mu_pr)
+    m_cand = len(sensors)
+
+    # Extract costs
+    if costs is None:
+        costs = np.array([s.cost for s in sensors], dtype=float)
+
+    # Test set for risk evaluation (use subset if large)
+    if test_idx is None:
+        n_test = min(200, n)
+        test_idx = rng.choice(n, size=n_test, replace=False)
+    else:
+        n_test = len(test_idx)
+
+    print(f"  Factorizing prior (n={n})...")
+    F = SparseFactor(Q_pr)
+
+    # --- Compute prior risk (on test set only)
+    print(f"  Computing prior risk on {n_test} test points...")
+    sigma_pr_test = np.sqrt(compute_posterior_variance_diagonal(F, test_idx))
+    prior_risk = expected_loss(
+        mu_pr[test_idx],
+        sigma_pr_test,
+        decision_config,
+        test_indices=np.arange(n_test)
+    )
+    print(f"    Prior risk: £{prior_risk:.2f}")
+
+    # --- Initialize state (will be updated after each selection)
+    cur_mu = mu_pr.copy()
+    cur_diag_full = compute_posterior_variance_diagonal(F, np.arange(n))
+    cur_diag_test = cur_diag_full[test_idx]
+
+    # Greedy loop
+    selected = []
+    obj_vals = []
+    gains = []
+    total_cost = 0.0
+
+    print(f"  Starting greedy EVI selection for k={k}...")
+    for step in range(k):
+        best_idx = -1
+        best_gain = -np.inf
+        best_score = -np.inf
+        best_pack = None
+
+        # --- Evaluate all remaining candidates
+        for i, s in enumerate(sensors):
+            if i in selected:
+                continue
+
+            # Build observation vector h
+            h = np.zeros(n)
+            h[s.idxs] = s.weights
+
+            # Solve for Σ h = Q^{-1} h
+            z_h = F.solve(h)
+
+            # Predictive distribution parameters
+            denom = float(s.noise_var + h @ z_h)
+            if denom <= 0:
+                continue
+
+            y_mean = float(h @ cur_mu)
+            y_std = np.sqrt(denom)
+
+            # --- Monte Carlo over possible observations
+            y_samples = y_mean + y_std * rng.standard_normal(n_y_samples)
+            post_losses = []
+
+            for y_obs in y_samples:
+                # Rank-1 posterior update (on test set only for speed)
+                residual = y_obs - y_mean
+                mu_post_test = cur_mu[test_idx] + z_h[test_idx] * (residual / denom)
+
+                # Update diagonal variance (on test set)
+                diag_post_test = cur_diag_test - (z_h[test_idx] ** 2) / denom
+                diag_post_test = np.maximum(diag_post_test, 1e-12)
+                sigma_post_test = np.sqrt(diag_post_test)
+
+                # Compute posterior risk
+                loss = expected_loss(
+                    mu_post_test,
+                    sigma_post_test,
+                    decision_config,
+                    test_indices=np.arange(n_test)
+                )
+                post_losses.append(loss)
+
+            # EVI: expected reduction in risk
+            avg_post_loss = np.mean(post_losses)
+            gain = prior_risk - avg_post_loss
+
+            # Score by cost
+            score = gain / costs[i] if use_cost else gain
+
+            if score > best_score:
+                best_score = score
+                best_gain = gain
+                best_idx = i
+                best_pack = (z_h, denom, y_mean)
+
+        if best_idx < 0:
+            print(f"    Step {step + 1}: No valid candidate, stopping early")
+            break
+
+        # --- Commit best candidate
+        z_h, denom, y_mean = best_pack
+
+        # Update state using expected posterior (E_y[μ'(y)] = μ, but variance reduces)
+        # For simplicity, keep mean unchanged and only update variance
+        cur_diag_full -= (z_h * z_h) / denom
+        cur_diag_test = cur_diag_full[test_idx]
+
+        # Recompute prior risk for next step (variance reduced)
+        prior_risk = expected_loss(
+            cur_mu[test_idx],
+            np.sqrt(np.maximum(cur_diag_test, 1e-12)),
+            decision_config,
+            test_indices=np.arange(n_test)
+        )
+
+        # Record
+        total_cost += costs[best_idx]
+        selected.append(best_idx)
+        gains.append(best_gain)
+        obj_vals.append(obj_vals[-1] + best_gain if obj_vals else best_gain)
+
+        if (step + 1) % 5 == 0 or step == 0:
+            print(f"    Step {step + 1}/{k}: sensor {best_idx}, "
+                  f"EVI=£{best_gain:.2f}, score={best_score:.4f}, "
+                  f"cumulative_cost=£{total_cost:.0f}, "
+                  f"remaining_risk=£{prior_risk:.2f}")
+
+    print(f"  ✓ Selected {len(selected)} sensors via EVI, total cost=£{total_cost:.0f}")
+
+    return SelectionResult(
+        selected_ids=selected,
+        objective_values=obj_vals,
+        marginal_gains=gains,
+        total_cost=total_cost,
+        method_name="Greedy-EVI"
+    )
+
+
+# =====================================================================
+# 🔥 新增：MaxMin K-Center (几何覆盖基线)
+# =====================================================================
+
+def maxmin_k_center(sensors: List, k: int, coords: np.ndarray,
+                    costs: np.ndarray = None,
+                    use_cost: bool = True) -> SelectionResult:
+    """
+    MaxMin K-Center sensor selection (geometric coverage baseline).
+
+    Iteratively selects the sensor that is farthest from already selected sensors,
+    optionally normalized by cost.
+
+    Args:
+        sensors: List of candidate sensors
+        k: Number of sensors to select
+        coords: Spatial coordinates (n_sensors, d)
+        costs: Cost array (if None, use sensor.cost)
+        use_cost: Whether to normalize distance by cost
+
+    Returns:
+        SelectionResult with selected indices
+    """
+    from scipy.spatial.distance import cdist
+
+    m = len(sensors)
+
+    # Extract costs
+    if costs is None:
+        costs = np.array([s.cost for s in sensors], dtype=float)
+
+    # Extract sensor center locations (use first index as representative)
+    sensor_locs = np.array([coords[s.idxs[0]] for s in sensors])
+
+    # Start with sensor closest to domain center
+    center = np.mean(sensor_locs, axis=0)
+    dists_to_center = np.linalg.norm(sensor_locs - center, axis=1)
+    first_idx = int(np.argmin(dists_to_center))
+
+    selected = [first_idx]
+    obj_vals = [0.0]
+    gains = [0.0]
+    total_cost = costs[first_idx]
+
+    print(f"  MaxMin K-Center: starting with sensor {first_idx}")
+
+    for step in range(1, k):
+        # Compute minimum distance to any selected sensor
+        selected_locs = sensor_locs[selected]
+        dists = cdist(sensor_locs, selected_locs, metric='euclidean')
+        min_dist = np.min(dists, axis=1)
+
+        # Mask already selected
+        min_dist[selected] = -np.inf
+
+        # Select sensor with maximum minimum distance (optionally cost-normalized)
+        if use_cost:
+            scores = min_dist / costs
+        else:
+            scores = min_dist
+
+        best_idx = int(np.argmax(scores))
+
+        if best_idx in selected or scores[best_idx] == -np.inf:
+            print(f"    Step {step + 1}: No valid candidate, stopping early")
+            break
+
+        # Record
+        selected.append(best_idx)
+        total_cost += costs[best_idx]
+        gain = float(min_dist[best_idx])
+        gains.append(gain)
+        obj_vals.append(obj_vals[-1] + gain)
+
+        if (step + 1) % 10 == 0 or step == 0:
+            print(f"    Step {step + 1}/{k}: sensor {best_idx}, "
+                  f"min_dist={gain:.2f}, cumulative_cost=£{total_cost:.0f}")
+
+    print(f"  ✓ Selected {len(selected)} sensors via MaxMin, total cost=£{total_cost:.0f}")
+
+    return SelectionResult(
+        selected_ids=selected,
+        objective_values=obj_vals,
+        marginal_gains=gains,
+        total_cost=total_cost,
+        method_name="MaxMin"
     )
 
 

@@ -110,55 +110,6 @@ def plot_budget_curves(results_by_method: Dict,
     print(f"  ✓ Saved: {output_path}")
 
 
-# ========== F2: 单位成本效率曲线（新增） ==========
-
-def plot_marginal_efficiency(selection_result, sensors: List,
-                             output_path: Path):
-    """
-    单位成本效率曲线：ΔEVI/£ vs 步数
-
-    展示：
-    - 边际信息量 / 成本
-    - 收益递减趋势
-    - 与非成本归一化对比
-    """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-    # 左图：边际MI（bits）
-    steps = np.arange(1, len(selection_result.marginal_gains) + 1)
-    gains_bits = np.array(selection_result.marginal_gains) / np.log(2)
-
-    ax1.plot(steps, gains_bits, marker='o', color='steelblue',
-            linewidth=2, markersize=5, label='Marginal MI')
-    ax1.fill_between(steps, 0, gains_bits, alpha=0.3, color='steelblue')
-
-    ax1.set_xlabel('Sensor Addition Step', fontweight='bold')
-    ax1.set_ylabel('Marginal MI Gain (bits)', fontweight='bold')
-    ax1.set_title('Diminishing Returns: MI per Sensor')
-    ax1.grid(True, alpha=0.3)
-    ax1.legend()
-
-    # 右图：成本效率（bits/£1000）
-    costs = [sensors[i].cost for i in selection_result.selected_ids]
-    efficiency = (gains_bits / np.array(costs)) * 1000  # per £1k
-
-    ax2.plot(steps, efficiency, marker='s', color='darkorange',
-            linewidth=2, markersize=5, label='Cost Efficiency')
-    ax2.axhline(efficiency.mean(), color='red', linestyle='--',
-               alpha=0.5, label=f'Mean: {efficiency.mean():.3f}')
-
-    ax2.set_xlabel('Sensor Addition Step', fontweight='bold')
-    ax2.set_ylabel('Efficiency (bits / £1,000)', fontweight='bold')
-    ax2.set_title('Cost-Normalized Information Gain')
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.savefig(output_path.with_suffix('.pdf'), bbox_inches='tight')
-    plt.close()
-
-    print(f"  ✓ Saved: {output_path}")
 
 
 # ========== F3: 传感器类型堆叠（新增） ==========
@@ -274,81 +225,6 @@ def plot_mi_voi_correlation(mi_values: np.ndarray,
     print(f"  ✓ Saved: {output_path}")
 
 
-# ========== F5: 校准图（新增） ==========
-
-def plot_calibration_diagnostics(fold_results: List[Dict],
-                                 output_path: Path):
-    """
-    校准与不确定性诊断
-
-    包含：
-    - F5a: 覆盖率曲线（名义vs经验）
-    - F5b: MSSE分布直方图
-    """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-    # === F5a: 覆盖率曲线 ===
-    nominal_levels = np.linspace(0.5, 0.95, 10)
-
-    # 收集每个fold的经验覆盖率
-    empirical_coverages = []
-    for fold in fold_results:
-        # 需要从fold_results中提取z-scores
-        # 这里假设有 'z_scores' 字段
-        if 'z_scores' in fold:
-            z_scores = fold['z_scores']
-            coverage = []
-            for level in nominal_levels:
-                z_thresh = np.percentile(np.abs(z_scores), level * 100)
-                empirical = np.mean(np.abs(z_scores) <= z_thresh)
-                coverage.append(empirical)
-            empirical_coverages.append(coverage)
-
-    # 如果有数据，绘制覆盖率曲线
-    if empirical_coverages:
-        empirical_mean = np.mean(empirical_coverages, axis=0)
-        empirical_std = np.std(empirical_coverages, axis=0)
-
-        ax1.plot(nominal_levels, nominal_levels, 'k--', linewidth=2,
-                label='Ideal (diagonal)')
-        ax1.plot(nominal_levels, empirical_mean, 'o-', linewidth=2,
-                color='steelblue', label='Empirical')
-        ax1.fill_between(nominal_levels,
-                        empirical_mean - empirical_std,
-                        empirical_mean + empirical_std,
-                        alpha=0.3, color='steelblue')
-
-    ax1.set_xlabel('Nominal Confidence Level', fontweight='bold')
-    ax1.set_ylabel('Empirical Coverage Rate', fontweight='bold')
-    ax1.set_title('Calibration Curve: Coverage Analysis')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    ax1.set_xlim([0.4, 1.0])
-    ax1.set_ylim([0.4, 1.0])
-
-    # === F5b: MSSE分布 ===
-    msse_values = [fold['msse'] for fold in fold_results if 'msse' in fold]
-
-    if msse_values:
-        ax2.hist(msse_values, bins=15, color='coral', alpha=0.7,
-                edgecolor='black', linewidth=1.5)
-        ax2.axvline(1.0, color='red', linestyle='--', linewidth=2,
-                   label='Ideal (MSSE=1)')
-        ax2.axvline(np.mean(msse_values), color='blue', linestyle='-',
-                   linewidth=2, label=f'Mean: {np.mean(msse_values):.2f}')
-
-        ax2.set_xlabel('Mean Squared Standardized Error', fontweight='bold')
-        ax2.set_ylabel('Frequency (# Folds)', fontweight='bold')
-        ax2.set_title('MSSE Distribution Across Folds')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3, axis='y')
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.savefig(output_path.with_suffix('.pdf'), bbox_inches='tight')
-    plt.close()
-
-    print(f"  ✓ Saved: {output_path}")
 
 
 # ========== F6: 增强的空间诊断（改进版） ==========
@@ -581,47 +457,721 @@ def plot_residual_map(mu_post: np.ndarray,
     print(f"  ✓ Saved: {output_path}")
 
 
-def plot_performance_profile(results_by_method: Dict,
-                             metric: str,
-                             output_path: Path,
-                             tau_max: float = 3.0):
-    """原有函数（保持不变）"""
-    methods = list(results_by_method.keys())
-    instances = list(next(iter(results_by_method.values())).keys())
 
-    perf_matrix = np.zeros((len(methods), len(instances)))
-    for i, method in enumerate(methods):
-        for j, instance in enumerate(instances):
-            perf_matrix[i, j] = results_by_method[method][instance]
+def plot_mi_evi_correlation(mi_results: Dict, evi_results: Dict,
+                            output_dir: Path = None,
+                            config=None) -> plt.Figure:
+    """
+    Plot correlation between Mutual Information and Expected Value of Information.
 
-    best_perf = perf_matrix.min(axis=0)
-    ratios = perf_matrix / best_perf[None, :]
+    This validates whether MI is a good proxy for decision-aware value.
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    Args:
+        mi_results: Results from Greedy-MI method
+        evi_results: Results from Greedy-EVI method
+        output_dir: Directory to save plots
+        config: Configuration object
 
-    tau_values = np.linspace(1.0, tau_max, 100)
+    Returns:
+        Figure object
+    """
+    # Extract marginal gains for matching (budget, fold) pairs
+    mi_data = []
+    evi_data = []
 
-    for i, method in enumerate(methods):
-        method_ratios = ratios[i, :]
-        profile = np.array([
-            (method_ratios <= tau).sum() / len(instances)
-            for tau in tau_values
-        ])
-        ax.plot(tau_values, profile, label=method, linewidth=2)
+    # Find common budgets
+    mi_budgets = set(mi_results['budgets'].keys())
+    evi_budgets = set(evi_results['budgets'].keys())
+    common_budgets = mi_budgets & evi_budgets
 
-    ax.set_xlabel(r'Performance Ratio $\tau$')
-    ax.set_ylabel(r'$P_s(\tau)$ (Fraction Solved)')
-    ax.set_title(f'Performance Profile: {metric}')
-    ax.legend()
+    if not common_budgets:
+        warnings.warn("No common budgets between MI and EVI results")
+        return None
+
+    for k in sorted(common_budgets):
+        mi_budget = mi_results['budgets'][k]
+        evi_budget = evi_results['budgets'][k]
+
+        # Get fold results
+        mi_folds = mi_budget.get('fold_results', [])
+        evi_folds = evi_budget.get('fold_results', [])
+
+        # Match by fold index
+        n_folds = min(len(mi_folds), len(evi_folds))
+
+        for fold_idx in range(n_folds):
+            if not mi_folds[fold_idx]['success'] or not evi_folds[fold_idx]['success']:
+                continue
+
+            # Get selection results
+            mi_sel = mi_folds[fold_idx]['selection_result']
+            evi_sel = evi_folds[fold_idx]['selection_result']
+
+            # Get marginal gains (step-by-step improvements)
+            mi_gains = mi_sel.marginal_gains
+            evi_gains = evi_sel.marginal_gains
+
+            # Align by step
+            n_steps = min(len(mi_gains), len(evi_gains))
+
+            for step in range(n_steps):
+                mi_data.append({
+                    'budget': k,
+                    'fold': fold_idx,
+                    'step': step + 1,
+                    'mi_gain': mi_gains[step],
+                    'evi_gain': evi_gains[step]
+                })
+
+    if not mi_data:
+        warnings.warn("No matching data found between MI and EVI")
+        return None
+
+    df = pd.DataFrame(mi_data)
+
+    # Create figure with subplots
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # --- Subplot 1: Scatter plot with regression
+    ax = axes[0]
+
+    # Plot points colored by step
+    scatter = ax.scatter(
+        df['mi_gain'],
+        df['evi_gain'],
+        c=df['step'],
+        cmap='viridis',
+        alpha=0.6,
+        s=50,
+        edgecolors='white',
+        linewidth=0.5
+    )
+
+    # Add colorbar
+    cbar = plt.colorbar(scatter, ax=ax, label='Selection Step')
+
+    # Fit linear regression
+    from scipy.stats import linregress
+    valid = np.isfinite(df['mi_gain']) & np.isfinite(df['evi_gain'])
+    if valid.sum() > 2:
+        slope, intercept, r_value, p_value, std_err = linregress(
+            df.loc[valid, 'mi_gain'],
+            df.loc[valid, 'evi_gain']
+        )
+
+        # Plot regression line
+        x_line = np.linspace(df['mi_gain'].min(), df['mi_gain'].max(), 100)
+        y_line = slope * x_line + intercept
+        ax.plot(x_line, y_line, 'r--', linewidth=2, alpha=0.8,
+                label=f'$R^2={r_value ** 2:.3f}$, $p<{p_value:.3f}$')
+
+        ax.legend(loc='upper left', fontsize=10)
+
+    # Add diagonal reference line (perfect correlation)
+    lims = [
+        min(ax.get_xlim()[0], ax.get_ylim()[0]),
+        max(ax.get_xlim()[1], ax.get_ylim()[1])
+    ]
+    ax.plot(lims, lims, 'k:', alpha=0.3, linewidth=1, label='y=x')
+
+    ax.set_xlabel('Marginal MI (nats)', fontsize=11)
+    ax.set_ylabel('Marginal EVI (£)', fontsize=11)
+    ax.set_title('MI vs EVI: Marginal Gains', fontsize=12, fontweight='bold')
     ax.grid(True, alpha=0.3)
-    ax.set_xlim([1, tau_max])
-    ax.set_ylim([0, 1])
+
+    # --- Subplot 2: Correlation by budget
+    ax = axes[1]
+
+    budget_corrs = []
+    for k in sorted(df['budget'].unique()):
+        df_k = df[df['budget'] == k]
+        if len(df_k) > 3:
+            corr = df_k['mi_gain'].corr(df_k['evi_gain'])
+            budget_corrs.append({
+                'budget': k,
+                'correlation': corr,
+                'n': len(df_k)
+            })
+
+    if budget_corrs:
+        df_corr = pd.DataFrame(budget_corrs)
+
+        # Bar plot
+        bars = ax.bar(
+            df_corr['budget'],
+            df_corr['correlation'],
+            color='steelblue',
+            alpha=0.7,
+            edgecolor='black',
+            linewidth=1
+        )
+
+        # Add sample size labels
+        for i, (k, corr, n) in enumerate(zip(df_corr['budget'],
+                                             df_corr['correlation'],
+                                             df_corr['n'])):
+            ax.text(k, corr + 0.02, f'n={n}',
+                    ha='center', va='bottom', fontsize=8)
+
+        ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        ax.set_xlabel('Budget (k sensors)', fontsize=11)
+        ax.set_ylabel('Pearson Correlation', fontsize=11)
+        ax.set_title('Correlation by Budget', fontsize=12, fontweight='bold')
+        ax.set_ylim([-0.1, 1.05])
+        ax.grid(True, alpha=0.3, axis='y')
 
     plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.close()
 
-    print(f"  ✓ Saved: {output_path}")
+    # Save
+    if output_dir:
+        for fmt in ['png', 'pdf']:
+            save_path = output_dir / f'f4_mi_evi_correlation.{fmt}'
+            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"      Saved: {save_path.name}")
+
+    return fig
+
+
+# ============================================================================
+# 🔥 更新：F2 - 边际效率（支持新方法）
+# ============================================================================
+
+def plot_marginal_efficiency(all_results: Dict,
+                             output_dir: Path = None,
+                             config=None,
+                             normalize_by_cost: bool = True) -> plt.Figure:
+    """
+    Plot marginal gain per unit cost across selection steps.
+
+    Shows diminishing returns and efficiency differences between methods.
+
+    Args:
+        all_results: Dictionary of results by method
+        output_dir: Directory to save plots
+        config: Configuration object
+        normalize_by_cost: If True, plot gain/cost; else plot raw gain
+
+    Returns:
+        Figure object
+    """
+    # Extract data
+    plot_data = []
+
+    for method_name, method_data in all_results.items():
+        # Skip random/uniform (no marginal gains)
+        if method_name.lower() in ['random', 'uniform']:
+            continue
+
+        for k, budget_data in method_data['budgets'].items():
+            fold_results = budget_data.get('fold_results', [])
+
+            for fold_idx, fold_res in enumerate(fold_results):
+                if not fold_res['success']:
+                    continue
+
+                sel_result = fold_res['selection_result']
+                gains = sel_result.marginal_gains
+                costs = []
+
+                # Extract costs for selected sensors
+                # (Assuming we stored sensor costs or can reconstruct)
+                if hasattr(sel_result, 'costs'):
+                    costs = sel_result.costs
+                else:
+                    # Fallback: assume uniform cost
+                    avg_cost = sel_result.total_cost / len(sel_result.selected_ids)
+                    costs = [avg_cost] * len(gains)
+
+                # Compute efficiency
+                for step, (gain, cost) in enumerate(zip(gains, costs)):
+                    if normalize_by_cost and cost > 0:
+                        efficiency = gain / cost
+                    else:
+                        efficiency = gain
+
+                    plot_data.append({
+                        'method': method_name,
+                        'budget': k,
+                        'fold': fold_idx,
+                        'step': step + 1,
+                        'gain': gain,
+                        'cost': cost,
+                        'efficiency': efficiency
+                    })
+
+    if not plot_data:
+        warnings.warn("No data available for marginal efficiency plot")
+        return None
+
+    df = pd.DataFrame(plot_data)
+
+    # Create figure
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Color palette
+    methods = df['method'].unique()
+    colors = sns.color_palette('Set2', n_colors=len(methods))
+    method_colors = dict(zip(methods, colors))
+
+    # --- Subplot 1: Efficiency by step (aggregated across budgets/folds)
+    ax = axes[0]
+
+    for method in methods:
+        df_method = df[df['method'] == method]
+
+        # Group by step and compute mean ± std
+        grouped = df_method.groupby('step')['efficiency'].agg(['mean', 'std', 'count'])
+
+        # Plot line
+        ax.plot(
+            grouped.index,
+            grouped['mean'],
+            marker='o',
+            markersize=4,
+            linewidth=2,
+            label=method.replace('_', ' ').title(),
+            color=method_colors[method],
+            alpha=0.8
+        )
+
+        # Confidence interval (±1 std)
+        ax.fill_between(
+            grouped.index,
+            grouped['mean'] - grouped['std'],
+            grouped['mean'] + grouped['std'],
+            alpha=0.2,
+            color=method_colors[method]
+        )
+
+    ax.set_xlabel('Selection Step', fontsize=11)
+    ylabel = 'Marginal Gain / Cost' if normalize_by_cost else 'Marginal Gain'
+    ax.set_ylabel(ylabel, fontsize=11)
+    ax.set_title('Marginal Efficiency by Step', fontsize=12, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(left=0.5)
+
+    # --- Subplot 2: Total gain vs total cost
+    ax = axes[1]
+
+    # Compute cumulative gains and costs
+    cumulative_data = []
+
+    for method in methods:
+        df_method = df[df['method'] == method]
+
+        for (budget, fold), group in df_method.groupby(['budget', 'fold']):
+            group_sorted = group.sort_values('step')
+
+            cumulative_gain = group_sorted['gain'].cumsum().values
+            cumulative_cost = group_sorted['cost'].cumsum().values
+
+            for step_idx in range(len(cumulative_gain)):
+                cumulative_data.append({
+                    'method': method,
+                    'budget': budget,
+                    'fold': fold,
+                    'total_gain': cumulative_gain[step_idx],
+                    'total_cost': cumulative_cost[step_idx]
+                })
+
+    df_cum = pd.DataFrame(cumulative_data)
+
+    for method in methods:
+        df_method = df_cum[df_cum['method'] == method]
+
+        # Plot scatter with trend
+        ax.scatter(
+            df_method['total_cost'],
+            df_method['total_gain'],
+            alpha=0.3,
+            s=20,
+            color=method_colors[method],
+            edgecolors='none'
+        )
+
+        # Add smooth trend line
+        from scipy.interpolate import UnivariateSpline
+        x_sorted = df_method['total_cost'].sort_values()
+        y_sorted = df_method.set_index('total_cost').loc[x_sorted.index, 'total_gain']
+
+        if len(x_sorted) > 10:
+            try:
+                # Smooth spline
+                spl = UnivariateSpline(x_sorted, y_sorted, s=len(x_sorted) * 10)
+                x_smooth = np.linspace(x_sorted.min(), x_sorted.max(), 100)
+                y_smooth = spl(x_smooth)
+
+                ax.plot(
+                    x_smooth, y_smooth,
+                    linewidth=2.5,
+                    label=method.replace('_', ' ').title(),
+                    color=method_colors[method],
+                    alpha=0.8
+                )
+            except:
+                # Fallback to simple mean
+                pass
+
+    ax.set_xlabel('Total Cost (£)', fontsize=11)
+    ax.set_ylabel('Cumulative Gain', fontsize=11)
+    ax.set_title('Total Gain vs Cost', fontsize=12, fontweight='bold')
+    ax.legend(loc='lower right', fontsize=9, framealpha=0.9)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    # Save
+    if output_dir:
+        for fmt in ['png', 'pdf']:
+            save_path = output_dir / f'f2_marginal_efficiency.{fmt}'
+            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"      Saved: {save_path.name}")
+
+    return fig
+
+
+# ============================================================================
+# 🔥 更新：F7a - Performance Profile（支持 budget×fold 实例）
+# ============================================================================
+
+def plot_performance_profile(df_results: pd.DataFrame,
+                             metric: str = 'expected_loss_gbp',
+                             output_dir: Path = None,
+                             config=None,
+                             use_budget_fold_instances: bool = True) -> plt.Figure:
+    """
+    Plot performance profile comparing methods across multiple instances.
+
+    Performance profile shows P(r_method <= τ * r_best) for various τ.
+
+    Args:
+        df_results: DataFrame with aggregated results
+        metric: Metric to use for ranking
+        output_dir: Directory to save plots
+        config: Configuration object
+        use_budget_fold_instances: If True, treat each (budget, fold) as instance;
+                                   else use only budget as instance
+
+    Returns:
+        Figure object
+    """
+    # Filter to relevant metric
+    df_metric = df_results[df_results['metric'] == metric].copy()
+
+    if df_metric.empty:
+        warnings.warn(f"No data for metric: {metric}")
+        return None
+
+    # Expand instances if requested
+    if use_budget_fold_instances:
+        # Each (budget, fold) is an instance
+        # Need to extract individual fold values from 'values' column
+        instance_data = []
+
+        for _, row in df_metric.iterrows():
+            method = row['method']
+            budget = row['budget']
+            values = row['values']  # List of fold values
+
+            for fold_idx, value in enumerate(values):
+                instance_data.append({
+                    'method': method,
+                    'instance': f"k={budget}_fold={fold_idx}",
+                    'value': value
+                })
+
+        df_instances = pd.DataFrame(instance_data)
+    else:
+        # Each budget is an instance (use mean)
+        df_instances = df_metric.rename(columns={'mean': 'value'})
+        df_instances['instance'] = df_instances['budget'].astype(str)
+
+    # Compute performance ratios
+    instances = df_instances['instance'].unique()
+    methods = df_instances['method'].unique()
+
+    # For each instance, find best performance
+    ratios = []
+
+    for instance in instances:
+        df_inst = df_instances[df_instances['instance'] == instance]
+
+        if len(df_inst) < 2:  # Need at least 2 methods
+            continue
+
+        best_value = df_inst['value'].min()  # Assuming lower is better
+
+        if best_value <= 0 or not np.isfinite(best_value):
+            continue
+
+        for _, row in df_inst.iterrows():
+            ratio = row['value'] / best_value if best_value > 0 else np.inf
+            ratios.append({
+                'method': row['method'],
+                'instance': instance,
+                'ratio': ratio
+            })
+
+    if not ratios:
+        warnings.warn("No valid ratios computed for performance profile")
+        return None
+
+    df_ratios = pd.DataFrame(ratios)
+
+    # Compute performance profile curves
+    if config and hasattr(config.plots, 'performance_profile'):
+        tau_values = config.plots.performance_profile.get('tau_values',
+                                                          [1.0, 1.05, 1.1, 1.2, 1.5, 2.0])
+    else:
+        tau_values = np.linspace(1.0, 3.0, 50)
+
+    tau_values = np.array(tau_values)
+
+    profiles = {}
+    for method in methods:
+        df_method = df_ratios[df_ratios['method'] == method]
+        ratios_method = df_method['ratio'].values
+
+        # For each tau, compute fraction of instances where ratio <= tau
+        profile = []
+        for tau in tau_values:
+            frac = np.mean(ratios_method <= tau)
+            profile.append(frac)
+
+        profiles[method] = np.array(profile)
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Color palette
+    colors = sns.color_palette('Set2', n_colors=len(methods))
+    method_colors = dict(zip(methods, colors))
+
+    # Plot curves
+    for method in methods:
+        ax.plot(
+            tau_values,
+            profiles[method],
+            linewidth=2.5,
+            marker='o',
+            markersize=4,
+            label=method.replace('_', ' ').title(),
+            color=method_colors[method],
+            alpha=0.8
+        )
+
+    # Formatting
+    ax.set_xlabel('Performance Ratio τ (relative to best)', fontsize=12)
+    ax.set_ylabel('P(performance ratio ≤ τ)', fontsize=12)
+    ax.set_title(f'Performance Profile: {metric.replace("_", " ").title()}',
+                 fontsize=13, fontweight='bold')
+    ax.legend(loc='lower right', fontsize=10, framealpha=0.9)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim([tau_values.min(), tau_values.max()])
+    ax.set_ylim([0, 1.05])
+
+    # Add horizontal line at y=1
+    ax.axhline(y=1.0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+
+    # Add vertical line at τ=1 (best method)
+    ax.axvline(x=1.0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+
+    # Add text annotation
+    n_instances = len(instances)
+    ax.text(
+        0.02, 0.02,
+        f'n = {n_instances} instances',
+        transform=ax.transAxes,
+        fontsize=9,
+        verticalalignment='bottom',
+        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3)
+    )
+
+    plt.tight_layout()
+
+    # Save
+    if output_dir:
+        for fmt in ['png', 'pdf']:
+            save_path = output_dir / f'f7a_performance_profile_{metric}.{fmt}'
+            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"      Saved: {save_path.name}")
+
+    return fig
+
+
+# ============================================================================
+# 🔥 更新：F5 - 校准诊断（使用 z_scores）
+# ============================================================================
+
+def plot_calibration_diagnostics(all_results: Dict,
+                                 output_dir: Path = None,
+                                 config=None) -> plt.Figure:
+    """
+    Plot calibration diagnostics: coverage curves and PIT histograms.
+
+    Args:
+        all_results: Dictionary of results by method
+        output_dir: Directory to save plots
+        config: Configuration object
+
+    Returns:
+        Figure object
+    """
+    # Extract z-scores from all methods
+    z_scores_by_method = {}
+
+    for method_name, method_data in all_results.items():
+        all_z_scores = []
+
+        for k, budget_data in method_data['budgets'].items():
+            fold_results = budget_data.get('fold_results', [])
+
+            for fold_res in fold_results:
+                if not fold_res['success']:
+                    continue
+
+                metrics = fold_res['metrics']
+                if 'z_scores' in metrics:
+                    z_scores = metrics['z_scores']
+                    all_z_scores.extend(z_scores)
+
+        if all_z_scores:
+            z_scores_by_method[method_name] = np.array(all_z_scores)
+
+    if not z_scores_by_method:
+        warnings.warn("No z_scores found in results. Ensure compute_metrics saves z_scores.")
+        return None
+
+    # Create figure with subplots
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Color palette
+    methods = list(z_scores_by_method.keys())
+    colors = sns.color_palette('Set2', n_colors=len(methods))
+    method_colors = dict(zip(methods, colors))
+
+    # --- Subplot 1: Coverage curves (empirical CDF of |z|)
+    ax = axes[0]
+
+    # Standard normal reference
+    z_ref = np.linspace(0, 3.5, 100)
+    coverage_ref = 2 * (1 - 0.5 * (1 + np.sign(z_ref) * np.sqrt(1 - np.exp(-2 * z_ref ** 2 / np.pi))))
+    # Actually, for |Z|, coverage = 2*Φ(z) - 1
+    from scipy.stats import norm
+    coverage_ref = 2 * norm.cdf(z_ref) - 1
+
+    ax.plot(z_ref, coverage_ref, 'k--', linewidth=2, label='Ideal (N(0,1))', alpha=0.7)
+
+    for method in methods:
+        z = z_scores_by_method[method]
+        z_abs = np.abs(z)
+        z_abs_sorted = np.sort(z_abs)
+
+        # Empirical CDF
+        n = len(z_abs_sorted)
+        empirical_cdf = np.arange(1, n + 1) / n
+
+        ax.plot(
+            z_abs_sorted,
+            empirical_cdf,
+            linewidth=2,
+            label=method.replace('_', ' ').title(),
+            color=method_colors[method],
+            alpha=0.8
+        )
+
+    # Add reference lines for common confidence levels
+    for alpha, z_val in [(0.90, 1.645), (0.95, 1.96)]:
+        ax.axvline(x=z_val, color='gray', linestyle=':', linewidth=1, alpha=0.5)
+        ax.axhline(y=alpha, color='gray', linestyle=':', linewidth=1, alpha=0.5)
+        ax.text(z_val, 0.02, f'{int(alpha * 100)}%', fontsize=8, ha='center')
+
+    ax.set_xlabel('|Standardized Error|', fontsize=11)
+    ax.set_ylabel('Empirical Coverage', fontsize=11)
+    ax.set_title('Coverage Calibration', fontsize=12, fontweight='bold')
+    ax.legend(loc='lower right', fontsize=9, framealpha=0.9)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim([0, 3.5])
+    ax.set_ylim([0, 1.05])
+
+    # --- Subplot 2: PIT histogram (probability integral transform)
+    ax = axes[1]
+
+    # Convert z-scores to uniform via Φ(z)
+    for method in methods:
+        z = z_scores_by_method[method]
+        pit_values = norm.cdf(z)
+
+        ax.hist(
+            pit_values,
+            bins=20,
+            alpha=0.6,
+            label=method.replace('_', ' ').title(),
+            color=method_colors[method],
+            edgecolor='black',
+            linewidth=0.5,
+            density=True
+        )
+
+    # Add uniform reference line
+    ax.axhline(y=1.0, color='black', linestyle='--', linewidth=2,
+               label='Ideal (Uniform)', alpha=0.7)
+
+    ax.set_xlabel('PIT Value', fontsize=11)
+    ax.set_ylabel('Density', fontsize=11)
+    ax.set_title('Probability Integral Transform', fontsize=12, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_xlim([0, 1])
+
+    plt.tight_layout()
+
+    # Save
+    if output_dir:
+        for fmt in ['png', 'pdf']:
+            save_path = output_dir / f'f5_calibration_diagnostics.{fmt}'
+            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"      Saved: {save_path.name}")
+
+    return fig
+
+
+# ============================================================================
+# 🔥 辅助函数：提取 selection result 中的 costs（如果没有存储）
+# ============================================================================
+
+def extract_sensor_costs_from_results(all_results: Dict, sensors: List) -> Dict:
+    """
+    Extract per-sensor costs from selection results.
+
+    This is a helper to reconstruct costs if they weren't stored in SelectionResult.
+
+    Args:
+        all_results: Dictionary of results
+        sensors: Original sensor pool
+
+    Returns:
+        Dictionary mapping (method, budget, fold, step) -> cost
+    """
+    costs_map = {}
+
+    for method_name, method_data in all_results.items():
+        for k, budget_data in method_data['budgets'].items():
+            fold_results = budget_data.get('fold_results', [])
+
+            for fold_idx, fold_res in enumerate(fold_results):
+                if not fold_res['success']:
+                    continue
+
+                sel_result = fold_res['selection_result']
+                selected_ids = sel_result.selected_ids
+
+                for step, sensor_id in enumerate(selected_ids):
+                    cost = sensors[sensor_id].cost
+                    costs_map[(method_name, k, fold_idx, step)] = cost
+
+    return costs_map
 
 
 def plot_critical_difference(results_by_method: Dict,

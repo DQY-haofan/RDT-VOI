@@ -3,28 +3,49 @@ Main experimental script for RDT-VoI simulation.
 Runs complete benchmarking suite with spatial CV.
 """
 
-import numpy as np
 from pathlib import Path
 from datetime import datetime
 import json
 import pickle
 import sys
+import warnings
+import numpy as np
+import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
-
+from typing import Dict, List
+import pickle
+import time
 from config import load_config
 from geometry import build_grid2d_geometry
 from spatial_field import build_prior, sample_gmrf
 from sensors import generate_sensor_pool
-from selection import greedy_mi, greedy_aopt, uniform_selection, random_selection
-from evaluation import run_cv_experiment, spatial_bootstrap, spatial_block_cv
-from visualization import (setup_style, plot_budget_curves, plot_marginal_mi,
-                          plot_residual_map, plot_performance_profile,
-                          plot_critical_difference)
+from inference import compute_posterior, compute_posterior_variance_diagonal
+from sensors import get_observation
 
+from selection import greedy_mi, greedy_aopt, uniform_selection, random_selection
+from evaluation import spatial_block_cv, compute_metrics, morans_i
+# 🔥 Import new method wrappers
+from method_wrappers import (
+    get_selection_method,
+    get_available_methods,
+    should_use_evi
+)
+
+# 🔥 Import visualization
+from visualization import (
+    plot_budget_curves,
+    plot_performance_profile,
+    plot_critical_difference,
+    plot_marginal_mi,
+    plot_mi_evi_correlation,
+    plot_marginal_efficiency,
+    plot_calibration_diagnostics,
+    plot_sensor_placement_map, setup_style
+)
 
 # 🔥 添加自定义JSON encoder
 class NumpyEncoder(json.JSONEncoder):
@@ -96,87 +117,260 @@ def get_selection_method(method_name: str, geom, rng_seed: int = None):
         raise ValueError(f"Unknown method: {method_name}")
 
 
-def run_single_fold_worker(method_name, geom, Q_pr, mu_pr, x_true,
-                           sensors, k, train_idx, test_idx,
-                           decision_config, fold_idx, seed):
+def run_single_fold_worker(fold_data: Dict) -> Dict:
     """
-    单个fold的worker函数
+    Worker function for a single CV fold.
+    Separates selection from evaluation for parallel execution.
 
     Args:
-        method_name: 方法名称
-        geom: 几何对象
-        Q_pr, mu_pr: 先验参数
-        x_true: 真实状态
-        sensors: 候选传感器列表
-        k: 预算
-        train_idx: 训练集索引
-        test_idx: 测试集索引
-        decision_config: 决策配置
-        fold_idx: Fold索引
-        seed: 随机种子
+        fold_data: Dictionary containing:
+            - train_idx, test_idx: CV split
+            - selection_method: Function to call
+            - k: Budget
+            - Q_pr, mu_pr: Prior
+            - x_true: True state
+            - sensors: Sensor pool
+            - decision_config: Decision model
+            - rng_seed: Random seed for this fold
 
     Returns:
-        (fold_idx, metrics): Fold索引和指标字典
+        Dictionary with metrics and selection results
     """
-    print(f"    Fold {fold_idx + 1}: Starting...")
+    # Unpack data
+    train_idx = fold_data['train_idx']
+    test_idx = fold_data['test_idx']
+    selection_method = fold_data['selection_method']
+    k = fold_data['k']
+    Q_pr = fold_data['Q_pr']
+    mu_pr = fold_data['mu_pr']
+    x_true = fold_data['x_true']
+    sensors = fold_data['sensors']
+    decision_config = fold_data['decision_config']
+    geom = fold_data['geom']
+    rng = np.random.default_rng(fold_data['rng_seed'])
 
-    # 获取方法
-    method_func = get_selection_method(method_name, geom, seed + fold_idx)
+    try:
+        # 🔥 Run selection (pass mu_pr for methods that need it)
+        t_start = time.time()
+        selection_result = selection_method(sensors, k, Q_pr, mu_pr)
+        selection_time = time.time() - t_start
 
-    # 选择传感器
-    selection_result = method_func(sensors, k, Q_pr)
-    selected_sensors = [sensors[i] for i in selection_result.selected_ids]
+        # Get selected sensors
+        selected_sensors = [sensors[i] for i in selection_result.selected_ids]
 
-    # 生成观测
-    from sensors import get_observation
-    import numpy as np
-    rng = np.random.default_rng(seed + fold_idx)
-    y, H, R = get_observation(x_true, selected_sensors, rng)
+        # Generate observations
+        y, H, R = get_observation(x_true, selected_sensors, rng)
 
-    # 计算后验
-    from inference import compute_posterior, compute_posterior_variance_diagonal
-    mu_post, factor = compute_posterior(Q_pr, mu_pr, H, R, y)
+        # Compute posterior
+        t_start = time.time()
+        mu_post, factor = compute_posterior(Q_pr, mu_pr, H, R, y)
+        inference_time = time.time() - t_start
 
-    # 计算后验方差（仅在测试集上）
-    var_post_test = compute_posterior_variance_diagonal(factor, test_idx)
-    sigma_post_test = np.sqrt(np.maximum(var_post_test, 1e-12))
+        # Get posterior uncertainties on test set
+        var_post_test = compute_posterior_variance_diagonal(factor, test_idx)
+        sigma_post_test = np.sqrt(np.maximum(var_post_test, 1e-12))
 
-    # 扩展到全数组（用于compute_metrics）
-    sigma_post = np.zeros(len(mu_post))
-    sigma_post[test_idx] = sigma_post_test
+        # Expand to full arrays for metrics
+        sigma_post = np.zeros(len(mu_post))
+        sigma_post[test_idx] = sigma_post_test
 
-    # 计算指标
-    from evaluation import compute_metrics, morans_i
-    metrics = compute_metrics(
-        mu_post, sigma_post, x_true, test_idx, decision_config
+        # Compute metrics
+        metrics = compute_metrics(
+            mu_post, sigma_post, x_true, test_idx, decision_config
+        )
+
+        # Spatial diagnostics
+        residuals = mu_post - x_true
+        if geom.adjacency is not None:
+            I_stat, I_pval = morans_i(
+                residuals[test_idx],
+                geom.adjacency[test_idx][:, test_idx],
+                n_permutations=999,
+                rng=rng
+            )
+            metrics['morans_i'] = I_stat
+            metrics['morans_pval'] = I_pval
+
+        # Add timing
+        metrics['selection_time_sec'] = selection_time
+        metrics['inference_time_sec'] = inference_time
+
+        # Add selection diagnostics
+        metrics['n_selected'] = len(selection_result.selected_ids)
+        metrics['total_cost'] = selection_result.total_cost
+
+        return {
+            'success': True,
+            'metrics': metrics,
+            'selection_result': selection_result,
+            'mu_post': mu_post,
+            'sigma_post': sigma_post
+        }
+
+    except Exception as e:
+        warnings.warn(f"Fold evaluation failed: {str(e)}")
+        return {
+            'success': False,
+            'error': str(e),
+            'metrics': {}
+        }
+
+
+def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
+                          x_true, sensors, test_idx_global=None) -> Dict:
+    """
+    Run complete evaluation for one method across all budgets and CV folds.
+
+    Args:
+        method_name: Name of selection method
+        cfg: Configuration object
+        geom: Geometry
+        Q_pr, mu_pr: Prior parameters
+        x_true: True state
+        sensors: Candidate sensor pool
+        test_idx_global: Global test indices (for EVI)
+
+    Returns:
+        Dictionary with results organized by budget and fold
+    """
+    print(f"\n{'=' * 70}")
+    print(f"  Method: {method_name.upper()}")
+    print(f"{'=' * 70}")
+
+    rng = cfg.get_rng()
+
+    # Get selection method wrapper
+    selection_method = get_selection_method(
+        method_name, cfg, geom,
+        x_true=x_true,
+        test_idx=test_idx_global
     )
 
-    # 计算Moran's I
-    residuals = mu_post - x_true
-    try:
-        I_stat, I_pval = morans_i(
-            residuals[test_idx],
-            geom.adjacency[test_idx][:, test_idx],
-            n_permutations=499,
-            rng=rng
-        )
-        metrics['morans_i'] = float(I_stat)
-        metrics['morans_pval'] = float(I_pval)
-    except:
-        metrics['morans_i'] = 0.0
-        metrics['morans_pval'] = 1.0
+    # Generate CV folds
+    buffer_width = cfg.cv.buffer_width_multiplier * cfg.prior.correlation_length
+    folds = spatial_block_cv(
+        geom.coords,
+        cfg.cv.k_folds,
+        buffer_width,
+        cfg.cv.block_strategy,
+        rng
+    )
 
-    # 🔥 保存额外数据用于可视化
-    metrics['selection_result'] = selection_result
-    metrics['mu_post'] = mu_post
-    metrics['x_true'] = x_true
-    metrics['test_idx'] = test_idx
-    metrics['fold_idx'] = fold_idx
+    results = {
+        'budgets': {},
+        'method_name': method_name,
+        'n_folds': len(folds)
+    }
 
-    print(f"    Fold {fold_idx + 1}: RMSE={metrics['rmse']:.3f}, "
-          f"Loss=£{metrics['expected_loss_gbp']:.0f}")
+    # Loop over budgets
+    for k in cfg.selection.budgets:
+        print(f"\n  Budget k={k}")
+        print(f"  {'-' * 50}")
 
-    return fold_idx, metrics
+        budget_results = {
+            'fold_results': [],
+            'fold_metrics': []
+        }
+
+        # Loop over folds
+        for fold_idx, (train_idx, test_idx) in enumerate(folds):
+            # 🔥 Check if should run (for EVI cost control)
+            if not should_use_evi(method_name, k, fold_idx, cfg):
+                print(f"    Fold {fold_idx + 1}/{len(folds)}: SKIPPED (EVI subset)")
+                continue
+
+            print(f"    Fold {fold_idx + 1}/{len(folds)}: "
+                  f"train={len(train_idx)}, test={len(test_idx)}")
+
+            # Prepare fold data
+            fold_data = {
+                'train_idx': train_idx,
+                'test_idx': test_idx,
+                'selection_method': selection_method,
+                'k': k,
+                'Q_pr': Q_pr,
+                'mu_pr': mu_pr,
+                'x_true': x_true,
+                'sensors': sensors,
+                'decision_config': cfg.decision,
+                'geom': geom,
+                'rng_seed': rng.integers(0, 2 ** 31)
+            }
+
+            # Run fold
+            fold_result = run_single_fold_worker(fold_data)
+
+            if fold_result['success']:
+                budget_results['fold_results'].append(fold_result)
+                budget_results['fold_metrics'].append(fold_result['metrics'])
+
+                # Print key metrics
+                m = fold_result['metrics']
+                print(f"        RMSE={m['rmse']:.3f}, "
+                      f"Loss=£{m['expected_loss_gbp']:.0f}, "
+                      f"Coverage={m['coverage_90']:.2%}")
+            else:
+                print(f"        FAILED: {fold_result['error']}")
+
+        # Aggregate metrics across folds
+        if budget_results['fold_metrics']:
+            aggregated = {}
+            for key in budget_results['fold_metrics'][0].keys():
+                if key == 'z_scores':  # Skip array fields
+                    continue
+                values = [m[key] for m in budget_results['fold_metrics']
+                          if key in m]
+                if values:
+                    aggregated[key] = {
+                        'mean': float(np.mean(values)),
+                        'std': float(np.std(values)),
+                        'values': values
+                    }
+            budget_results['aggregated'] = aggregated
+
+            # Print summary
+            print(f"\n    Summary (n={len(budget_results['fold_metrics'])} folds):")
+            if 'expected_loss_gbp' in aggregated:
+                loss = aggregated['expected_loss_gbp']
+                print(f"      Loss: £{loss['mean']:.0f} ± {loss['std']:.0f}")
+            if 'rmse' in aggregated:
+                rmse = aggregated['rmse']
+                print(f"      RMSE: {rmse['mean']:.3f} ± {rmse['std']:.3f}")
+
+        results['budgets'][k] = budget_results
+
+    return results
+
+
+def aggregate_results_for_visualization(all_results: Dict) -> pd.DataFrame:
+    """
+    Convert nested results dictionary to flat DataFrame for visualization.
+
+    Args:
+        all_results: Dictionary with structure:
+            {method_name: {budgets: {k: {aggregated: {...}}}}}
+
+    Returns:
+        DataFrame with columns: method, budget, metric, mean, std, values
+    """
+    rows = []
+
+    for method_name, method_data in all_results.items():
+        for k, budget_data in method_data['budgets'].items():
+            if 'aggregated' not in budget_data:
+                continue
+
+            for metric_name, metric_data in budget_data['aggregated'].items():
+                rows.append({
+                    'method': method_name,
+                    'budget': k,
+                    'metric': metric_name,
+                    'mean': metric_data['mean'],
+                    'std': metric_data['std'],
+                    'values': metric_data['values']
+                })
+
+    return pd.DataFrame(rows)
 
 def serialize_sparse_matrix(mat):
     """将稀疏矩阵序列化为字典"""
@@ -835,33 +1029,245 @@ def run_full_experiment(cfg):
 
 
 def main():
-    """Main entry point."""
-    import argparse
+    """Main evaluation pipeline."""
 
-    parser = argparse.ArgumentParser(description='RDT-VoI Simulation')
-    parser.add_argument('--config', default='config.yaml', help='Config file path')
-    parser.add_argument('--milestone', choices=['m1', 'm2', 'full'],
-                       default='full', help='Which milestone to run')
-    args = parser.parse_args()
+    print("=" * 70)
+    print("  RDT-VoI EVALUATION FRAMEWORK")
+    print("=" * 70)
 
-    # Load configuration
+    # ========================================================================
+    # 1. SETUP
+    # ========================================================================
+    print("\n[1] Loading configuration...")
+    cfg = load_config()
+    rng = cfg.get_rng()
+
+    # Create output directory
+    output_dir = Path(cfg.experiment.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"    Output directory: {output_dir}")
+
+    # Save config copy
+    cfg.save_to(output_dir)
+
+    # ========================================================================
+    # 2. BUILD SPATIAL DOMAIN
+    # ========================================================================
+    print("\n[2] Building spatial domain...")
+    geom = build_grid2d_geometry(cfg.geometry.nx, cfg.geometry.ny, cfg.geometry.h)
+    print(f"    Domain: {geom.n} locations, {geom.adjacency.nnz} edges")
+
+    # ========================================================================
+    # 3. CONSTRUCT PRIOR
+    # ========================================================================
+    print("\n[3] Constructing GMRF prior...")
+    Q_pr, mu_pr = build_prior(geom, cfg.prior)
+    print(f"    Precision sparsity: {Q_pr.nnz / geom.n ** 2 * 100:.2f}%")
+    print(f"    Correlation length: {cfg.prior.correlation_length:.1f} m")
+
+    # ========================================================================
+    # 4. SAMPLE TRUE STATE
+    # ========================================================================
+    print("\n[4] Sampling true deterioration state...")
+    x_true = sample_gmrf(Q_pr, mu_pr, rng)
+    print(f"    State range: [{x_true.min():.2f}, {x_true.max():.2f}]")
+    print(f"    Mean: {x_true.mean():.2f}, Std: {x_true.std():.2f}")
+
+    # Save true state
+    np.save(output_dir / 'x_true.npy', x_true)
+
+    # ========================================================================
+    # 5. GENERATE SENSOR POOL
+    # ========================================================================
+    print("\n[5] Generating sensor pool...")
+    sensors = generate_sensor_pool(geom, cfg.sensors, rng)
+    print(f"    Pool size: {len(sensors)} candidates")
+
+    # Type distribution
+    type_counts = {}
+    for s in sensors:
+        type_counts[s.type_name] = type_counts.get(s.type_name, 0) + 1
+    print("    Type distribution:")
+    for tname, count in type_counts.items():
+        print(f"      {tname}: {count} ({count / len(sensors) * 100:.1f}%)")
+
+    # ========================================================================
+    # 6. PREPARE TEST SET (for EVI and diagnostics)
+    # ========================================================================
+    print("\n[6] Preparing global test set for EVI...")
+    n_test = min(200, geom.n)
+    test_idx_global = rng.choice(geom.n, size=n_test, replace=False)
+    print(f"    Test set size: {n_test}")
+
+    # ========================================================================
+    # 7. RUN METHOD EVALUATIONS
+    # ========================================================================
+    print("\n[7] Running method evaluations...")
+
+    methods = get_available_methods(cfg)
+    print(f"    Methods to evaluate: {', '.join(methods)}")
+
+    all_results = {}
+
+    for method_name in methods:
+        t_method_start = time.time()
+
+        try:
+            results = run_method_evaluation(
+                method_name=method_name,
+                cfg=cfg,
+                geom=geom,
+                Q_pr=Q_pr,
+                mu_pr=mu_pr,
+                x_true=x_true,
+                sensors=sensors,
+                test_idx_global=test_idx_global
+            )
+            all_results[method_name] = results
+
+            t_method_elapsed = time.time() - t_method_start
+            print(f"\n  ✓ {method_name} completed in {t_method_elapsed:.1f}s")
+
+        except Exception as e:
+            print(f"\n  ✗ {method_name} FAILED: {str(e)}")
+            warnings.warn(f"Method {method_name} failed: {str(e)}")
+            continue
+
+    # ========================================================================
+    # 8. SAVE RESULTS
+    # ========================================================================
+    print("\n[8] Saving results...")
+
+    # Save raw results
+    with open(output_dir / 'results_raw.pkl', 'wb') as f:
+        pickle.dump(all_results, f)
+    print(f"    Saved: results_raw.pkl")
+
+    # Convert to DataFrame for easy analysis
+    df_results = aggregate_results_for_visualization(all_results)
+    df_results.to_csv(output_dir / 'results_aggregated.csv', index=False)
+    print(f"    Saved: results_aggregated.csv")
+
+    # ========================================================================
+    # 9. VISUALIZATION
+    # ========================================================================
+    print("\n[9] Generating visualizations...")
+
+    plots_dir = output_dir / 'plots'
+    plots_dir.mkdir(exist_ok=True)
+
     try:
-        cfg = load_config(args.config)
-    except FileNotFoundError as e:
-        print(f"\n⌫ Error: {e}")
-        print("\nPlease create config.yaml in project root.")
-        print("You can copy from the provided template.")
-        return 1
+        # 🔥 F1: Budget-performance curves
+        print("    [F1] Budget-performance curves...")
+        fig = plot_budget_curves(
+            df_results,
+            metrics=['rmse', 'expected_loss_gbp', 'coverage_90'],
+            output_dir=plots_dir,
+            config=cfg
+        )
 
-    # Run experiment
-    try:
-        run_full_experiment(cfg)
-        return 0
+        # 🔥 F2: Marginal efficiency
+        print("    [F2] Marginal efficiency...")
+        fig = plot_marginal_efficiency(
+            all_results,
+            output_dir=plots_dir,
+            config=cfg
+        )
+
+        # 🔥 F7a: Performance profile
+        print("    [F7a] Performance profile...")
+        fig = plot_performance_profile(
+            df_results,
+            metric='expected_loss_gbp',
+            output_dir=plots_dir,
+            config=cfg
+        )
+
+        # 🔥 F7b: Critical difference diagram
+        print("    [F7b] Critical difference diagram...")
+        fig = plot_critical_difference(
+            df_results,
+            metric='expected_loss_gbp',
+            output_dir=plots_dir,
+            config=cfg
+        )
+
+        # 🔥 F4: MI-EVI correlation (if both methods ran)
+        if 'greedy_mi' in all_results and 'greedy_evi' in all_results:
+            print("    [F4] MI-EVI correlation...")
+            fig = plot_mi_evi_correlation(
+                all_results['greedy_mi'],
+                all_results['greedy_evi'],
+                output_dir=plots_dir,
+                config=cfg
+            )
+
+        # 🔥 F5: Calibration diagnostics
+        print("    [F5] Calibration diagnostics...")
+        fig = plot_calibration_diagnostics(
+            all_results,
+            output_dir=plots_dir,
+            config=cfg
+        )
+
+        # 🔥 F8: Sensor placement maps
+        if cfg.plots.expert_plots.get('sensor_placement_map', {}).get('enable', False):
+            print("    [F8] Sensor placement maps...")
+            fig = plot_sensor_placement_map(
+                all_results,
+                geom,
+                x_true,
+                output_dir=plots_dir,
+                config=cfg
+            )
+
+        print(f"    ✓ All plots saved to: {plots_dir}")
+
     except Exception as e:
-        print(f"\n⌫ Experiment failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
+        print(f"    ✗ Visualization failed: {str(e)}")
+        warnings.warn(f"Visualization error: {str(e)}")
+
+    # ========================================================================
+    # 10. SUMMARY REPORT
+    # ========================================================================
+    print("\n" + "=" * 70)
+    print("  EVALUATION COMPLETE")
+    print("=" * 70)
+
+    print("\nSummary:")
+    print(f"  Methods evaluated: {len(all_results)}")
+    print(f"  Budgets: {cfg.selection.budgets}")
+    print(f"  CV folds: {cfg.cv.k_folds}")
+    print(f"  Total domain size: {geom.n}")
+    print(f"  Candidate pool: {len(sensors)}")
+
+    print(f"\nResults saved to: {output_dir}")
+    print(f"  - results_raw.pkl (Python pickle)")
+    print(f"  - results_aggregated.csv (tabular)")
+    print(f"  - plots/ (all figures)")
+
+    # Print best method per metric
+    print("\nBest methods (at k=30):")
+    for metric in ['rmse', 'expected_loss_gbp', 'coverage_90']:
+        try:
+            df_k30 = df_results[
+                (df_results['budget'] == 30) &
+                (df_results['metric'] == metric)
+                ]
+            if not df_k30.empty:
+                if metric == 'coverage_90':
+                    # Closer to 0.90 is better
+                    df_k30['score'] = -np.abs(df_k30['mean'] - 0.90)
+                    best_row = df_k30.loc[df_k30['score'].idxmax()]
+                else:
+                    # Lower is better
+                    best_row = df_k30.loc[df_k30['mean'].idxmin()]
+                print(f"  {metric:20s}: {best_row['method']:15s} "
+                      f"({best_row['mean']:.3f} ± {best_row['std']:.3f})")
+        except:
+            pass
+
+    print("\n" + "=" * 70)
 
 
 if __name__ == "__main__":
