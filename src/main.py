@@ -520,12 +520,254 @@ def run_milestone_m2(cfg, output_dir):
         'random_loss': random_loss
     }
 
+
     with open(output_dir / "m2_summary.json", 'w', encoding='utf-8') as f:
         json.dump(m2_summary, f, indent=2, cls=NumpyEncoder)
 
+    try:
+        generate_all_expert_plots(all_results, cfg, geom, sensors, output_dir)
+    except Exception as e:
+        print(f"⚠️  Visualization generation failed: {e}")
+        import traceback
+        traceback.print_exc()
 
     return m2_summary, all_results
 
+
+def generate_all_expert_plots(all_results, cfg, geom, sensors, output_dir):
+    """
+    生成专家建议的所有图像
+
+    Args:
+        all_results: 所有方法的实验结果
+        cfg: 配置对象
+        geom: 几何对象
+        sensors: 传感器列表
+        output_dir: 输出目录
+    """
+    from visualization import (
+        setup_style,
+        plot_budget_curves,
+        plot_marginal_efficiency,
+        plot_type_composition,
+        plot_mi_voi_correlation,
+        plot_calibration_diagnostics,
+        plot_spatial_diagnostics_enhanced,
+        plot_performance_profile,
+        plot_critical_difference,
+        plot_sensor_placement_map
+    )
+
+    print("\n" + "=" * 60)
+    print("GENERATING EXPERT-RECOMMENDED VISUALIZATIONS")
+    print("=" * 60)
+
+    setup_style()
+
+    # 创建输出子目录
+    curves_dir = output_dir / "curves"
+    maps_dir = output_dir / "maps"
+    calibration_dir = output_dir / "calibration"
+    comparison_dir = output_dir / "comparison"
+
+    for d in [curves_dir, maps_dir, calibration_dir, comparison_dir]:
+        d.mkdir(exist_ok=True)
+
+    # ========== F1: 预算-损失前沿 ==========
+    print("\n📈 F1: Budget-Loss Frontier...")
+    try:
+        # 重组数据为 plot_budget_curves 需要的格式
+        results_by_method = {}
+        for method_name in all_results.keys():
+            results_by_method[method_name] = {}
+            for budget in all_results[method_name].keys():
+                results_by_method[method_name][budget] = all_results[method_name][budget]
+
+        plot_budget_curves(
+            results_by_method,
+            metric='expected_loss_gbp',
+            output_path=curves_dir / "f1_budget_loss_frontier.png",
+            show_ci=True
+        )
+        print("  ✅ F1 saved")
+    except Exception as e:
+        print(f"  ❌ F1 failed: {e}")
+
+    # ========== F2: 单位成本效率 ==========
+    print("\n💰 F2: Marginal Efficiency Curves...")
+    try:
+        for method_name in ['Greedy-MI', 'Greedy-A']:
+            if method_name not in all_results:
+                continue
+
+            # 获取最大预算的结果（包含完整的选择历史）
+            max_budget = max(all_results[method_name].keys())
+            result_data = all_results[method_name][max_budget]
+
+            # 从第一个fold获取selection_result
+            if 'fold_results' in result_data and len(result_data['fold_results']) > 0:
+                fold_0 = result_data['fold_results'][0]
+                if 'selection_result' in fold_0:
+                    selection_result = fold_0['selection_result']
+
+                    plot_marginal_efficiency(
+                        selection_result,
+                        sensors,
+                        output_path=curves_dir / f"f2_efficiency_{method_name.lower().replace('-', '_')}.png"
+                    )
+        print("  ✅ F2 saved")
+    except Exception as e:
+        print(f"  ❌ F2 failed: {e}")
+
+    # ========== F3: 类型堆叠图 ==========
+    print("\n🎨 F3: Type Composition...")
+    try:
+        for method_name in ['Greedy-MI']:
+            if method_name not in all_results:
+                continue
+
+            max_budget = max(all_results[method_name].keys())
+            result_data = all_results[method_name][max_budget]
+
+            if 'fold_results' in result_data and len(result_data['fold_results']) > 0:
+                fold_0 = result_data['fold_results'][0]
+                if 'selection_result' in fold_0:
+                    selection_result = fold_0['selection_result']
+
+                    plot_type_composition(
+                        selection_result,
+                        sensors,
+                        output_path=curves_dir / f"f3_type_composition_{method_name.lower().replace('-', '_')}.png"
+                    )
+        print("  ✅ F3 saved")
+    except Exception as e:
+        print(f"  ❌ F3 failed: {e}")
+
+    # ========== F4: MI vs VoI 相关性 ==========
+    print("\n🔗 F4: MI vs VoI Correlation...")
+    try:
+        # 需要收集MI和EVI数据
+        # 这需要在实验过程中保存EVI值
+        # 如果没有EVI数据，跳过
+        print("  ⏭️  F4 skipped (requires EVI computation)")
+    except Exception as e:
+        print(f"  ❌ F4 failed: {e}")
+
+    # ========== F5: 校准诊断 ==========
+    print("\n📊 F5: Calibration Diagnostics...")
+    try:
+        for method_name in ['Greedy-MI']:
+            if method_name not in all_results:
+                continue
+
+            # 收集所有预算的fold结果
+            all_fold_results = []
+            for budget in all_results[method_name].keys():
+                result_data = all_results[method_name][budget]
+                if 'fold_results' in result_data:
+                    all_fold_results.extend(result_data['fold_results'])
+
+            if all_fold_results:
+                plot_calibration_diagnostics(
+                    all_fold_results,
+                    output_path=calibration_dir / f"f5_calibration_{method_name.lower().replace('-', '_')}.png"
+                )
+        print("  ✅ F5 saved")
+    except Exception as e:
+        print(f"  ❌ F5 failed: {e}")
+
+    # ========== F6: 空间诊断 ==========
+    print("\n🗺️  F6: Spatial Diagnostics...")
+    try:
+        for method_name in ['Greedy-MI', 'Random']:
+            if method_name not in all_results:
+                continue
+
+            # 使用中等预算的结果
+            budgets = list(all_results[method_name].keys())
+            mid_budget = budgets[len(budgets) // 2]
+            result_data = all_results[method_name][mid_budget]
+
+            if 'fold_results' in result_data and len(result_data['fold_results']) > 0:
+                fold_0 = result_data['fold_results'][0]
+
+                # 需要从fold中提取 mu_post, x_true, test_idx
+                # 这些数据需要在实验时保存
+                print(f"  ⏭️  F6 for {method_name} skipped (needs mu_post/x_true from folds)")
+        print("  ⚠️  F6 partially implemented")
+    except Exception as e:
+        print(f"  ❌ F6 failed: {e}")
+
+    # ========== F7: 性能剖面 + CD图 ==========
+    print("\n📉 F7: Performance Profile & Critical Difference...")
+    try:
+        # 重组数据为性能剖面格式
+        perf_data = {}
+        for method_name in all_results.keys():
+            perf_data[method_name] = {}
+            for budget in all_results[method_name].keys():
+                instance_key = f"k={budget}"
+                agg = all_results[method_name][budget]['aggregated']
+                perf_data[method_name][instance_key] = agg['expected_loss_gbp']['mean']
+
+        plot_performance_profile(
+            perf_data,
+            metric='expected_loss_gbp',
+            output_path=comparison_dir / "f7a_performance_profile.png",
+            tau_max=3.0
+        )
+
+        plot_critical_difference(
+            perf_data,
+            metric='expected_loss_gbp',
+            output_path=comparison_dir / "f7b_critical_difference.png",
+            alpha=0.05
+        )
+        print("  ✅ F7 saved")
+    except Exception as e:
+        print(f"  ❌ F7 failed: {e}")
+
+    # ========== F8: 消融实验 ==========
+    print("\n🔬 F8: Ablation Study...")
+    print("  ⏭️  F8 skipped (requires separate experiments)")
+
+    # ========== F9: 复杂度分析 ==========
+    print("\n⏱️  F9: Complexity Analysis...")
+    print("  ⏭️  F9 skipped (requires timing instrumentation)")
+
+    # ========== F10: 选址地图 ==========
+    print("\n🗺️  F10: Sensor Placement Maps...")
+    try:
+        for method_name in ['Greedy-MI']:
+            if method_name not in all_results:
+                continue
+
+            for budget in all_results[method_name].keys():
+                result_data = all_results[method_name][budget]
+
+                if 'fold_results' in result_data and len(result_data['fold_results']) > 0:
+                    fold_0 = result_data['fold_results'][0]
+                    if 'selection_result' in fold_0:
+                        selection_result = fold_0['selection_result']
+
+                        plot_sensor_placement_map(
+                            geom.coords,
+                            selection_result.selected_ids,
+                            sensors,
+                            output_path=maps_dir / f"f10_placement_{method_name.lower().replace('-', '_')}_k{budget}.png"
+                        )
+        print("  ✅ F10 saved")
+    except Exception as e:
+        print(f"  ❌ F10 failed: {e}")
+
+    print("\n" + "=" * 60)
+    print("VISUALIZATION COMPLETE")
+    print("=" * 60)
+    print(f"\n📂 All plots saved to: {output_dir}")
+    print(f"   - Curves: {curves_dir}")
+    print(f"   - Maps: {maps_dir}")
+    print(f"   - Calibration: {calibration_dir}")
+    print(f"   - Comparison: {comparison_dir}")
 
 def run_full_experiment(cfg):
     """Run complete experimental pipeline."""
