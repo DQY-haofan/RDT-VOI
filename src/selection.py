@@ -9,15 +9,28 @@ from typing import List, Tuple
 import heapq
 from dataclasses import dataclass
 
-
+# 🔥 关键导入 - 确保这些都存在
+from sensors import Sensor, assemble_H_R
+from inference import (
+    SparseFactor,
+    compute_posterior,
+    compute_posterior_variance_diagonal,
+    compute_mutual_information,
+    quadform_via_solve
+)
 @dataclass
 class SelectionResult:
-    """Result container for sensor selection."""
+    """Container for selection algorithm results."""
     selected_ids: List[int]
-    objective_values: List[float]  # Value after each addition
-    marginal_gains: List[float]  # Marginal gain at each step
+    objective_values: List[float]
+    marginal_gains: List[float]
     total_cost: float
     method_name: str
+
+    def __repr__(self):
+        return (f"SelectionResult(method={self.method_name}, "
+                f"n_selected={len(self.selected_ids)}, "
+                f"total_cost=£{self.total_cost:.0f})")
 
 
 def greedy_mi(sensors: List, k: int, Q_pr: sp.spmatrix,
@@ -324,191 +337,204 @@ def greedy_aopt(sensors: List, k: int, Q_pr: sp.spmatrix,
 # 🔥 新增：Myopic EVI (决策感知选址)
 # =====================================================================
 
-def greedy_evi_myopic(sensors: List, k: int, Q_pr: sp.spmatrix,
+def greedy_evi_myopic(sensors: List[Sensor],
+                      k: int,
+                      Q_pr: sp.spmatrix,
                       mu_pr: np.ndarray,
                       decision_config,
-                      test_idx: np.ndarray = None,
+                      test_idx: np.ndarray,
                       costs: np.ndarray = None,
                       n_y_samples: int = 25,
                       use_cost: bool = True,
-                      rng: np.random.Generator = None) -> SelectionResult:
+                      rng: np.random.Generator = None,
+                      verbose: bool = True) -> SelectionResult:
     """
-    Greedy Expected Value of Information (EVI) sensor selection.
+    🔥 优化版本：支持批量RHS + 预筛选
 
-    At each step, selects the sensor that maximizes expected reduction in
-    decision loss (economic risk) per unit cost.
+    Greedy sensor selection using myopic Expected Value of Information.
 
-    Uses rank-1 posterior update formula for fast candidate evaluation:
-    - Prior: μ, Σ
-    - Observation model: y ~ N(h^T μ, h^T Σ h + r)
-    - Posterior (given y): μ'(y) = μ + (Σh)(y - h^T μ)/(r + h^T Σ h)
-    - EVI ≈ E_y[Risk_prior - Risk_posterior(y)]
-
-    Args:
-        sensors: List of candidate sensors
-        k: Budget (number to select)
-        Q_pr: Prior precision matrix
-        mu_pr: Prior mean vector
-        decision_config: Decision configuration with tau_iri, L_FP, L_FN, etc.
-        test_idx: Test set indices (if None, use random subset)
-        costs: Cost array (if None, use sensor.cost)
-        n_y_samples: Number of Monte Carlo samples for EVI approximation
-        use_cost: Whether to use gain/cost scoring
-        rng: Random number generator
-
-    Returns:
-        SelectionResult with selected sensors
+    优化策略：
+    1. 批量求解所有候选的 Σh (一次多RHS solve)
+    2. 先用MI/cost预筛选出Top-L候选
+    3. 只对Top-L做昂贵的EVI评估
     """
-    from inference import SparseFactor, compute_posterior_variance_diagonal
+    from inference import SparseFactor, compute_posterior, compute_posterior_variance_diagonal
     from decision import expected_loss
+    from sensors import assemble_H_R
+    import time
 
     if rng is None:
-        rng = np.random.default_rng(42)
+        rng = np.random.default_rng()
 
-    n = len(mu_pr)
-    m_cand = len(sensors)
+    n = Q_pr.shape[0]
+    m_total = len(sensors)
 
-    # Extract costs
     if costs is None:
-        costs = np.array([s.cost for s in sensors], dtype=float)
+        costs = np.ones(m_total)
 
-    # Test set for risk evaluation (use subset if large)
-    if test_idx is None:
-        n_test = min(200, n)
-        test_idx = rng.choice(n, size=n_test, replace=False)
-    else:
-        n_test = len(test_idx)
+    # 初始化
+    selected = []
+    selected_ids = []
+    objective_values = []
+    marginal_gains = []
+    total_cost = 0.0
+    remaining = list(range(m_total))
 
-    print(f"  Factorizing prior (n={n})...")
-    F = SparseFactor(Q_pr)
+    # 先验因子（用于批量求解）
+    factor_pr = SparseFactor(Q_pr)
 
-    # --- Compute prior risk (on test set only)
-    print(f"  Computing prior risk on {n_test} test points...")
-    sigma_pr_test = np.sqrt(compute_posterior_variance_diagonal(F, test_idx))
+    # 🔥 优化1：预计算所有候选的观测矩阵行向量（用于批量求解）
+    if verbose:
+        print("  [EVI] Pre-computing observation vectors...")
+
+    H_rows = []
+    for s in sensors:
+        h_row = np.zeros(n)
+        h_row[s.idxs] = s.weights
+        H_rows.append(h_row)
+    H_all = np.array(H_rows).T  # (n, m_total)
+
+    # 🔥 优化2：一次性求解所有 z_h = Σ * h
+    if verbose:
+        print("  [EVI] Batch solving Σ * H...")
+    start_time = time.time()
+    Z_all = factor_pr.solve_multi(H_all)  # (n, m_total) - 一次solve完成!
+    solve_time = time.time() - start_time
+    if verbose:
+        print(f"    Solved {m_total} RHS in {solve_time:.2f}s")
+
+    # 先验风险（固定值，所有样本共享）
+    var_pr_test = compute_posterior_variance_diagonal(factor_pr, test_idx)
+    sigma_pr_test = np.sqrt(np.maximum(var_pr_test, 1e-12))
     prior_risk = expected_loss(
         mu_pr[test_idx],
         sigma_pr_test,
         decision_config,
-        test_indices=np.arange(n_test)
+        test_indices=np.arange(len(test_idx))
     )
-    print(f"    Prior risk: £{prior_risk:.2f}")
 
-    # --- Initialize state (will be updated after each selection)
-    cur_mu = mu_pr.copy()
-    cur_diag_full = compute_posterior_variance_diagonal(F, np.arange(n))
-    cur_diag_test = cur_diag_full[test_idx]
+    if verbose:
+        print(f"  [EVI] Prior risk: £{prior_risk:.2f}")
+        if prior_risk < 0.01:
+            print("  ⚠️  WARNING: Prior risk near zero - check config!")
 
-    # Greedy loop
-    selected = []
-    obj_vals = []
-    gains = []
-    total_cost = 0.0
-
-    print(f"  Starting greedy EVI selection for k={k}...")
+    # 贪心选择循环
     for step in range(k):
-        best_idx = -1
-        best_gain = -np.inf
-        best_score = -np.inf
-        best_pack = None
-
-        # --- Evaluate all remaining candidates
-        for i, s in enumerate(sensors):
-            if i in selected:
-                continue
-
-            # Build observation vector h
-            h = np.zeros(n)
-            h[s.idxs] = s.weights
-
-            # Solve for Σ h = Q^{-1} h
-            z_h = F.solve(h)
-
-            # Predictive distribution parameters
-            denom = float(s.noise_var + h @ z_h)
-            if denom <= 0:
-                continue
-
-            y_mean = float(h @ cur_mu)
-            y_std = np.sqrt(denom)
-
-            # --- Monte Carlo over possible observations
-            y_samples = y_mean + y_std * rng.standard_normal(n_y_samples)
-            post_losses = []
-
-            for y_obs in y_samples:
-                # Rank-1 posterior update (on test set only for speed)
-                residual = y_obs - y_mean
-                mu_post_test = cur_mu[test_idx] + z_h[test_idx] * (residual / denom)
-
-                # Update diagonal variance (on test set)
-                diag_post_test = cur_diag_test - (z_h[test_idx] ** 2) / denom
-                diag_post_test = np.maximum(diag_post_test, 1e-12)
-                sigma_post_test = np.sqrt(diag_post_test)
-
-                # Compute posterior risk
-                loss = expected_loss(
-                    mu_post_test,
-                    sigma_post_test,
-                    decision_config,
-                    test_indices=np.arange(n_test)
-                )
-                post_losses.append(loss)
-
-            # EVI: expected reduction in risk
-            avg_post_loss = np.mean(post_losses)
-            gain = prior_risk - avg_post_loss
-
-            # Score by cost
-            score = gain / costs[i] if use_cost else gain
-
-            if score > best_score:
-                best_score = score
-                best_gain = gain
-                best_idx = i
-                best_pack = (z_h, denom, y_mean)
-
-        if best_idx < 0:
-            print(f"    Step {step + 1}: No valid candidate, stopping early")
+        if not remaining:
             break
 
-        # --- Commit best candidate
-        z_h, denom, y_mean = best_pack
+        if verbose and step % 5 == 0:
+            print(f"\n  [EVI] Step {step + 1}/{k}, remaining candidates: {len(remaining)}")
 
-        # Update state using expected posterior (E_y[μ'(y)] = μ, but variance reduces)
-        # For simplicity, keep mean unchanged and only update variance
-        cur_diag_full -= (z_h * z_h) / denom
-        cur_diag_test = cur_diag_full[test_idx]
+        # 🔥 优化3：快速预筛选（用MI/cost作为代理指标）
+        prescreening_size = min(50, max(10, len(remaining) // 5))  # Top 10-50个
 
-        # Recompute prior risk for next step (variance reduced)
-        prior_risk = expected_loss(
-            cur_mu[test_idx],
-            np.sqrt(np.maximum(cur_diag_test, 1e-12)),
-            decision_config,
-            test_indices=np.arange(n_test)
-        )
+        if len(remaining) > prescreening_size * 2:  # 只有候选数量足够多才预筛
+            if verbose and step == 0:
+                print(f"  [EVI] Using MI-based prescreening (top {prescreening_size})")
 
-        # Record
+            # 快速计算MI增益
+            mi_scores = []
+            for cand_idx in remaining:
+                s = sensors[cand_idx]
+                z_h = Z_all[:, cand_idx]
+
+                # MI增益: 0.5 * log(1 + h^T Σ h / σ_n^2)
+                quad_form = np.dot(H_all[:, cand_idx], z_h)
+                mi_gain = 0.5 * np.log1p(quad_form / s.noise_var)
+
+                # 归一化
+                if use_cost:
+                    score = mi_gain / costs[cand_idx]
+                else:
+                    score = mi_gain
+
+                mi_scores.append((cand_idx, score))
+
+            # 选出Top-L
+            mi_scores.sort(key=lambda x: x[1], reverse=True)
+            candidates_to_eval = [idx for idx, _ in mi_scores[:prescreening_size]]
+        else:
+            candidates_to_eval = remaining
+
+        # 🔥 现在只对筛选后的候选做昂贵的EVI评估
+        best_evi = -np.inf
+        best_idx = None
+
+        for cand_idx in candidates_to_eval:
+            s = sensors[cand_idx]
+
+            # 构建增量观测矩阵
+            H_cand = sp.csr_matrix((s.weights, (np.zeros(len(s.idxs), dtype=int), s.idxs)),
+                                   shape=(1, n))
+            R_cand = np.array([s.noise_var])
+
+            # MC估计EVI
+            post_risks = []
+            for _ in range(n_y_samples):
+                # 从先验采样
+                w = rng.standard_normal(n)
+                z = factor_pr.solve(w)
+                x_sample = mu_pr + z
+
+                # 生成观测
+                y_clean = H_cand @ x_sample
+                noise = rng.normal(0, np.sqrt(s.noise_var))
+                y = y_clean + noise
+
+                # 后验
+                try:
+                    mu_post, factor_post = compute_posterior(Q_pr, mu_pr, H_cand, R_cand, y)
+                    var_post_test = compute_posterior_variance_diagonal(factor_post, test_idx)
+                    sigma_post_test = np.sqrt(np.maximum(var_post_test, 1e-12))
+
+                    post_risk = expected_loss(
+                        mu_post[test_idx],
+                        sigma_post_test,
+                        decision_config,
+                        test_indices=np.arange(len(test_idx))
+                    )
+                    post_risks.append(post_risk)
+                except:
+                    post_risks.append(prior_risk)
+
+            # EVI = 先验风险 - 平均后验风险
+            avg_post_risk = np.mean(post_risks)
+            evi = prior_risk - avg_post_risk
+
+            # 归一化
+            if use_cost:
+                score = evi / costs[cand_idx]
+            else:
+                score = evi
+
+            if score > best_evi:
+                best_evi = score
+                best_idx = cand_idx
+
+        if best_idx is None:
+            break
+
+        # 更新
+        selected.append(sensors[best_idx])
+        selected_ids.append(best_idx)
+        remaining.remove(best_idx)
+        marginal_gains.append(best_evi)
         total_cost += costs[best_idx]
-        selected.append(best_idx)
-        gains.append(best_gain)
-        obj_vals.append(obj_vals[-1] + best_gain if obj_vals else best_gain)
 
-        if (step + 1) % 5 == 0 or step == 0:
-            print(f"    Step {step + 1}/{k}: sensor {best_idx}, "
-                  f"EVI=£{best_gain:.2f}, score={best_score:.4f}, "
-                  f"cumulative_cost=£{total_cost:.0f}, "
-                  f"remaining_risk=£{prior_risk:.2f}")
+        # 计算累积目标值（总EVI）
+        objective_values.append(sum(marginal_gains))
 
-    print(f"  ✓ Selected {len(selected)} sensors via EVI, total cost=£{total_cost:.0f}")
+        if verbose:
+            print(f"    Selected sensor {best_idx}: EVI/cost = {best_evi:.4f}")
 
     return SelectionResult(
-        selected_ids=selected,
-        objective_values=obj_vals,
-        marginal_gains=gains,
+        selected_ids=selected_ids,
+        objective_values=objective_values,
+        marginal_gains=marginal_gains,
         total_cost=total_cost,
-        method_name="Greedy-EVI"
+        method_name="GREEDY_EVI"
     )
-
 
 # =====================================================================
 # 🔥 新增：MaxMin K-Center (几何覆盖基线)
@@ -700,7 +726,7 @@ if __name__ == "__main__":
     from config import load_config
     from geometry import build_grid2d_geometry
     from spatial_field import build_prior
-    from sensors import generate_sensor_pool
+    from sensors import generate_sensor_pool, Sensor
 
     cfg = load_config()
     rng = cfg.get_rng()

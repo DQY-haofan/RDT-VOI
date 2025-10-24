@@ -47,7 +47,7 @@ class GeometryConfig:
 
 @dataclass
 class PriorConfig:
-    """GMRF prior hyperparameters."""
+    '''GMRF prior hyperparameters - 支持非平稳先验'''
     nu: float
     kappa: float
     sigma2: float
@@ -56,9 +56,23 @@ class PriorConfig:
     mu_prior_mean: float
     mu_prior_std: float
 
+    # 🔥 新增字段
+    beta_base: float = None
+    beta_hot: float = None
+    hotspots: List[Dict[str, Any]] = None
+
+    def __post_init__(self):
+        # 设置默认值
+        if self.beta_base is None:
+            self.beta_base = self.beta * 100
+        if self.beta_hot is None:
+            self.beta_hot = self.beta
+        if self.hotspots is None:
+            self.hotspots = []
+
     @property
     def correlation_length(self) -> float:
-        """Approximate correlation length: sqrt(8*nu)/kappa."""
+        import numpy as np
         return np.sqrt(8 * self.nu) / self.kappa
 
 

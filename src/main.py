@@ -167,19 +167,9 @@ def run_single_fold_worker(fold_data: Dict) -> Dict:
 def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
                           x_true, sensors, test_idx_global=None) -> Dict:
     """
+    🔥 修复版：运行完整的方法评估
+
     Run complete evaluation for one method across all budgets and CV folds.
-
-    Args:
-        method_name: Name of selection method
-        cfg: Configuration object
-        geom: Geometry
-        Q_pr, mu_pr: Prior parameters
-        x_true: True state
-        sensors: Candidate sensor pool
-        test_idx_global: Global test indices (for EVI)
-
-    Returns:
-        Dictionary with results organized by budget and fold
     """
     print(f"\n{'=' * 70}")
     print(f"  Method: {method_name.upper()}")
@@ -187,7 +177,7 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
 
     rng = cfg.get_rng()
 
-    # 🔥 修复：传递所有参数给 get_selection_method
+    # 创建选择方法wrapper
     try:
         selection_method = get_selection_method(
             method_name=method_name,
@@ -200,7 +190,7 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
         print(f"  ✗ Failed to create method wrapper: {e}")
         raise
 
-    # Generate CV folds
+    # 生成CV folds
     buffer_width = cfg.cv.buffer_width_multiplier * cfg.prior.correlation_length
     folds = spatial_block_cv(
         geom.coords,
@@ -210,13 +200,17 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
         rng
     )
 
+    # 打印fold信息
+    for fold_idx, (train_idx, test_idx) in enumerate(folds):
+        print(f"  Fold {fold_idx + 1}: train={len(train_idx)}, test={len(test_idx)}")
+
     results = {
         'budgets': {},
         'method_name': method_name,
         'n_folds': len(folds)
     }
 
-    # Loop over budgets
+    # 遍历budgets
     for k in cfg.selection.budgets:
         print(f"\n  Budget k={k}")
         print(f"  {'-' * 50}")
@@ -226,17 +220,25 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
             'fold_metrics': []
         }
 
-        # Loop over folds
+        # 遍历folds
         for fold_idx, (train_idx, test_idx) in enumerate(folds):
-            # 🔥 Check if should run (for EVI cost control)
-            if not should_use_evi(method_name, k, fold_idx, cfg):
-                print(f"    Fold {fold_idx + 1}/{len(folds)}: SKIPPED (EVI subset)")
-                continue
+            # 🔥 关键修复：只对 EVI 方法检查是否跳过
+            is_evi_method = method_name.lower() in ['greedy_evi', 'evi', 'greedy-evi', 'myopic_evi']
 
-            print(f"    Fold {fold_idx + 1}/{len(folds)}: "
-                  f"train={len(train_idx)}, test={len(test_idx)}")
+            if is_evi_method:
+                # EVI 方法可能需要跳过某些配置以节省时间
+                if not should_use_evi(method_name, k, fold_idx, cfg):
+                    print(f"    Fold {fold_idx + 1}/{len(folds)}: SKIPPED (EVI subset)")
+                    budget_results['fold_results'].append({
+                        'success': False,
+                        'skipped': True,
+                        'reason': 'EVI budget/fold subset'
+                    })
+                    continue
 
-            # Prepare fold data
+            print(f"    Fold {fold_idx + 1}/{len(folds)}: train={len(train_idx)}, test={len(test_idx)}")
+
+            # 准备fold数据
             fold_data = {
                 'train_idx': train_idx,
                 'test_idx': test_idx,
@@ -251,45 +253,71 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
                 'rng_seed': rng.integers(0, 2 ** 31)
             }
 
-            # Run fold
-            fold_result = run_single_fold_worker(fold_data)
-
-            if fold_result['success']:
+            # 运行fold
+            try:
+                fold_result = run_single_fold_worker(fold_data)
                 budget_results['fold_results'].append(fold_result)
-                budget_results['fold_metrics'].append(fold_result['metrics'])
 
-                # Print key metrics
-                m = fold_result['metrics']
-                print(f"        RMSE={m['rmse']:.3f}, "
-                      f"Loss=£{m['expected_loss_gbp']:.0f}, "
-                      f"Coverage={m['coverage_90']:.2%}")
-            else:
-                print(f"        FAILED: {fold_result['error']}")
+                if fold_result['success']:
+                    metrics = fold_result['metrics']
+                    budget_results['fold_metrics'].append(metrics)
 
-        # Aggregate metrics across folds
+                    # 打印关键指标
+                    print(f"        RMSE={metrics['rmse']:.3f}, "
+                          f"Loss=£{metrics['expected_loss_gbp']:.0f}, "
+                          f"Coverage={metrics['coverage_90'] * 100:.2f}%")
+                else:
+                    print(f"        ✗ FAILED: {fold_result.get('error', 'unknown error')}")
+
+            except Exception as e:
+                print(f"        ✗ Exception: {str(e)}")
+                import traceback
+                traceback.print_exc()
+
+                budget_results['fold_results'].append({
+                    'success': False,
+                    'error': str(e),
+                    'traceback': traceback.format_exc()
+                })
+
+        # 计算budget级别的统计
         if budget_results['fold_metrics']:
+            n_folds = len(budget_results['fold_metrics'])
+
+            # 聚合指标
             aggregated = {}
             for key in budget_results['fold_metrics'][0].keys():
-                if key == 'z_scores':  # Skip array fields
+                # 跳过非数值指标
+                if key in ['z_scores', 'n_test', 'n_selected']:
                     continue
-                values = [m[key] for m in budget_results['fold_metrics']
-                          if key in m]
-                if values:
+
+                values = [m[key] for m in budget_results['fold_metrics'] if key in m]
+                if values and all(isinstance(v, (int, float)) for v in values):
                     aggregated[key] = {
-                        'mean': float(np.mean(values)),
-                        'std': float(np.std(values)),
+                        'mean': np.mean(values),
+                        'std': np.std(values),
                         'values': values
                     }
+
             budget_results['aggregated'] = aggregated
 
-            # Print summary
-            print(f"\n    Summary (n={len(budget_results['fold_metrics'])} folds):")
-            if 'expected_loss_gbp' in aggregated:
-                loss = aggregated['expected_loss_gbp']
-                print(f"      Loss: £{loss['mean']:.0f} ± {loss['std']:.0f}")
-            if 'rmse' in aggregated:
-                rmse = aggregated['rmse']
-                print(f"      RMSE: {rmse['mean']:.3f} ± {rmse['std']:.3f}")
+            print(f"\n    Summary (n={n_folds} folds):")
+            for metric in ['expected_loss_gbp', 'rmse']:
+                if metric in aggregated:
+                    stats = aggregated[metric]
+
+                    # 🔥 修复：条件格式化
+                    if 'loss' in metric:
+                        mean_str = f"{stats['mean']:.0f}"
+                        std_str = f"{stats['std']:.0f}"
+                    else:
+                        mean_str = f"{stats['mean']:.3f}"
+                        std_str = f"{stats['std']:.3f}"
+
+                    print(f"      {metric.replace('_', ' ').title()}: "
+                          f"{mean_str} ± {std_str}")
+        else:
+            print(f"\n    ⚠️  No successful folds for budget k={k}")
 
         results['budgets'][k] = budget_results
 
@@ -298,42 +326,119 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
 
 def aggregate_results_for_visualization(all_results: Dict) -> pd.DataFrame:
     """
-    Convert nested results dictionary to flat DataFrame for visualization.
+    🔥 强化修复版：将结果转换为DataFrame供可视化使用
 
-    Args:
-        all_results: Dictionary with structure:
-            {method_name: {budgets: {k: {aggregated: {...}}}}}
-
-    Returns:
-        DataFrame with columns: method, budget, metric, mean, std, values
+    处理所有方法的数据，包括可能的结构差异
     """
     rows = []
 
+    print("    开始聚合结果...")
+
     for method_name, method_data in all_results.items():
-        # 检查是否有 budgets 数据
-        if 'budgets' not in method_data:
+        print(f"      处理方法: {method_name}")
+
+        # 🔥 统一方法显示名称
+        method_display = method_name.replace('_', ' ').title()
+
+        # 🔥 检查数据结构
+        if not isinstance(method_data, dict):
+            print(f"        ⚠️  跳过：数据类型错误 ({type(method_data)})")
             continue
 
-        for k, budget_data in method_data['budgets'].items():
-            # 检查是否有聚合数据
-            if 'aggregated' not in budget_data:
+        budgets_data = method_data.get('budgets', {})
+
+        if not budgets_data:
+            print(f"        ⚠️  跳过：无budgets数据")
+            continue
+
+        print(f"        找到 {len(budgets_data)} 个budgets")
+
+        for budget, budget_data in budgets_data.items():
+            # 🔥 安全地获取fold_results
+            if isinstance(budget_data, dict):
+                fold_results = budget_data.get('fold_results', [])
+            else:
+                print(f"          Budget {budget}: 数据类型错误 ({type(budget_data)})")
                 continue
 
-            for metric_name, metric_data in budget_data['aggregated'].items():
-                rows.append({
-                    'method': method_name,
-                    'budget': k,
-                    'metric': metric_name,
-                    'mean': metric_data['mean'],
-                    'std': metric_data['std'],
-                    'values': metric_data['values']
-                })
+            if not fold_results:
+                print(f"          Budget {budget}: 无fold结果")
+                continue
+
+            # 收集所有fold的指标
+            valid_folds = 0
+
+            for fold_idx, fold_res in enumerate(fold_results):
+                # 🔥 检查fold_res结构
+                if not isinstance(fold_res, dict):
+                    continue
+
+                if not fold_res.get('success', False):
+                    continue
+
+                metrics = fold_res.get('metrics', {})
+
+                if not metrics or not isinstance(metrics, dict):
+                    continue
+
+                valid_folds += 1
+
+                # 🔥 为每个指标创建行
+                for metric_name, metric_value in metrics.items():
+                    # 跳过非标量指标
+                    if metric_name in ['z_scores'] or metric_name.startswith('_'):
+                        continue
+
+                    # 🔥 确保值是标量
+                    if isinstance(metric_value, (list, np.ndarray)):
+                        continue
+
+                    if metric_value is None or (isinstance(metric_value, float) and np.isnan(metric_value)):
+                        continue
+
+                    rows.append({
+                        'method': method_display,
+                        'budget': int(budget),
+                        'fold': fold_idx + 1,
+                        'metric': metric_name,
+                        'value': float(metric_value)
+                    })
+
+            print(f"          Budget {budget}: {valid_folds} 个有效folds")
 
     if not rows:
-        # 如果没有数据，返回空 DataFrame 但保留必要的列
-        return pd.DataFrame(columns=['method', 'budget', 'metric', 'mean', 'std', 'values'])
+        warnings.warn("没有有效的结果可以聚合")
+        return pd.DataFrame()
 
-    return pd.DataFrame(rows)
+    # 创建DataFrame
+    df = pd.DataFrame(rows)
+
+    # 🔥 计算统计量
+    stats_rows = []
+    for (method, budget, metric), group in df.groupby(['method', 'budget', 'metric']):
+        values = group['value'].values
+        stats_rows.append({
+            'method': method,
+            'budget': budget,
+            'fold': None,  # 聚合统计
+            'metric': metric,
+            'value': np.mean(values),
+            'mean': np.mean(values),
+            'std': np.std(values),
+            'min': np.min(values),
+            'max': np.max(values),
+            'n_folds': len(values)
+        })
+
+    # 合并原始数据和统计数据
+    df_stats = pd.DataFrame(stats_rows)
+    df_combined = pd.concat([df, df_stats], ignore_index=True)
+
+    print(f"    ✓ 聚合完成: {len(df)} 行原始数据 + {len(df_stats)} 行统计数据")
+    print(f"    ✓ 方法: {sorted(df['method'].unique())}")
+    print(f"    ✓ 指标: {len(df['metric'].unique())} 个")
+
+    return df_combined
 
 def serialize_sparse_matrix(mat):
     """将稀疏矩阵序列化为字典"""

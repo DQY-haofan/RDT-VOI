@@ -59,6 +59,31 @@ class SparseFactor:
         else:
             raise ValueError(f"Unknown factorization method: {method}")
 
+    def solve_multi(self, B: np.ndarray) -> np.ndarray:
+        """
+        🔥 新增：批量求解 Q * X = B (多个右端向量)
+
+        Args:
+            B: Right-hand sides (n, m) - 每列是一个RHS
+
+        Returns:
+            X: Solutions (n, m)
+        """
+        if sp.issparse(B):
+            B = B.toarray()
+
+        if self.method == "pcg":
+            # PCG不支持多RHS，逐列求解
+            if B.ndim == 1:
+                return self.solve(B)
+            return np.column_stack([self.solve(B[:, i]) for i in range(B.shape[1])])
+        else:
+            # CHOLMOD和SPLU原生支持多RHS
+            if self._has_cholmod:
+                return self.factor.solve_A(B)
+            else:
+                return self.factor.solve(B)
+
     def solve(self, b: Union[np.ndarray, sp.spmatrix], tol: float = 1e-8) -> np.ndarray:
         """
         Solve Q * x = b (supports multiple RHS)

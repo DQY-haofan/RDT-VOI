@@ -32,19 +32,28 @@ geometry:
 # Prior Distribution (GMRF/SPDE)
 # ----------------------------------------------------------------------------
 prior:
-  # Matérn parameters
-  nu: 1.0          # Smoothness parameter
-  kappa: 0.08      # Inverse correlation range (1/meters)
-  sigma2: 0.30     # 🔥 Marginal variance (increased for more uncertainty)
+  # 原有参数保持不变
+  nu: 1.0
+  kappa: 0.10
+  sigma2: 0.30
+  alpha: 2
+  beta: 1.0e-6  # 保留向后兼容
+  mu_prior_mean: 2.2
+  mu_prior_std: 0.3
 
-  # SPDE discretization
-  alpha: 2         # Operator power: (κ² - Δ)^α
-  beta: 0.0001     # Nugget for strict positive-definiteness
+  # 🔥 新增：非平稳先验参数
+  beta_base: 5.0e-2   # 非热点区域 nugget（比 beta 大1000倍）
+  beta_hot: 1.0e-8    # 热点区域 nugget（等于原 beta）
 
-  # Mean field (optional spatial trend)
-  mu_prior_mean: -100.0  # 🔥 改为接近真实数据的均值
-  mu_prior_std: 15.0     # 🔥 增大变异性
-
+  # 🔥 新增：热点区域定义（米坐标）
+  # 假设你的域是 200m × 200m (40×40 网格, h=5m)
+  hotspots:
+    - center_m: [60, 60]    # 左下角热点
+      radius_m: 30
+    - center_m: [140, 60]   # 右下角热点
+      radius_m: 25
+    - center_m: [100, 140]  # 中上热点
+      radius_m: 30
 # ----------------------------------------------------------------------------
 # Sensor Pool Configuration
 # ----------------------------------------------------------------------------
@@ -83,13 +92,21 @@ sensors:
 # ----------------------------------------------------------------------------
 decision:
   # Decision threshold
-  tau_iri: -90.0  # 🔥 设置到分布的中位区域（-100 + 10）
+  tau_iri: 2.2  # 🔥 调整到均值附近 (从2.0改为2.2，接近mu_prior_mean)
+                # 这样约50%的位置会在阈值上下，决策更敏感
 
-  # Loss matrix (in GBP)
-  L_TP_gbp: 500    # True Positive: correctly maintain degraded road
-  L_FP_gbp: 2000   # False Positive: unnecessary maintenance
-  L_FN_gbp: 12000  # 🔥 False Negative: miss degraded road (increased 6x FP)
-  L_TN_gbp: 0      # True Negative: correctly skip good road
+  # Loss matrix (in GBP) - 🔥 关键改进：大幅增加不对称性
+  L_TP_gbp: 5000     # True Positive: 正确维护需要维护的路段 (保持)
+  L_FP_gbp: 8000     # False Positive: 过度维护 (保持)
+  L_FN_gbp: 80000    # 🔥 False Negative: 漏检严重路段 (从40k增加到80k - 2倍)
+                     # 这是最重要的成本！错过坏路段后果严重
+  L_TN_gbp: 0        # True Negative: 正确跳过 (可以保持0)
+
+  # 成本比分析：
+  # FN:FP = 80000:8000 = 10:1  (原来是 40000:8000 = 5:1)
+  # FN:TP = 80000:5000 = 16:1  (原来是 40000:5000 = 8:1)
+  # → 这将使不确定性降低的价值大幅提升
+
 
 # ----------------------------------------------------------------------------
 # Sensor Selection Methods
@@ -120,11 +137,18 @@ selection:
     use_cost: true       # 🔥 Enable gain/cost scoring
 
   greedy_evi:
-    n_y_samples: 10      # 🔥 Monte Carlo samples for EVI approximation
+    n_y_samples: 25
     use_cost: true
-    # 🔥 Run only on subset to control computational cost
-    budgets_subset: [10, 20, 40]  # Only these budgets
-    max_folds: 1                   # Only first 2 CV folds
+
+    # 🔥 新增：必须运行的预算（所有折都运行）
+    must_budgets: [5, 20, 40]  # 关键预算点
+
+    # 🔥 新增：每 N 折运行一次（节省计算）
+    every_n_folds: 2  # 每 2 折运行一次（对非 must_budgets）
+
+    # 原有配置（可选）
+    budgets_subset: []  # 空列表表示运行所有预算
+    max_folds: null     # null 表示运行所有折
 
   maxmin:
     use_cost: true       # 🔥 Normalize distance by cost
@@ -133,11 +157,9 @@ selection:
 # Expected Value of Information (EVI) Computation
 # ----------------------------------------------------------------------------
 evi:
-  compute_for: ["greedy_mi", "greedy_aopt"]  # Compute EVI for these methods
-  method: "monte_carlo"  # "monte_carlo" | "unscented"
-
-  # Monte Carlo settings
-  monte_carlo_samples: 500
+  compute_for: ["greedy_mi", "greedy_evi"]  # 🔥 添加 greedy_evi
+  method: "monte_carlo"
+  monte_carlo_samples: 10  # 🔥 先用小值测试 (从500改为10)greedy_evi
 
   # Unscented Transform settings (if method = "unscented")
   unscented_alpha: 1.0

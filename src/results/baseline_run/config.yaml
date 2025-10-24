@@ -22,11 +22,11 @@ cv:
   morans_permutations: 999
   scheme: spatial_block
 decision:
-  L_FN_gbp: 12000
-  L_FP_gbp: 2000
+  L_FN_gbp: 40000
+  L_FP_gbp: 8000
   L_TN_gbp: 0
-  L_TP_gbp: 500
-  tau_iri: 2.2
+  L_TP_gbp: 5000
+  tau_iri: 2.0
 diagnostics:
   calibration:
     coverage_curves: true
@@ -39,9 +39,9 @@ diagnostics:
 evi:
   compute_for:
   - greedy_mi
-  - greedy_aopt
+  - greedy_evi
   method: monte_carlo
-  monte_carlo_samples: 500
+  monte_carlo_samples: 10
   unscented_alpha: 1.0
   unscented_beta: 2.0
   unscented_kappa: 0.0
@@ -115,8 +115,8 @@ prior:
   alpha: 2
   beta: 0.0001
   kappa: 0.08
-  mu_prior_mean: 2.0
-  mu_prior_std: 0.3
+  mu_prior_mean: 2.2
+  mu_prior_std: 0.0
   nu: 1.0
   sigma2: 0.3
 selection:
@@ -135,9 +135,8 @@ selection:
     budgets_subset:
     - 10
     - 20
-    - 40
-    max_folds: 2
-    n_y_samples: 25
+    max_folds: 1
+    n_y_samples: 10
     use_cost: true
   greedy_mi:
     adaptive_pruning: true
