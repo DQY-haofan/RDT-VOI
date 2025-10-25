@@ -300,6 +300,10 @@ def greedy_evi_myopic_fast(
 
     if costs is None:
         costs = np.array([s.cost for s in sensors], dtype=float)
+    else:
+        costs = np.asarray(costs, dtype=float)
+        if len(costs) != C:
+            raise ValueError(f"Cost length {len(costs)} != sensor count {C}")
 
     if verbose:
         print(f"\n  🚀 Fast Greedy-EVI: n={n}, candidates={C}, budget={k}, test={len(test_idx)}")
@@ -341,7 +345,7 @@ def greedy_evi_myopic_fast(
     H_dense = np.stack(
         [np.bincount(idxs, weights=w, minlength=n) for idxs, w in zip(idx_list, w_list)],
         axis=0
-    )  # C × n
+    )  # (C, n)
 
     # ---------------------------
     # 3. MI 预筛：一次多 RHS 得到 Z=Σ H^T
@@ -353,10 +357,15 @@ def greedy_evi_myopic_fast(
         if verbose:
             print(f"    🔍 MI prescreening over {C} candidates ...")
 
-        Z = F.solve_multi(H_dense.T)  # n × C
+        Z = F.solve_multi(H_dense.T)  # (n, C)
 
-        # 每个候选的 quad = h^T Σ h = h^T z_h
-        quad = np.einsum('ij,ij->j', H_dense, Z.T)  # (C,)
+        # ✅ 修复：每个候选的 quad = h^T Σ h
+        # H_dense: (C, n)
+        # Z: (n, C)
+        # Z.T: (C, n)
+        # quad[c] = sum_n (H_dense[c,n] * Z.T[c,n])
+        quad = np.sum(H_dense * Z.T, axis=1)  # (C,) ✅ 正确！
+
         mi = 0.5 * np.log1p(quad / r_list)
 
         n_keep = max(20, int(C * keep_fraction))
@@ -371,14 +380,14 @@ def greedy_evi_myopic_fast(
         idx_list = [idx_list[i] for i in range(C) if keep_mask[i]]
         w_list = [w_list[i] for i in range(C) if keep_mask[i]]
         original_indices = original_indices[keep_mask]
-        Z = Z[:, keep_mask]  # n × C_new
+        Z = Z[:, keep_mask]  # (n, C_new)
         C = H_dense.shape[0]
 
         if verbose:
             print(f"    ✓ kept {C} ({100 * C / len(keep_mask):.0f}%), "
                   f"MI∈[{mi[keep_mask].min():.3f},{mi[keep_mask].max():.3f}] nats")
     else:
-        Z = F.solve_multi(H_dense.T)  # n × C
+        Z = F.solve_multi(H_dense.T)  # (n, C)
 
     # ---------------------------
     # 4. Greedy 循环：每步 1 次解 + 向量代数
@@ -395,13 +404,18 @@ def greedy_evi_myopic_fast(
 
         # 对所有仍在池内的候选，计算"加它后的 posterior 风险"
         # posterior diag on test: diag' = diag - (z_h_test^2)/(r + h^T z_h)
-        zt = Z[test_idx, :]  # m_test × C
+        zt = Z[test_idx, :]  # (m_test, C)
         num = np.sum(zt * zt, axis=0)  # (C,)
-        denom = r_list + np.einsum('ij,ij->j', H_dense, Z.T)  # (C,)
+
+        # ✅ 修复：计算 h^T z_h
+        # H_dense: (C, n)
+        # Z: (n, C)
+        # 对于每个候选 c: h_c^T z_c = sum_n H_dense[c,n] * Z[n,c]
+        denom = r_list + np.sum(H_dense * Z.T, axis=1)  # (C,) ✅ 正确！
         denom = np.maximum(denom, 1e-12)
 
         # 逐候选得到 Σ' 的 test 对角
-        diag_post_all = diag_test[:, None] - (zt * zt) / denom[None, :]  # m_test × C
+        diag_post_all = diag_test[:, None] - (zt * zt) / denom[None, :]  # (m_test, C)
         diag_post_all = np.maximum(diag_post_all, 1e-12)
 
         # 计算 posterior 风险
@@ -457,8 +471,8 @@ def greedy_evi_myopic_fast(
         )
 
         # 更新 Z：Z' = Z - z_* (h_*^T Z)/den
-        c = h_star @ Z  # (C,) = (n,) @ (n×C)
-        Z -= np.outer(z_star, c) / den  # (n×1) (1×C) / scalar
+        c = h_star @ Z  # (C,) = (n,) @ (n, C)
+        Z -= np.outer(z_star, c) / den  # (n, 1) @ (1, C) / scalar
 
         # 标记该候选失效
         alive[best] = False
@@ -470,6 +484,8 @@ def greedy_evi_myopic_fast(
         total_cost=tot_cost,
         method_name="Greedy-EVI-fast"
     )
+
+
 # =====================================================================
 # 4. Maxmin k-center
 # =====================================================================
