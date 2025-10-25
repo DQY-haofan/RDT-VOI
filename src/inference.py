@@ -36,7 +36,10 @@ class SparseFactor:
                 from sksparse.cholmod import cholesky
                 self.factor = cholesky(self.Q)
                 self._has_cholmod = True
-                print("  Using CHOLMOD (fast)")
+                # 🔥 只在第一次打印
+                if not hasattr(SparseFactor, '_cholmod_initialized'):
+                    print("  Using CHOLMOD (fast)")
+                    SparseFactor._cholmod_initialized = True
             except ImportError:
                 warnings.warn("cholmod not available, falling back to splu")
                 self.factor = spla.splu(self.Q)
@@ -159,8 +162,28 @@ class SparseFactor:
     def rank1_update(self, h: np.ndarray, weight: float = 1.0):
         """Update factor to reflect Q_new = Q + weight * h h^T."""
         if self._has_cholmod and weight > 0:
-            self.factor.update_inplace(h, weight)
+            try:
+                # 确保 h 是 numpy array
+                if sp.issparse(h):
+                    h = h.toarray().ravel()
+                self.factor.update_inplace(h, weight)
+            except Exception as e:
+                # CHOLMOD update 失败，降级到重新分解
+                import warnings
+                warnings.warn(f"CHOLMOD update failed ({e}), refactorizing...")
+
+                # 确保 Q 是稀疏矩阵
+                if not sp.issparse(self.Q):
+                    self.Q = sp.csr_matrix(self.Q)
+
+                # 重新分解
+                self.Q = self.Q + weight * sp.csr_matrix(np.outer(h, h))
+                self.__init__(self.Q, self.method)
         else:
+            # 确保 Q 是稀疏矩阵
+            if not sp.issparse(self.Q):
+                self.Q = sp.csr_matrix(self.Q)
+
             # Refactorize
             self.Q = self.Q + weight * sp.csr_matrix(np.outer(h, h))
             self.__init__(self.Q, self.method)
