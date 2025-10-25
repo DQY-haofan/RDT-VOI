@@ -156,13 +156,14 @@ selection:
     use_cost: true
   greedy_evi:
     budgets_subset: []
-    every_n_folds: 3
+    every_n_folds: 2
+    keep_fraction: 0.25
     max_folds: null
+    mi_prescreen: true
     must_budgets:
-    - 5
-    - 20
-    - 40
-    n_y_samples: 10
+    - 10
+    - 30
+    n_y_samples: 0
     use_cost: true
   greedy_mi:
     adaptive_pruning: true

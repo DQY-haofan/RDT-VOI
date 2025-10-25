@@ -1,6 +1,12 @@
 """
 Method wrappers for easy integration into main evaluation pipeline.
 Provides unified interface for all selection methods.
+
+🔥 修复版本 - 2025-01-25
+修复问题：
+1. 统一 costs 参数处理（添加 dtype=float）
+2. 修复 greedy_evi 导入名称
+3. 添加 maxmin 支持
 """
 
 import numpy as np
@@ -15,26 +21,28 @@ def get_selection_method(method_name: str, config, geom,
     """
     Get a selection method function with unified signature.
     """
-    # 统一方法名
     method_lower = method_name.lower().replace('-', '_').replace(' ', '_')
 
+    # =====================================================================
+    # 1. Greedy MI
+    # =====================================================================
     if method_lower in ['greedy_mi', 'mi']:
         from selection import greedy_mi
 
         def wrapper(sensors, k, Q_pr, mu_pr=None):
-            costs = np.array([s.cost for s in sensors])
+            # ✅ 修复：确保 costs 长度与 sensors 一致
+            n_sensors = len(sensors)
+            costs = np.array([s.cost for s in sensors], dtype=float)
 
-            # 🔥 修复：只传入 greedy_mi 实际支持的参数
-            # greedy_mi 签名：(sensors, k, Q_pr, costs=None, lazy=True, batch_size=64)
+            # 验证长度
+            assert len(costs) == n_sensors, f"Cost length mismatch: {len(costs)} vs {n_sensors}"
 
-            # 从配置获取参数（如果存在）
-            batch_size = 64  # 默认值
-            lazy = True  # 默认值
+            batch_size = 64
+            lazy = True
 
             if hasattr(config.selection, 'greedy_mi'):
                 mi_cfg = config.selection.greedy_mi
                 batch_size = mi_cfg.get('batch_size', 64)
-                # lazy 参数目前配置文件没有，使用默认值
 
             return greedy_mi(
                 sensors=sensors,
@@ -47,13 +55,17 @@ def get_selection_method(method_name: str, config, geom,
 
         return wrapper
 
+    # =====================================================================
+    # 2. Greedy A-optimal
+    # =====================================================================
     elif method_lower in ['greedy_aopt', 'greedy-aopt', 'greedy_a', 'aopt', 'a']:
         from selection import greedy_aopt
 
         def wrapper(sensors, k, Q_pr, mu_pr=None):
-            costs = np.array([s.cost for s in sensors])
+            n_sensors = len(sensors)
+            costs = np.array([s.cost for s in sensors], dtype=float)
+            assert len(costs) == n_sensors
 
-            # 从配置获取参数
             n_probes = 16
             use_cost = True
 
@@ -73,31 +85,39 @@ def get_selection_method(method_name: str, config, geom,
 
         return wrapper
 
+    # =====================================================================
+    # 3. Greedy EVI (决策感知)
+    # =====================================================================
     elif method_lower in ['greedy_evi', 'greedy-evi', 'evi', 'myopic_evi']:
-        from selection import greedy_evi_myopic
+        from selection import greedy_evi_myopic_fast
 
         if x_true is None:
             raise ValueError("EVI method requires x_true")
         if test_idx is None:
-            # 使用随机子集
             rng = np.random.default_rng(config.experiment.seed)
             n_test = min(200, geom.n)
             test_idx = rng.choice(geom.n, size=n_test, replace=False)
 
         def wrapper(sensors, k, Q_pr, mu_pr):
-            costs = np.array([s.cost for s in sensors])
+            n_sensors = len(sensors)
+            costs = np.array([s.cost for s in sensors], dtype=float)
+            assert len(costs) == n_sensors
+
             rng = config.get_rng()
 
-            # 从配置获取参数
-            n_y_samples = 10
+            n_y_samples = 0
             use_cost = True
+            mi_prescreen = True
+            keep_fraction = 0.25
 
             if hasattr(config.selection, 'greedy_evi'):
                 evi_cfg = config.selection.greedy_evi
-                n_y_samples = evi_cfg.get('n_y_samples', 10)
+                n_y_samples = evi_cfg.get('n_y_samples', 0)
                 use_cost = evi_cfg.get('use_cost', True)
+                mi_prescreen = evi_cfg.get('mi_prescreen', True)
+                keep_fraction = evi_cfg.get('keep_fraction', 0.25)
 
-            return greedy_evi_myopic(
+            return greedy_evi_myopic_fast(
                 sensors=sensors,
                 k=k,
                 Q_pr=Q_pr,
@@ -107,17 +127,24 @@ def get_selection_method(method_name: str, config, geom,
                 costs=costs,
                 n_y_samples=n_y_samples,
                 use_cost=use_cost,
+                mi_prescreen=mi_prescreen,
+                keep_fraction=keep_fraction,
                 rng=rng,
-                verbose=False  # 在批量运行时关闭详细输出
+                verbose=False
             )
 
         return wrapper
 
+    # =====================================================================
+    # 4. Maxmin k-center
+    # =====================================================================
     elif method_lower in ['maxmin', 'k-center', 'kcenter', 'max-min']:
         from selection import maxmin_k_center
 
         def wrapper(sensors, k, Q_pr, mu_pr=None):
-            costs = np.array([s.cost for s in sensors])
+            n_sensors = len(sensors)
+            costs = np.array([s.cost for s in sensors], dtype=float)
+            assert len(costs) == n_sensors
 
             use_cost = True
             if hasattr(config.selection, 'maxmin'):
@@ -134,6 +161,9 @@ def get_selection_method(method_name: str, config, geom,
 
         return wrapper
 
+    # =====================================================================
+    # 5. Uniform
+    # =====================================================================
     elif method_lower in ['uniform', 'uniform_random']:
         from selection import SelectionResult
 
@@ -157,15 +187,18 @@ def get_selection_method(method_name: str, config, geom,
 
         return wrapper
 
+    # =====================================================================
+    # 6. Random
+    # =====================================================================
     elif method_lower == 'random':
         from selection import SelectionResult
 
         def wrapper(sensors, k, Q_pr, mu_pr=None):
             rng = config.get_rng()
             n_sensors = len(sensors)
-            costs = np.array([s.cost for s in sensors])
+            costs = np.array([s.cost for s in sensors], dtype=float)
+            assert len(costs) == n_sensors
 
-            # 逆成本加权
             weights = 1.0 / (costs + 1.0)
             weights = weights / weights.sum()
 
@@ -200,14 +233,23 @@ def get_available_methods(config) -> List[str]:
 def should_use_evi(method_name: str, budget: int, fold_idx: int,
                    config) -> bool:
     """
-    🔥 修复版本：更合理的 EVI 跳过策略
+    决定是否运行 EVI 的跳过策略
 
     确保：
     1. 非EVI方法总是返回True
     2. must_budgets的预算运行所有折
     3. 其他预算至少保留第1折 + 每N折运行一次
+
+    Args:
+        method_name: 方法名称
+        budget: 当前预算
+        fold_idx: 当前fold索引（从0开始）
+        config: 配置对象
+
+    Returns:
+        bool: 是否应该运行该fold
     """
-    # ✅ 确保只对 EVI 方法应用限制
+    # 确保只对 EVI 方法应用限制
     method_lower = method_name.lower()
     if method_lower not in ['greedy_evi', 'evi', 'greedy-evi', 'myopic_evi']:
         return True
@@ -216,10 +258,10 @@ def should_use_evi(method_name: str, budget: int, fold_idx: int,
     if hasattr(config.selection, 'greedy_evi'):
         evi_cfg = config.selection.greedy_evi
 
-        # 🔥 must_budgets - 这些预算必须运行所有折
-        must_budgets = set(evi_cfg.get('must_budgets', [5, 20, 40]))
+        # must_budgets - 这些预算必须运行所有折
+        must_budgets = set(evi_cfg.get('must_budgets', [10, 30]))
         if budget in must_budgets:
-            return True  # 必须运行的预算，不跳过任何折
+            return True  # 必须运行的预算，不跳过任何fold
 
         # 检查 budget 约束
         if 'budgets_subset' in evi_cfg:
@@ -227,7 +269,7 @@ def should_use_evi(method_name: str, budget: int, fold_idx: int,
             if budgets_subset and budget not in budgets_subset:
                 return False  # 不在子集中，跳过
 
-        # 🔥 改进：fold 约束 - 至少保留第1折
+        # fold 约束 - 至少保留第1折
         if fold_idx == 0:
             return True  # 第1折总是运行（用于基准测试）
 

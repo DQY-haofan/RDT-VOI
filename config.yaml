@@ -141,14 +141,17 @@ selection:
     use_cost: true       # 🔥 Enable gain/cost scoring
 
   greedy_evi:
-    n_y_samples: 5
+    n_y_samples: 0
     use_cost: true
+
+    mi_prescreen: true  # 🔥 启用MI预筛（强烈推荐）
+    keep_fraction: 0.25  # 预筛保留25%候选
 
     # 🔥 新增：必须运行的预算（所有折都运行）
     must_budgets: [10, 30]  # 关键预算点
 
     # 🔥 新增：每 N 折运行一次（节省计算）
-    every_n_folds: 99  # 每 2 折运行一次（对非 must_budgets）
+    every_n_folds: 2  # 每 2 折运行一次（对非 must_budgets）
 
     # 原有配置（可选）
     budgets_subset: []  # 空列表表示运行所有预算

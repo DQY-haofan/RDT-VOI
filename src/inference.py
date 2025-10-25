@@ -1,10 +1,10 @@
 """
-支持批量RHS的推断模块
+支持批量RHS的推断模块 - 清理版
 
 主要改进：
-1. solve()支持多列RHS
-2. 新增batch_quadform()快速计算多个h^T Σ h
-3. 优化的对角元提取
+1. solve_multi() 统一接口，移除重复定义
+2. 批量二次型计算优化
+3. 完整的多RHS支持
 """
 
 import numpy as np
@@ -16,8 +16,10 @@ import warnings
 
 class SparseFactor:
     """
-    改进的稀疏因子类：支持批量操作
+    优化的稀疏因子类：支持批量操作和rank-1更新
     """
+
+    _cholmod_initialized = False  # 类变量，只打印一次
 
     def __init__(self, Q: sp.spmatrix, method: str = "cholmod"):
         """
@@ -36,8 +38,8 @@ class SparseFactor:
                 from sksparse.cholmod import cholesky
                 self.factor = cholesky(self.Q)
                 self._has_cholmod = True
-                # 🔥 只在第一次打印
-                if not hasattr(SparseFactor, '_cholmod_initialized'):
+                # 只在第一次打印
+                if not SparseFactor._cholmod_initialized:
                     print("  Using CHOLMOD (fast)")
                     SparseFactor._cholmod_initialized = True
             except ImportError:
@@ -62,34 +64,9 @@ class SparseFactor:
         else:
             raise ValueError(f"Unknown factorization method: {method}")
 
-    def solve_multi(self, B: np.ndarray) -> np.ndarray:
-        """
-        🔥 新增：批量求解 Q * X = B (多个右端向量)
-
-        Args:
-            B: Right-hand sides (n, m) - 每列是一个RHS
-
-        Returns:
-            X: Solutions (n, m)
-        """
-        if sp.issparse(B):
-            B = B.toarray()
-
-        if self.method == "pcg":
-            # PCG不支持多RHS，逐列求解
-            if B.ndim == 1:
-                return self.solve(B)
-            return np.column_stack([self.solve(B[:, i]) for i in range(B.shape[1])])
-        else:
-            # CHOLMOD和SPLU原生支持多RHS
-            if self._has_cholmod:
-                return self.factor.solve_A(B)
-            else:
-                return self.factor.solve(B)
-
     def solve(self, b: Union[np.ndarray, sp.spmatrix], tol: float = 1e-8) -> np.ndarray:
         """
-        Solve Q * x = b (supports multiple RHS)
+        Solve Q * x = b (supports single or multiple RHS)
 
         Args:
             b: Right-hand side (n,) or (n, k) or sparse matrix
@@ -98,7 +75,7 @@ class SparseFactor:
         Returns:
             x: Solution vector(s) (n,) or (n, k)
         """
-        # 🔥 转换稀疏矩阵为稠密（对于批量RHS）
+        # 转换稀疏矩阵为稠密
         if sp.issparse(b):
             b = b.toarray()
 
@@ -117,15 +94,38 @@ class SparseFactor:
                     warnings.warn(f"PCG did not converge (info={info})")
                 return x
             else:
-                # 🔥 批量PCG（列循环，未来可改为block-CG）
+                # 批量PCG（列循环）
                 return np.column_stack([self.solve(b[:, i], tol) for i in range(b.shape[1])])
 
         else:
-            # 🔥 CHOLMOD和SPLU都支持多RHS
+            # CHOLMOD和SPLU都支持多RHS
             if self._has_cholmod:
                 return self.factor.solve_A(b)
             else:
                 return self.factor.solve(b)
+
+    def solve_multi(self, B: np.ndarray) -> np.ndarray:
+        """
+        🔥 批量求解 Q X = B（多个右端向量）
+
+        这是加速的关键！一次调用解决所有候选，而不是循环。
+
+        Args:
+            B: Right-hand sides (n, m) - 每列是一个RHS
+
+        Returns:
+            X: Solutions (n, m)
+
+        Example:
+            # 不要这样（慢）：
+            for i in range(480):
+                z_i = factor.solve(H[i, :])  # 480次调用
+
+            # 应该这样（快）：
+            Z = factor.solve_multi(H.T)  # 1次调用！
+        """
+        # 直接调用solve，它已经支持多RHS
+        return self.solve(B)
 
     def solve_lower(self, b: np.ndarray) -> np.ndarray:
         """
@@ -160,7 +160,11 @@ class SparseFactor:
             return -np.log(trace_inv) * self.n
 
     def rank1_update(self, h: np.ndarray, weight: float = 1.0):
-        """Update factor to reflect Q_new = Q + weight * h h^T."""
+        """
+        🔥 Rank-1更新：Q_new = Q + weight * h h^T
+
+        这是EVI快速实现的核心！
+        """
         if self._has_cholmod and weight > 0:
             try:
                 # 确保 h 是 numpy array
@@ -169,28 +173,21 @@ class SparseFactor:
                 self.factor.update_inplace(h, weight)
             except Exception as e:
                 # CHOLMOD update 失败，降级到重新分解
-                import warnings
                 warnings.warn(f"CHOLMOD update failed ({e}), refactorizing...")
-
-                # 确保 Q 是稀疏矩阵
                 if not sp.issparse(self.Q):
                     self.Q = sp.csr_matrix(self.Q)
-
-                # 重新分解
                 self.Q = self.Q + weight * sp.csr_matrix(np.outer(h, h))
                 self.__init__(self.Q, self.method)
         else:
-            # 确保 Q 是稀疏矩阵
+            # 重新分解
             if not sp.issparse(self.Q):
                 self.Q = sp.csr_matrix(self.Q)
-
-            # Refactorize
             self.Q = self.Q + weight * sp.csr_matrix(np.outer(h, h))
             self.__init__(self.Q, self.method)
 
 
 # =====================================================================
-# 🔥 新增：批量二次型计算
+# 批量二次型计算（用于MI预筛）
 # =====================================================================
 
 def batch_quadform_via_solve(factor: SparseFactor,
@@ -209,12 +206,8 @@ def batch_quadform_via_solve(factor: SparseFactor,
         Z = Q^{-1} H  (一次solve，m个RHS)
         quad[i] = h_i^T z_i = sum(H[:, i] * Z[:, i])
     """
-    # 🔥 一次solve得到所有结果
-    Z = factor.solve(H)  # (n, m)
-
-    # 🔥 批量计算列向量点积（Einstein求和）
+    Z = factor.solve_multi(H)  # (n, m) - 一次调用！
     quad = np.einsum('ij,ij->j', H, Z)
-
     return quad
 
 
@@ -230,19 +223,14 @@ def batch_quadform_cholesky(factor: SparseFactor,
     if not factor._has_cholmod:
         return batch_quadform_via_solve(factor, H)
 
-    # 🔥 一次下三角求解
-    T = factor.solve_lower(H)  # L T = H
-
-    # 🔥 列向量范数平方
+    T = factor.solve_lower(H)
     quad = np.einsum('ij,ij->j', T, T)
-
     return quad
 
 
 def quadform_via_solve(factor: SparseFactor, h: np.ndarray) -> float:
     """
     单向量版本（向后兼容）
-
     Compute h^T Σ h = h^T Q^{-1} h
     """
     z = factor.solve(h)
@@ -283,7 +271,7 @@ def compute_posterior(Q_pr: sp.spmatrix,
 
     if rhs_norm > 1e-14:
         rel_residual = np.linalg.norm(residual) / rhs_norm
-        if rel_residual > tol * 10:  # 放宽验证容差
+        if rel_residual > tol * 10:
             warnings.warn(f"High relative residual: {rel_residual:.2e}")
 
     return mu_post, factor
@@ -294,8 +282,6 @@ def compute_posterior_variance_diagonal(factor: SparseFactor,
                                        batch_size: int = 100) -> np.ndarray:
     """
     批量计算对角方差（加速版）
-
-    改进：分批次求解，减少内存占用
     """
     n = factor.n
     if indices is None:
@@ -303,7 +289,7 @@ def compute_posterior_variance_diagonal(factor: SparseFactor,
 
     var_diag = np.zeros(len(indices))
 
-    # 🔥 分批计算（避免一次构造过大矩阵）
+    # 分批计算（避免一次构造过大矩阵）
     for batch_start in range(0, len(indices), batch_size):
         batch_end = min(batch_start + batch_size, len(indices))
         batch_indices = indices[batch_start:batch_end]
@@ -315,7 +301,7 @@ def compute_posterior_variance_diagonal(factor: SparseFactor,
             E_batch[idx, i] = 1.0
 
         # 批量求解
-        Z_batch = factor.solve(E_batch)
+        Z_batch = factor.solve_multi(E_batch)
 
         # 提取对角元
         for i, idx in enumerate(batch_indices):
@@ -336,64 +322,4 @@ def compute_mutual_information(Q_pr: sp.spmatrix,
     factor_post = SparseFactor(Q_post)
 
     mi = 0.5 * (factor_post.logdet() - factor_pr.logdet())
-
     return mi
-
-
-# =====================================================================
-# 向后兼容性测试
-# =====================================================================
-
-if __name__ == "__main__":
-    print("Testing batched inference module...")
-
-    # 构造测试问题
-    n = 500
-    m_batch = 50
-
-    A = sp.diags([4, -1, -1], [0, -1, 1], shape=(n, n), format='csc')
-    A = A + 1e-6 * sp.eye(n)
-
-    factor = SparseFactor(A)
-
-    # 测试批量求解
-    print("\n1. Testing batch solve...")
-    B = np.random.randn(n, m_batch)
-
-    import time
-
-    # 方法1：逐列求解（慢）
-    start = time.time()
-    X1 = np.column_stack([factor.solve(B[:, i]) for i in range(m_batch)])
-    t1 = time.time() - start
-
-    # 方法2：批量求解（快）
-    start = time.time()
-    X2 = factor.solve(B)
-    t2 = time.time() - start
-
-    print(f"  Sequential: {t1*1000:.2f} ms")
-    print(f"  Batched:    {t2*1000:.2f} ms")
-    print(f"  Speedup:    {t1/t2:.1f}x")
-    print(f"  Max error:  {np.max(np.abs(X1 - X2)):.2e}")
-
-    # 测试批量二次型
-    print("\n2. Testing batch quadform...")
-    H = np.random.randn(n, m_batch)
-
-    # 方法1：逐个计算
-    start = time.time()
-    quad1 = np.array([quadform_via_solve(factor, H[:, i]) for i in range(m_batch)])
-    t1 = time.time() - start
-
-    # 方法2：批量计算
-    start = time.time()
-    quad2 = batch_quadform_via_solve(factor, H)
-    t2 = time.time() - start
-
-    print(f"  Sequential: {t1*1000:.2f} ms")
-    print(f"  Batched:    {t2*1000:.2f} ms")
-    print(f"  Speedup:    {t1/t2:.1f}x")
-    print(f"  Max error:  {np.max(np.abs(quad1 - quad2)):.2e}")
-
-    print("\n✓ All tests passed!")
