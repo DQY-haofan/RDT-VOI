@@ -18,15 +18,15 @@ cv:
   block_strategy: kmeans
   buffer_width_multiplier: 1.5
   ensure_connected: true
-  k_folds: 5
+  k_folds: 3
   morans_permutations: 999
   scheme: spatial_block
 decision:
-  L_FN_gbp: 40000
+  L_FN_gbp: 80000
   L_FP_gbp: 8000
   L_TN_gbp: 0
   L_TP_gbp: 5000
-  tau_iri: 2.0
+  tau_iri: 2.2
 diagnostics:
   calibration:
     coverage_curves: true
@@ -113,10 +113,25 @@ plots:
   style: seaborn-v0_8-paper
 prior:
   alpha: 2
-  beta: 0.0001
-  kappa: 0.08
+  beta: 1.0e-06
+  beta_base: 0.05
+  beta_hot: 1.0e-08
+  hotspots:
+  - center_m:
+    - 60
+    - 60
+    radius_m: 30
+  - center_m:
+    - 140
+    - 60
+    radius_m: 25
+  - center_m:
+    - 100
+    - 140
+    radius_m: 30
+  kappa: 0.1
   mu_prior_mean: 2.2
-  mu_prior_std: 0.0
+  mu_prior_std: 0.3
   nu: 1.0
   sigma2: 0.3
 selection:
@@ -132,10 +147,13 @@ selection:
     n_probes: 16
     use_cost: true
   greedy_evi:
-    budgets_subset:
-    - 10
+    budgets_subset: []
+    every_n_folds: 3
+    max_folds: null
+    must_budgets:
+    - 5
     - 20
-    max_folds: 1
+    - 40
     n_y_samples: 10
     use_cost: true
   greedy_mi:

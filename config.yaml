@@ -137,14 +137,14 @@ selection:
     use_cost: true       # 🔥 Enable gain/cost scoring
 
   greedy_evi:
-    n_y_samples: 25
+    n_y_samples: 10
     use_cost: true
 
     # 🔥 新增：必须运行的预算（所有折都运行）
     must_budgets: [5, 20, 40]  # 关键预算点
 
     # 🔥 新增：每 N 折运行一次（节省计算）
-    every_n_folds: 2  # 每 2 折运行一次（对非 must_budgets）
+    every_n_folds: 3  # 每 2 折运行一次（对非 must_budgets）
 
     # 原有配置（可选）
     budgets_subset: []  # 空列表表示运行所有预算
@@ -171,7 +171,7 @@ evi:
 # ----------------------------------------------------------------------------
 cv:
   scheme: "spatial_block"  # "spatial_block" | "random" | "stratified"
-  k_folds: 5
+  k_folds: 3
   buffer_width_multiplier: 1.5  # Buffer = 1.5 × correlation_length
   block_strategy: "kmeans"      # "kmeans" | "grid" | "random"
   ensure_connected: true

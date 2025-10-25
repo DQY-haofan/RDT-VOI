@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
+from visualization_helpers import generate_expert_plots
 
 from matplotlib import pyplot as plt
 
@@ -1329,6 +1330,14 @@ def main():
             import traceback
             traceback.print_exc()
 
+    generate_expert_plots(
+        all_results=all_results,
+        sensors=sensors,
+        geom=geom,
+        Q_pr=Q_pr,
+        output_dir=output_dir,
+        config=cfg
+    )
     # ========================================================================
     # 10. SUMMARY REPORT
     # ========================================================================

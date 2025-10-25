@@ -202,67 +202,44 @@ def should_use_evi(method_name: str, budget: int, fold_idx: int,
     """
     🔥 修复版本：更合理的 EVI 跳过策略
 
-    Determine if EVI should be run for this (method, budget, fold) combination.
-
-    Since EVI is expensive, we can run it on a subset of configurations.
-
-    ⚠️  WARNING: This function should ONLY apply constraints to EVI methods!
-                For other methods, always return True (run all configurations).
-
-    Args:
-        method_name: Name of the method (should be 'greedy_evi' or similar)
-        budget: Budget value
-        fold_idx: Fold index (0-based)
-        config: Configuration object
-
-    Returns:
-        True if should run, False if should skip
-
-    修改：
-    1. 对非 EVI 方法总是返回 True
-    2. 添加 must_budgets 配置 - 这些预算必须运行所有折
-    3. 改进 max_folds 逻辑 - 至少保留第 1 折
+    确保：
+    1. 非EVI方法总是返回True
+    2. must_budgets的预算运行所有折
+    3. 其他预算至少保留第1折 + 每N折运行一次
     """
     # ✅ 确保只对 EVI 方法应用限制
     method_lower = method_name.lower()
     if method_lower not in ['greedy_evi', 'evi', 'greedy-evi', 'myopic_evi']:
-        # 非 EVI 方法总是运行
         return True
 
     # 检查 EVI 配置约束
     if hasattr(config.selection, 'greedy_evi'):
         evi_cfg = config.selection.greedy_evi
 
-        # 🔥 新增：must_budgets - 这些预算必须运行所有折
-        if 'must_budgets' in evi_cfg and evi_cfg['must_budgets']:
-            if budget in evi_cfg['must_budgets']:
-                return True  # 必须运行的预算，不跳过任何折
+        # 🔥 must_budgets - 这些预算必须运行所有折
+        must_budgets = set(evi_cfg.get('must_budgets', [5, 20, 40]))
+        if budget in must_budgets:
+            return True  # 必须运行的预算，不跳过任何折
 
         # 检查 budget 约束
         if 'budgets_subset' in evi_cfg:
-            budgets_subset = evi_cfg['budgets_subset']
+            budgets_subset = evi_cfg.get('budgets_subset', [])
             if budgets_subset and budget not in budgets_subset:
-                # 如果定义了 budgets_subset 且当前 budget 不在内，跳过
+                return False  # 不在子集中，跳过
+
+        # 🔥 改进：fold 约束 - 至少保留第1折
+        if fold_idx == 0:
+            return True  # 第1折总是运行（用于基准测试）
+
+        # 每N折运行一次
+        every_n = evi_cfg.get('every_n_folds', 2)
+        if every_n and every_n > 1:
+            if (fold_idx % every_n) != 0:
                 return False
 
-        # 🔥 改进：fold 约束 - 至少保留第 1 折
-        if 'max_folds' in evi_cfg:
-            max_folds = evi_cfg['max_folds']
-            if max_folds is not None:
-                if fold_idx == 0:
-                    # 第 1 折总是运行（用于基准测试）
-                    return True
-                elif fold_idx >= max_folds:
-                    # 超过最大折数，跳过
-                    return False
+        # max_folds约束（可选）
+        max_folds = evi_cfg.get('max_folds')
+        if max_folds is not None and fold_idx >= max_folds:
+            return False
 
-        # 🔥 新增：every_n_folds - 每 N 折运行一次
-        if 'every_n_folds' in evi_cfg:
-            every_n = evi_cfg['every_n_folds']
-            if every_n and every_n > 1:
-                # 第 0 折 + 每 N 折
-                if fold_idx > 0 and (fold_idx % every_n) != 0:
-                    return False
-
-    # 默认运行
-    return True
+    return True  # 默认运行

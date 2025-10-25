@@ -315,66 +315,14 @@ def run_cv_experiment(geom, Q_pr, mu_pr, x_true, sensors,
         metrics['morans_i'] = I_stat
         metrics['morans_pval'] = I_pval
 
-        fold_results.append(metrics)
-
-        print(f"    RMSE={metrics['rmse']:.3f}, Loss=£{metrics['expected_loss_gbp']:.0f}, "
-              f"I={I_stat:.3f} (p={I_pval:.3f})")
-
-    # Aggregate across folds
-    aggregated = {}
-    for key in fold_results[0].keys():
-        values = np.array([fr[key] for fr in fold_results])
-        aggregated[key] = {
-            'mean': values.mean(),
-            'std': values.std(),
-            'values': values
+        fold_result_dict = {
+            'success': True,
+            'metrics': metrics,
+            'selection_result': selection_result,
+            'residuals': residuals[test_idx],  # 🔥 新增：保存残差
         }
 
-    return {
-        'fold_results': fold_results,
-        'aggregated': aggregated,
-        'selection_result': selection_result
-    }
-
-    fold_results = []
-
-    for fold_idx, (train_idx, test_idx) in enumerate(folds):
-        print(f"\n  Fold {fold_idx+1}/{len(folds)}")
-
-        # Select sensors (on full domain or train only - depends on application)
-        # Here we select on full domain for simplicity
-        selection_result = selection_method(sensors, k, Q_pr)
-        selected_sensors = [sensors[i] for i in selection_result.selected_ids]
-
-        # Generate observations
-        y, H, R = get_observation(x_true, selected_sensors, rng)
-
-        # Compute posterior
-        mu_post, factor = compute_posterior(Q_pr, mu_pr, H, R, y)
-
-        # Get posterior variances on test set
-        var_post_test = compute_posterior_variance_diagonal(factor, test_idx)
-        sigma_post_test = np.sqrt(var_post_test)
-
-        # Expand to full arrays (for metrics function)
-        sigma_post = np.zeros(len(mu_post))
-        sigma_post[test_idx] = sigma_post_test
-
-        # Compute metrics
-        metrics = compute_metrics(
-            mu_post, sigma_post, x_true, test_idx, decision_config
-        )
-
-        # Spatial diagnostic: Moran's I on residuals
-        residuals = mu_post - x_true
-        I_stat, I_pval = morans_i(
-            residuals[test_idx],
-            geom.adjacency[test_idx][:, test_idx],
-            n_permutations=cv_config.get('morans_permutations', 999),
-            rng=rng
-        )
-        metrics['morans_i'] = I_stat
-        metrics['morans_pval'] = I_pval
+        fold_results.append(fold_result_dict)
 
         fold_results.append(metrics)
 
