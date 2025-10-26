@@ -62,7 +62,8 @@ def conditional_risk(mu: float, sigma: float,
 def expected_loss(mu_post: np.ndarray,
                  sigma_post: np.ndarray,
                  decision_config,
-                 test_indices: np.ndarray = None) -> float:
+                 test_indices: np.ndarray = None,
+                 tau: float = None) -> float:
     """
     Compute expected economic loss averaged over test set.
 
@@ -71,6 +72,7 @@ def expected_loss(mu_post: np.ndarray,
         sigma_post: Posterior std deviations (n,)
         decision_config: DecisionConfig object
         test_indices: Subset to evaluate (if None, use all)
+        tau: Decision threshold (if None, get from decision_config)
 
     Returns:
         expected_loss: Mean conditional risk over test set (GBP)
@@ -78,10 +80,28 @@ def expected_loss(mu_post: np.ndarray,
     if test_indices is None:
         test_indices = np.arange(len(mu_post))
 
+    # 🔥 改进的阈值获取逻辑
+    if tau is None:
+        if decision_config.tau_iri is not None:
+            tau = decision_config.tau_iri
+        elif decision_config.tau_quantile is not None:
+            # 🔥 自动计算动态阈值（使用后验均值）
+            tau = float(np.quantile(mu_post, decision_config.tau_quantile))
+            warnings.warn(
+                f"tau_iri not set, using dynamic threshold from posterior: "
+                f"tau = quantile(mu_post, {decision_config.tau_quantile}) = {tau:.3f}. "
+                "For better performance, set tau_iri in main() before evaluation."
+            )
+        else:
+            raise ValueError(
+                "Decision threshold not configured. "
+                "Set either tau_iri or tau_quantile in config.yaml"
+            )
+
     risks = np.array([
         conditional_risk(
             mu_post[i], sigma_post[i],
-            decision_config.tau_iri,
+            tau,
             decision_config.L_FP_gbp,
             decision_config.L_FN_gbp,
             decision_config.L_TP_gbp,
@@ -122,7 +142,27 @@ def expected_loss_batch(mu_post_batch: np.ndarray,
         >>> losses = expected_loss_batch(mu, sigma, config)
         >>> losses.shape  # (100,)
     """
-    tau = decision_config.tau_iri
+    # 🔥 改进的阈值获取逻辑
+    if decision_config.tau_iri is not None:
+        tau = decision_config.tau_iri
+    elif decision_config.tau_quantile is not None:
+        # 🔥 自动计算动态阈值（使用后验均值）
+        # 对于批量版本，使用第一列（或全局）的分位数
+        if mu_post_batch.ndim == 1:
+            tau = float(np.quantile(mu_post_batch, decision_config.tau_quantile))
+        else:
+            # 使用所有候选的平均分位数
+            tau = float(np.quantile(mu_post_batch, decision_config.tau_quantile))
+        warnings.warn(
+            f"tau_iri not set, using dynamic threshold: tau = {tau:.3f}. "
+            "For better performance, set tau_iri in main() before evaluation."
+        )
+    else:
+        raise ValueError(
+            "Decision threshold not configured. "
+            "Set either tau_iri or tau_quantile in config.yaml"
+        )
+
     L_FP = decision_config.L_FP_gbp
     L_FN = decision_config.L_FN_gbp
     L_TP = decision_config.L_TP_gbp

@@ -97,26 +97,54 @@ class SensorsConfig:
 @dataclass
 class DecisionConfig:
     """Decision model parameters."""
-    tau_iri: float
     L_TP_gbp: float
     L_FP_gbp: float
     L_FN_gbp: float
     L_TN_gbp: float
 
-    # 🔥 新增：动态阈值支持
-    tau_quantile: float = None  # 可选：使用先验分位数作为阈值
+    # 🔥 阈值配置：两种模式二选一
+    tau_iri: float = None  # 模式1：固定阈值（如 2.2）
+    tau_quantile: float = None  # 模式2：动态分位数阈值（如 0.88）
 
     def __post_init__(self):
-        """验证参数"""
+        # 验证：必须指定一种阈值模式
+        if self.tau_iri is None and self.tau_quantile is None:
+            raise ValueError("Must specify either tau_iri or tau_quantile")
+
+        # 验证：不能同时指定两种模式
+        if self.tau_iri is not None and self.tau_quantile is not None:
+            print(f"  Warning: Both tau_iri and tau_quantile specified. "
+                  f"Using tau_quantile={self.tau_quantile}")
+
+        # 验证分位数范围
         if self.tau_quantile is not None:
             if not (0 < self.tau_quantile < 1):
                 raise ValueError(f"tau_quantile must be in (0, 1), got {self.tau_quantile}")
+
+    def get_threshold(self, mu_prior = None):
+        """
+        获取决策阈值
+
+        Args:
+            mu_prior: 先验均值（仅当使用 tau_quantile 时需要）
+
+        Returns:
+            threshold: 决策阈值
+        """
+        import numpy as np
+        if self.tau_quantile is not None:
+            if mu_prior is None:
+                raise ValueError("tau_quantile mode requires mu_prior")
+            tau = float(np.quantile(mu_prior, self.tau_quantile))
+            print(f"  Dynamic threshold: τ = quantile(μ_prior, {self.tau_quantile}) = {tau:.3f}")
+            return tau
+        else:
+            return self.tau_iri
 
     @property
     def prob_threshold(self) -> float:
         """Bayes-optimal probability threshold."""
         return self.L_FP_gbp / (self.L_FP_gbp + self.L_FN_gbp - self.L_TP_gbp)
-
 
 @dataclass
 class SelectionConfig:
@@ -124,6 +152,7 @@ class SelectionConfig:
     methods: List[str]
     budgets: List[int]
     greedy_mi: Dict[str, Any]
+    budget_type: str = "count"  # "count" 或 "monetary"
     greedy_aopt: Dict[str, Any] = None  # 🔥 新增
     greedy_evi: Dict[str, Any] = None  # 🔥 新增
     maxmin: Dict[str, Any] = None  # 🔥 新增
@@ -156,9 +185,9 @@ class EVIConfig:
     compute_for: List[str]
     method: str
     monte_carlo_samples: int
-    unscented_alpha: float
-    unscented_beta: float
-    unscented_kappa: float
+    unscented_alpha: float = 1.0
+    unscented_beta: float = 2.0
+    unscented_kappa: float = 0.0
 
 
 @dataclass
@@ -197,6 +226,9 @@ class PlotsConfig:
     budget_curves: Dict[str, Any]
     performance_profile: Dict[str, float]
     critical_difference: Dict[str, Any]
+    business_metrics: Dict[str, Any] = None  # 🔥 新增：业务友好图表
+    effect_size: Dict[str, Any] = None  # 🔥 新增：效应量分析
+    critical_region: Dict[str, Any] = None  # 🔥 新增：近阈值区域分析
     expert_plots: Dict[str, Any] = None  # 🔥 新增字段（可选）
 
     def __post_init__(self):
@@ -212,6 +244,16 @@ class PlotsConfig:
                 'ablation_study': {'enable': False},
                 'sensor_placement_map': {'enable': False}
             }
+
+        # 设置默认值for新增字段
+        if self.business_metrics is None:
+            self.business_metrics = {'enable': False}
+
+        if self.effect_size is None:
+            self.effect_size = {'enable': False}
+
+        if self.critical_region is None:
+            self.critical_region = {'enable': False}
 
 
 @dataclass
