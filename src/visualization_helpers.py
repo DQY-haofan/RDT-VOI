@@ -420,5 +420,298 @@ def generate_expert_plots(all_results, sensors, geom, Q_pr,
     print("\n" + "=" * 70)
 
 
+
+# ============================================================================
+# 🔥 Effect Size Analysis (新增效应量分析)
+# ============================================================================
+
+def compute_cliffs_delta(x: np.ndarray, y: np.ndarray) -> float:
+    """
+    计算 Cliff's Delta 效应量
+
+    Cliff's Delta 是一种非参数效应量测度，范围 [-1, 1]：
+    - δ = 0: 两组无差异
+    - δ = -1: y 中所有值都优于 x（对于越小越好的指标）
+    - δ = +1: x 中所有值都优于 y
+
+    解释（Cohen's 风格）：
+    - |δ| < 0.147: negligible
+    - 0.147 ≤ |δ| < 0.330: small
+    - 0.330 ≤ |δ| < 0.474: medium
+    - |δ| ≥ 0.474: large
+
+    Args:
+        x: 方法 A 的结果数组
+        y: 方法 B 的结果数组
+
+    Returns:
+        delta: Cliff's Delta 值
+    """
+    n_x, n_y = len(x), len(y)
+
+    if n_x == 0 or n_y == 0:
+        return np.nan
+
+    # 计算所有配对的优劣关系
+    dominance = 0
+    for xi in x:
+        for yi in y:
+            if xi < yi:  # x 更好（假设越小越好）
+                dominance += 1
+            elif xi > yi:  # y 更好
+                dominance -= 1
+
+    delta = dominance / (n_x * n_y)
+    return delta
+
+
+def interpret_cliffs_delta(delta: float) -> str:
+    """解释 Cliff's Delta 的效应大小"""
+    abs_delta = abs(delta)
+
+    if abs_delta < 0.147:
+        return "negligible"
+    elif abs_delta < 0.330:
+        return "small"
+    elif abs_delta < 0.474:
+        return "medium"
+    else:
+        return "large"
+
+
+def compute_win_rate(x: np.ndarray, y: np.ndarray,
+                     lower_is_better: bool = True) -> float:
+    """
+    计算配对胜率（方法 x 优于方法 y 的比例）
+
+    Args:
+        x, y: 两个方法的结果数组
+        lower_is_better: 是否越小越好
+
+    Returns:
+        win_rate: x 胜出的比例 [0, 1]
+    """
+    if len(x) != len(y):
+        raise ValueError("Arrays must have same length for pairwise comparison")
+
+    if len(x) == 0:
+        return np.nan
+
+    if lower_is_better:
+        wins = np.sum(x < y)
+    else:
+        wins = np.sum(x > y)
+
+    return wins / len(x)
+
+
+def compute_pairwise_statistics(df_folds: pd.DataFrame,
+                                metric: str = 'expected_loss_gbp',
+                                lower_is_better: bool = True) -> tuple:
+    """
+    计算所有方法间的配对统计量
+
+    Args:
+        df_folds: fold-level DataFrame with columns [method, budget, fold, metric, ...]
+        metric: 要比较的指标
+        lower_is_better: 指标是否越小越好
+
+    Returns:
+        delta_matrix: Cliff's Delta 矩阵 (n_methods, n_methods)
+        winrate_matrix: 胜率矩阵 (n_methods, n_methods)
+        summary_df: 汇总 DataFrame
+    """
+    methods = sorted(df_folds['method'].unique())
+    n_methods = len(methods)
+
+    delta_matrix = np.zeros((n_methods, n_methods))
+    winrate_matrix = np.zeros((n_methods, n_methods))
+
+    # 计算配对统计量
+    for i, method_a in enumerate(methods):
+        for j, method_b in enumerate(methods):
+            if i == j:
+                delta_matrix[i, j] = 0
+                winrate_matrix[i, j] = 0.5
+                continue
+
+            # 获取两个方法在所有 (budget, fold) 实例上的结果
+            vals_a = df_folds[df_folds['method'] == method_a][metric].values
+            vals_b = df_folds[df_folds['method'] == method_b][metric].values
+
+            # 确保长度相同（配对比较）
+            min_len = min(len(vals_a), len(vals_b))
+            vals_a = vals_a[:min_len]
+            vals_b = vals_b[:min_len]
+
+            # Cliff's Delta（对于越小越好的指标，负值表示 a 更好）
+            if lower_is_better:
+                delta = compute_cliffs_delta(vals_b, vals_a)  # 反转，让负值表示 a 更好
+            else:
+                delta = compute_cliffs_delta(vals_a, vals_b)
+
+            delta_matrix[i, j] = delta
+
+            # 胜率（a 优于 b 的比例）
+            winrate = compute_win_rate(vals_a, vals_b, lower_is_better)
+            winrate_matrix[i, j] = winrate
+
+    # 创建汇总 DataFrame
+    summary_rows = []
+    for i, method_a in enumerate(methods):
+        for j, method_b in enumerate(methods):
+            if i != j:
+                summary_rows.append({
+                    'Method A': method_a,
+                    'Method B': method_b,
+                    'Cliff_Delta': delta_matrix[i, j],
+                    'Effect_Size': interpret_cliffs_delta(delta_matrix[i, j]),
+                    'Win_Rate': winrate_matrix[i, j],
+                    'A_Better': winrate_matrix[i, j] > 0.5
+                })
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    return delta_matrix, winrate_matrix, summary_df
+
+
+def plot_effect_size_heatmaps(delta_matrix: np.ndarray,
+                              winrate_matrix: np.ndarray,
+                              methods: list,
+                              output_path: Path,
+                              metric_name: str = 'Expected Loss'):
+    """
+    绘制效应量双热力图（Cliff's Delta + 胜率）
+
+    Args:
+        delta_matrix: Cliff's Delta 矩阵
+        winrate_matrix: 胜率矩阵
+        methods: 方法名称列表
+        output_path: 输出路径
+        metric_name: 指标名称（用于标题）
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7))
+
+    n_methods = len(methods)
+
+    # === 左图：Cliff's Delta ===
+    im1 = ax1.imshow(delta_matrix, cmap='RdBu_r', vmin=-1, vmax=1, aspect='auto')
+    ax1.set_xticks(range(n_methods))
+    ax1.set_yticks(range(n_methods))
+    ax1.set_xticklabels(methods, rotation=45, ha='right')
+    ax1.set_yticklabels(methods)
+    ax1.set_title(f"Cliff's Delta Effect Size\n{metric_name}\n"
+                  "(negative = row method better)", fontsize=12)
+    ax1.set_xlabel('Method B (compared to)', fontsize=10)
+    ax1.set_ylabel('Method A (baseline)', fontsize=10)
+
+    # 添加数值和效应大小标注
+    for i in range(n_methods):
+        for j in range(n_methods):
+            delta_val = delta_matrix[i, j]
+            effect = interpret_cliffs_delta(delta_val)
+
+            # 文本颜色（深色背景用白色，浅色背景用黑色）
+            text_color = 'white' if abs(delta_val) > 0.5 else 'black'
+
+            # 主数值
+            ax1.text(j, i, f'{delta_val:.2f}',
+                    ha="center", va="center", color=text_color,
+                    fontsize=9, fontweight='bold')
+
+            # 效应大小注释（对角线除外）
+            if i != j and abs(delta_val) >= 0.147:  # 只标注非negligible的
+                ax1.text(j, i + 0.3, f'({effect[0]})',
+                        ha="center", va="center", color=text_color,
+                        fontsize=7, style='italic')
+
+    # 颜色条
+    cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+    cbar1.set_label("Cliff's Delta\n(negative = A better)", fontsize=10)
+
+    # === 右图：胜率 ===
+    im2 = ax2.imshow(winrate_matrix, cmap='RdYlGn', vmin=0, vmax=1, aspect='auto')
+    ax2.set_xticks(range(n_methods))
+    ax2.set_yticks(range(n_methods))
+    ax2.set_xticklabels(methods, rotation=45, ha='right')
+    ax2.set_yticklabels(methods)
+    ax2.set_title(f"Pairwise Win Rate\n{metric_name}\n"
+                  "(row method wins over column method)", fontsize=12)
+    ax2.set_xlabel('Method B (opponent)', fontsize=10)
+    ax2.set_ylabel('Method A (player)', fontsize=10)
+
+    # 添加数值标注
+    for i in range(n_methods):
+        for j in range(n_methods):
+            winrate_val = winrate_matrix[i, j]
+
+            # 文本颜色
+            if winrate_val > 0.75:
+                text_color = 'white'
+            elif winrate_val < 0.25:
+                text_color = 'white'
+            else:
+                text_color = 'black'
+
+            # 主数值
+            ax2.text(j, i, f'{winrate_val:.0%}',
+                    ha="center", va="center", color=text_color,
+                    fontsize=10, fontweight='bold')
+
+            # 显著标记（胜率 > 60% 或 < 40%）
+            if i != j:
+                if winrate_val > 0.6:
+                    marker = '↑'  # A 显著更好
+                elif winrate_val < 0.4:
+                    marker = '↓'  # B 显著更好
+                else:
+                    marker = '≈'  # 接近
+
+                ax2.text(j, i + 0.35, marker,
+                        ha="center", va="center", color=text_color,
+                        fontsize=12)
+
+    # 颜色条
+    cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+    cbar2.set_label('Win Rate\n(A wins over B)', fontsize=10)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"  ✓ Saved effect size heatmaps: {output_path}")
+
+
+def generate_pairwise_comparison_table(summary_df: pd.DataFrame,
+                                       output_path: Path,
+                                       top_k: int = 20):
+    """
+    生成配对比较表（显示最大效应量的比较）
+
+    Args:
+        summary_df: 配对统计汇总 DataFrame
+        output_path: 输出路径
+        top_k: 显示前 k 对比较
+    """
+    # 按 Cliff's Delta 绝对值排序
+    summary_df['Abs_Delta'] = summary_df['Cliff_Delta'].abs()
+    top_comparisons = summary_df.nlargest(top_k, 'Abs_Delta')
+
+    # 格式化显示
+    display_df = top_comparisons[[
+        'Method A', 'Method B', 'Cliff_Delta', 'Effect_Size', 'Win_Rate', 'A_Better'
+    ]].copy()
+
+    display_df['Cliff_Delta'] = display_df['Cliff_Delta'].map('{:.3f}'.format)
+    display_df['Win_Rate'] = display_df['Win_Rate'].map('{:.1%}'.format)
+
+    # 保存为 CSV
+    display_df.to_csv(output_path, index=False)
+    print(f"  ✓ Saved pairwise comparison table: {output_path}")
+
+    return display_df
+
+
+
 if __name__ == "__main__":
     print("Visualization helpers loaded successfully")

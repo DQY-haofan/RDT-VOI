@@ -376,3 +376,138 @@ if __name__ == "__main__":
     residuals = rng.normal(0, 0.5, geom.n)
     I, p = morans_i(residuals, geom.adjacency, n_permutations=99, rng=rng)
     print(f"\nMoran's I: {I:.3f} (p={p:.3f})")
+
+# ============================================================================
+# 🔥 Business-Friendly Metrics (新增业务指标)
+# ============================================================================
+
+def compute_savings_and_roi(results_dict: Dict,
+                            baseline_method: str = 'uniform',
+                            cost_key: str = 'total_cost',
+                            loss_key: str = 'expected_loss_gbp') -> Dict:
+    """
+    计算各方法相对 baseline 的省钱和 ROI
+
+    Args:
+        results_dict: 嵌套字典 {method: {budget: {metrics}}}
+        baseline_method: 基准方法名称
+        cost_key: 成本键名
+        loss_key: 损失键名
+
+    Returns:
+        Dict with keys for each (method, budget): savings_gbp, roi, cost_efficiency
+    """
+    business_metrics = {}
+
+    # 获取所有预算点
+    budgets = set()
+    for method_data in results_dict.values():
+        budgets.update(method_data.keys())
+    budgets = sorted(budgets)
+
+    for budget in budgets:
+        # 获取 baseline 损失
+        if baseline_method not in results_dict:
+            print(f"Warning: baseline method '{baseline_method}' not found")
+            continue
+
+        if budget not in results_dict[baseline_method]:
+            continue
+
+        baseline_loss = results_dict[baseline_method][budget]['mean'][loss_key]
+
+        for method_name, method_data in results_dict.items():
+            if budget not in method_data:
+                continue
+
+            metrics = method_data[budget]['mean']
+            method_loss = metrics[loss_key]
+            method_cost = metrics[cost_key]
+
+            # 省钱 = baseline 损失 - 方法损失
+            savings = baseline_loss - method_loss
+
+            # ROI = 省钱 / 花费
+            roi = savings / method_cost if method_cost > 0 else 0
+
+            # 成本效率
+            cost_efficiency = savings / method_cost if method_cost > 0 else 0
+
+            key = (method_name, budget)
+            business_metrics[key] = {
+                'savings_gbp': savings,
+                'roi': roi,
+                'cost_efficiency': cost_efficiency,
+                'total_cost': method_cost,
+                'expected_loss_gbp': method_loss,
+                'baseline_loss_gbp': baseline_loss
+            }
+
+    return business_metrics
+
+
+def compute_critical_region_metrics(mu_post: np.ndarray,
+                                    sigma_post: np.ndarray,
+                                    x_true: np.ndarray,
+                                    tau: float,
+                                    epsilon: float = 0.2) -> Dict:
+    """
+    计算临界区域（阈值附近）的性能指标
+
+    临界区域定义：|μ - τ| ≤ ε 的点
+    这是决策最敏感的区域，EVI 优势应该最明显
+
+    Args:
+        mu_post: 后验均值 (n,)
+        sigma_post: 后验标准差 (n,)
+        x_true: 真实值 (n,)
+        tau: 决策阈值
+        epsilon: 临界区域半径
+
+    Returns:
+        Dict with metrics:
+        - n_critical: 临界区域点数
+        - rmse_critical: 临界区域 RMSE
+        - misclass_rate: 误分类率
+        - avg_uncertainty: 平均不确定性
+    """
+    # 识别临界区域
+    critical_mask = np.abs(mu_post - tau) <= epsilon
+    critical_idx = np.where(critical_mask)[0]
+
+    if len(critical_idx) == 0:
+        return {
+            'n_critical': 0,
+            'fraction_critical': 0.0,
+            'rmse_critical': np.nan,
+            'misclass_rate': np.nan,
+            'avg_uncertainty_critical': np.nan,
+            'max_uncertainty_critical': np.nan
+        }
+
+    # 提取临界区域数据
+    mu_crit = mu_post[critical_idx]
+    sigma_crit = sigma_post[critical_idx]
+    x_crit = x_true[critical_idx]
+
+    # RMSE
+    errors = mu_crit - x_crit
+    rmse_crit = np.sqrt(np.mean(errors ** 2))
+
+    # 误分类率（预测 vs 真实是否超过阈值）
+    pred_above = mu_crit > tau
+    true_above = x_crit > tau
+    misclass_rate = np.mean(pred_above != true_above)
+
+    # 不确定性统计
+    avg_uncertainty = sigma_crit.mean()
+    max_uncertainty = sigma_crit.max()
+
+    return {
+        'n_critical': len(critical_idx),
+        'fraction_critical': len(critical_idx) / len(mu_post),
+        'rmse_critical': rmse_crit,
+        'misclass_rate': misclass_rate,
+        'avg_uncertainty_critical': avg_uncertainty,
+        'max_uncertainty_critical': max_uncertainty
+    }
