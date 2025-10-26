@@ -167,21 +167,36 @@ class SparseFactor:
         """
         if self._has_cholmod and weight > 0:
             try:
-                # 确保 h 是 numpy array
+                # ✅ 修复：转换为 CSC 列向量（CHOLMOD 要求）
                 if sp.issparse(h):
-                    h = h.toarray().ravel()
-                self.factor.update_inplace(h, weight)
+                    h_col = h.tocsc()
+                else:
+                    # 将 dense array 转为 CSC 列向量
+                    h_flat = h.ravel()
+                    h_col = sp.csc_matrix(h_flat.reshape(-1, 1))
+
+                self.factor.update_inplace(h_col, weight)
             except Exception as e:
                 # CHOLMOD update 失败，降级到重新分解
                 warnings.warn(f"CHOLMOD update failed ({e}), refactorizing...")
                 if not sp.issparse(self.Q):
                     self.Q = sp.csr_matrix(self.Q)
+
+                # 确保 h 是 dense 用于 outer
+                if sp.issparse(h):
+                    h = h.toarray().ravel()
+
                 self.Q = self.Q + weight * sp.csr_matrix(np.outer(h, h))
                 self.__init__(self.Q, self.method)
         else:
             # 重新分解
             if not sp.issparse(self.Q):
                 self.Q = sp.csr_matrix(self.Q)
+
+            # 确保 h 是 dense 用于 outer
+            if sp.issparse(h):
+                h = h.toarray().ravel()
+
             self.Q = self.Q + weight * sp.csr_matrix(np.outer(h, h))
             self.__init__(self.Q, self.method)
 
