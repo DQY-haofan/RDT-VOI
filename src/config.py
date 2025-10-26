@@ -103,6 +103,15 @@ class DecisionConfig:
     L_FN_gbp: float
     L_TN_gbp: float
 
+    # 🔥 新增：动态阈值支持
+    tau_quantile: float = None  # 可选：使用先验分位数作为阈值
+
+    def __post_init__(self):
+        """验证参数"""
+        if self.tau_quantile is not None:
+            if not (0 < self.tau_quantile < 1):
+                raise ValueError(f"tau_quantile must be in (0, 1), got {self.tau_quantile}")
+
     @property
     def prob_threshold(self) -> float:
         """Bayes-optimal probability threshold."""
