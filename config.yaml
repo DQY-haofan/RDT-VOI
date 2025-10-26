@@ -1,18 +1,19 @@
 # ============================================================================
-# RDT-VoI Simulation Configuration - OPTIMIZED VERSION
+# RDT-VoI Simulation Configuration - EXPERT-OPTIMIZED VERSION
 # Road Deterioration Testing: Value of Information Framework
 #
-# 配置评分: 5/5 (优化后)
-# 关键改进:
-#   1. 增强损失不对称性 FN:FP = 15:1 (从 10:1)
-#   2. 优化预算点分布，增加小预算密度
-#   3. EVI 配置优化，确保关键预算点覆盖
+# 🔥 主要优化（基于专家审查意见）:
+#   1. 增强传感器池异质性（SNR 和成本对比度）
+#   2. 优化 EVI 预筛选参数（keep_fraction: 0.25 → 0.6）
+#   3. 启用分层测试集抽样
+#   4. 保持决策损失不对称性 FN:FP = 15:1
+#   5. 保持非平稳先验 (CV=30%)
 # ============================================================================
 
 experiment:
-  name: "rdt_voi_optimized"
+  name: "rdt_voi_expert_optimized"
   seed: 42
-  output_dir: "results/optimized_run"
+  output_dir: "results/expert_optimized"
 
 # ----------------------------------------------------------------------------
 # Numerical Settings
@@ -21,19 +22,19 @@ numerics:
   linear_solver_tol: 1.0e-8
   cholesky_nugget: 1.0e-6
   pcg_max_iter: 500
-  logdet_method: "cholmod"  # "cholmod" | "exact" | "hutchinson"
+  logdet_method: "cholmod"
 
 # ----------------------------------------------------------------------------
 # Spatial Domain
 # ----------------------------------------------------------------------------
 geometry:
-  mode: "grid2d"  # "grid2d" | "polyline1d" | "graph"
+  mode: "grid2d"
   nx: 40
   ny: 40
   h: 5.0  # Grid spacing in meters
 
 # ----------------------------------------------------------------------------
-# Prior Distribution (GMRF/SPDE) - 已验证优秀 ✓
+# Prior Distribution (GMRF/SPDE) - ✓ CV=30% (已验证优秀)
 # ----------------------------------------------------------------------------
 prior:
   # 基础参数
@@ -45,79 +46,89 @@ prior:
   mu_prior_mean: 2.2
   mu_prior_std: 0.3
 
-  # 🔥 非平稳先验参数 - CV=30.11% (优秀!)
+  # 非平稳先验参数 - CV=30.11% (优秀!)
   beta_base: 3.0        # 非热点区域 nugget
-  beta_hot: 1.0e-8      # 热点区域 nugget (差距 3×10^8)
+  beta_hot: 1.0e-8      # 热点区域 nugget
 
   # 热点区域定义 (米坐标) - 域: 200m × 200m
   hotspots:
-    - center_m: [50, 50]      # 左下角
+    - center_m: [50, 50]
       radius_m: 45
-    - center_m: [150, 50]     # 右下角
+    - center_m: [150, 50]
       radius_m: 45
-    - center_m: [50, 150]     # 左上角
+    - center_m: [50, 150]
       radius_m: 45
-    - center_m: [150, 150]    # 右上角
+    - center_m: [150, 150]
       radius_m: 45
-    - center_m: [100, 100]    # 中心区域
+    - center_m: [100, 100]
       radius_m: 50
 
 # ----------------------------------------------------------------------------
-# Sensor Pool Configuration
+# 🔥 Sensor Pool Configuration - OPTIMIZED FOR CONTRAST
 # ----------------------------------------------------------------------------
 sensors:
-  # Available sensor types
+  # 🔥 优化：增强 SNR-Cost 对比度，拉开传感器差异
   types:
+    # 极便宜但噪声极大（智能手机 / 众包数据）
+    - name: "smartphone"
+      noise_std: 1.0          # ✅ SNR ≈ 2.2 (非常低)
+      cost_gbp: 50            # ✅ 极低成本
+      footprint: "point"
+
+    # 中等精度+中等成本（基础点传感器）
     - name: "basic_point"
-      noise_std: 0.15
+      noise_std: 0.15         # ✅ SNR ≈ 15
+      cost_gbp: 150
+      footprint: "point"
+
+    # 极高精度+极高成本（激光轮廓仪）
+    - name: "laser_profiler"
+      noise_std: 0.05         # ✅ SNR ≈ 44 (极高)
+      cost_gbp: 800           # ✅ 极高成本
+      footprint: "point"
+
+    # 大足迹+中高噪声（航空摄影测量）
+    - name: "photogrammetry"
+      noise_std: 0.25         # ✅ SNR ≈ 9
+      cost_gbp: 400
+      footprint: "avg5x5"     # ✅ 25 个点的平均
+
+    # 极大足迹+高噪声（车载移动平均）
+    - name: "vehicle_avg"
+      noise_std: 0.35         # ✅ SNR ≈ 6
       cost_gbp: 100
-      footprint: "point"
-
-    - name: "precise_point"
-      noise_std: 0.08
-      cost_gbp: 250
-      footprint: "point"
-
-    - name: "area_avg_3x3"
-      noise_std: 0.12
-      cost_gbp: 180
-      footprint: "avg3x3"
-
-    - name: "area_avg_5x5"
-      noise_std: 0.18
-      cost_gbp: 120
       footprint: "avg5x5"
 
-  # Pool generation strategy
-  pool_strategy: "grid_subsample"  # "grid_subsample" | "random" | "importance"
-  pool_fraction: 0.3               # Fraction of domain to use as candidates
+  pool_strategy: "grid_subsample"
+  pool_fraction: 0.3
 
-  # Type mix (must sum to 1.0)
-  type_mix: [0.4, 0.2, 0.3, 0.1]   # Proportion of each sensor type
+  # 🔥 优化：增加极端类型（极便宜/极贵）的比例
+  type_mix: [0.15, 0.35, 0.15, 0.20, 0.15]
+  # 说明：
+  #   15% smartphone（极便宜极噪）
+  #   35% basic_point（主力）
+  #   15% laser_profiler（极贵极准）
+  #   20% photogrammetry（大足迹）
+  #   15% vehicle_avg（大足迹+高噪）
 
 # ----------------------------------------------------------------------------
-# Decision Model (Economics) - 🔥 关键优化
+# Decision Model (Economics) - ✓ 已优化 FN:FP = 15:1
 # ----------------------------------------------------------------------------
 decision:
-  # Decision threshold - 已验证理想 (51.5th 百分位) ✓
-  tau_iri: 2.2
+  tau_iri: 2.2              # 阈值位于 51.5th 百分位 ✓
 
-  # Loss matrix (in GBP) - 🔥 增强不对称性
-  L_TP_gbp: 5000       # True Positive: 正确维护需要维护的路段
-  L_FP_gbp: 10000      # 🔥 False Positive: 过度维护 (从 8k 增加到 10k)
-  L_FN_gbp: 150000     # 🔥 False Negative: 漏检严重路段 (从 80k 增加到 150k)
-  L_TN_gbp: 0          # True Negative: 正确跳过
+  # Loss matrix (in GBP)
+  L_TP_gbp: 5000            # True Positive: 正确维护
+  L_FP_gbp: 10000           # False Positive: 过度维护
+  L_FN_gbp: 150000          # False Negative: 漏检严重路段 ✓
+  L_TN_gbp: 0               # True Negative: 正确跳过
 
-  # 🎯 优化后成本比例:
-  #   FN:FP = 150k:10k = 15:1  ✓ (从 10:1 提升)
-  #   FN:TP = 150k:5k = 30:1   ✓ (从 16:1 提升)
-  # 这将显著提升"不确定性降低"的决策价值
+  # 成本比例: FN:FP = 15:1, FN:TP = 30:1 ✓
 
 # ----------------------------------------------------------------------------
 # Sensor Selection Methods
 # ----------------------------------------------------------------------------
 selection:
-  # Methods to evaluate
   methods:
     - greedy_mi
     - greedy_aopt
@@ -126,13 +137,8 @@ selection:
     - uniform
     - random
 
-  # 🔥 优化预算点分布 - 增加小预算密度
+  # 预算点分布
   budgets: [3, 5, 8, 10, 15, 20, 25, 30, 40, 50]
-  # 改进说明:
-  #   - 添加 k=3 (最小预算，差距最明显)
-  #   - 添加 k=8 (填补 5-10 间隙)
-  #   - 添加 k=25 (填补 20-30 间隙)
-  #   - 保持最大预算 k=50 ≈ 10% 池大小
 
   # Method-specific configurations
   greedy_mi:
@@ -143,28 +149,26 @@ selection:
     early_stop_ratio: null
 
   greedy_aopt:
-    n_probes: 16         # Hutchinson++ probes for trace estimation
-    use_cost: true       # Enable gain/cost scoring
+    n_probes: 32            # ✅ 从 16 增加到 32（更稳定）
+    use_cost: true
 
-  # 🔥 EVI 配置优化
+  # 🔥 EVI Configuration - EXPERT OPTIMIZED
   greedy_evi:
-    n_y_samples: 0       # 使用协方差模式 (最快且稳定)
-    use_cost: true       # 启用成本归一化
+    n_y_samples: 8          # ✅ 从 0 改为 8（启用 MC 校准）
+    use_cost: true
 
-    # MI 预筛选 (强烈推荐)
-    mi_prescreen: true   # 启用 MI 预筛选
-    keep_fraction: 0.25  # 保留前 25% 候选
+    # MI 预筛选 - 🔥 关键优化
+    mi_prescreen: true
+    keep_fraction: 0.6      # ✅ 从 0.25 放宽到 0.6
 
-    # 🔥 运行策略优化
-    must_budgets: [5, 10, 20, 30]  # 关键预算点 (所有 fold)
-    every_n_folds: 1               # 每 fold 都运行 (展示完整性能)
-
-    # 可选约束
-    budgets_subset: []   # 空列表 = 运行所有预算
-    max_folds: null      # null = 运行所有 fold
+    # 运行策略
+    must_budgets: [5, 10, 20, 30]
+    every_n_folds: 1        # 每 fold 都运行
+    budgets_subset: []
+    max_folds: null
 
   maxmin:
-    use_cost: true       # Normalize distance by cost
+    use_cost: true
 
 # ----------------------------------------------------------------------------
 # Expected Value of Information (EVI) Computation
@@ -172,9 +176,8 @@ selection:
 evi:
   compute_for: ["greedy_mi", "greedy_aopt", "greedy_evi"]
   method: "monte_carlo"
-  monte_carlo_samples: 20  # 🔥 增加采样数以提高精度 (从 10 增加)
+  monte_carlo_samples: 20
 
-  # Unscented Transform settings (if method = "unscented")
   unscented_alpha: 1.0
   unscented_beta: 2.0
   unscented_kappa: 0.0
@@ -184,8 +187,8 @@ evi:
 # ----------------------------------------------------------------------------
 cv:
   scheme: "spatial_block"
-  k_folds: 3                        # 3 折足够 (加快迭代)
-  buffer_width_multiplier: 1.5      # Buffer = 1.5 × correlation_length
+  k_folds: 3
+  buffer_width_multiplier: 1.5
   block_strategy: "kmeans"
   ensure_connected: true
   morans_permutations: 999
@@ -222,25 +225,21 @@ plots:
   dpi: 300
   style: "seaborn-v0_8-paper"
 
-  # Budget-performance curves
   budget_curves:
     metrics: ["rmse", "expected_loss_gbp", "coverage_90"]
     show_confidence: true
     confidence_level: 0.95
 
-  # Performance profile
   performance_profile:
     tau_values: [1.0, 1.05, 1.1, 1.2, 1.5, 2.0, 3.0]
     use_budget_fold_instances: true
 
-  # Critical difference diagram
   critical_difference:
     alpha: 0.05
     test: "nemenyi"
 
-  # Expert plots (optional, for detailed analysis)
   expert_plots:
-    enable_all: false
+    enable_all: true        # ✅ 启用所有专家图
 
     marginal_efficiency:
       enable: true
@@ -266,28 +265,24 @@ plots:
 
     sensor_placement_map:
       enable: true
-      budgets_to_show: [5, 10, 20, 30, 50]  # 🔥 增加展示点
+      budgets_to_show: [5, 10, 20, 30, 50]
 
 # ----------------------------------------------------------------------------
-# Acceptance Criteria (for automated validation)
+# Acceptance Criteria
 # ----------------------------------------------------------------------------
 acceptance:
-  # Milestone 1: Basic functionality
   m1_grid_size: 100
   m1_budgets: [5, 10, 20]
   m1_check_monotonic: true
   m1_check_diminishing: true
 
-  # Milestone 2: Performance vs baselines
   m2_min_improvement_vs_random: 0.15
   m2_confidence_level: 0.95
 
-  # Milestone 3: Optimality gap
   m3_small_instance_n: 25
   m3_small_instance_k: 5
   m3_max_suboptimality: 0.10
 
-  # Milestone 4: Statistical validity
   m4_morans_alpha: 0.05
   m4_coverage_tolerance: 0.10
   m4_msse_tolerance: 0.25

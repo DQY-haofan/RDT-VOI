@@ -97,8 +97,17 @@ def greedy_mi(sensors, k: int, Q_pr, costs: np.ndarray = None,
     else:
         mi_values = None
 
-    # Greedy循环
-    alive = np.ones(C, dtype=bool)
+    # 🔥 启用 Top-p 预筛选（加速大候选池）
+    keep_fraction = 0.25  # 保留前 25% 候选
+    if mi_values is not None and C > 100:
+        # 使用 argpartition 快速找到 Top-K
+        n_keep = max(int(C * keep_fraction), k + 10)  # 至少保留 k+10 个
+        top_indices = np.argpartition(mi_values, -n_keep)[-n_keep:]
+        alive = np.zeros(C, dtype=bool)
+        alive[top_indices] = True
+        print(f"  MI prescreen: kept {n_keep}/{C} candidates ({100*keep_fraction:.0f}%)")
+    else:
+        alive = np.ones(C, dtype=bool)
 
     for step in range(k):
         best_idx = -1
@@ -220,12 +229,14 @@ def greedy_aopt(sensors, k: int, Q_pr, costs: np.ndarray = None,
 
             # 计算trace reduction
             z = factor.solve(h)
-            quad = np.dot(h, z)
+            quad = np.dot(h, z)       # = h^T Σ h
+            zz = np.dot(z, z)         # = h^T Σ^2 h = ||Σ h||^2
 
-            # Sherman-Morrison: trace(Σ') = trace(Σ) - quad/(r + quad)
+            # ✅ 正确的 A-optimal trace reduction 公式
+            # Δtrace = ||Σh||² / (r + h^T Σ h)
             denom = r + quad
             if denom > 1e-12:
-                reduction = quad / denom
+                reduction = zz / denom  # ✅ 修正后的公式
                 gain = reduction / costs[idx] if use_cost else reduction
 
                 if gain > best_gain:
