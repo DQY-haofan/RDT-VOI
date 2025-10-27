@@ -45,26 +45,27 @@ prior:
   mu_prior_mean: 2.2
   mu_prior_std: 0.3
 
-  # 非平稳先验 - CV=30% ✓
-  beta_base: 3.0
-  beta_hot: 1.0e-8
+  # 🔥 新增（如果没有的话）
+  beta_base: 1.0e-3   # 非热点区域
+  beta_hot: 1.0e-8    # 热点区域
 
-  hotspots:
-    - center_m: [50, 50]
+  hotspots: # 🔥 新增热点定义
+    - center_m: [ 50, 50 ]
+      radius_m: 40
+    - center_m: [ 150, 50 ]
+      radius_m: 30
+    - center_m: [ 50, 150 ]
+      radius_m: 30
+    - center_m: [ 150, 150 ]
+      radius_m: 35
+    - center_m: [ 100, 100 ]
       radius_m: 45
-    - center_m: [150, 50]
-      radius_m: 45
-    - center_m: [50, 150]
-      radius_m: 45
-    - center_m: [150, 150]
-      radius_m: 45
-    - center_m: [100, 100]
-      radius_m: 50
 
 # ----------------------------------------------------------------------------
 # Sensor Pool Configuration - OPTIMIZED V2
 # ----------------------------------------------------------------------------
 sensors:
+
   types:
     # 极便宜但噪声极大
     - name: smartphone
@@ -110,11 +111,11 @@ sensors:
 
   # 🔥 新增：异质化配置
   use_heterogeneous: true
-  cost_zones:
-    - center: [100, 100]
-      radius: 40
+  cost_zones:  # 🔥 新增成本分区
+    - center_m: [100, 100]
+      radius_m: 50
       cost_multiplier: 1.5
-      noise_multiplier: 0.7
+      noise_multiplier: 0.8
       allowed_types: ['inertial_profiler', 'photogrammetry']
 
 # ----------------------------------------------------------------------------
@@ -122,14 +123,14 @@ sensors:
 # ----------------------------------------------------------------------------
 decision:
   # 🔥 关键改动 1：使用分位数阈值（而非固定值）
-  tau_quantile: 0.85      # ✅ τ = quantile(μ_prior, 0.88)
-  # tau_iri: 2.2           # 如果设置了 tau_quantile，此项被忽略
+  tau_iri: null         # 如果用动态阈值，设为 null
+  tau_quantile: 0.75    # 或者保留您原有的固定值
 
   # 🔥 关键改动 2：加大误判代价比
-  L_TP_gbp: 500
-  L_FP_gbp: 100       # ✅ 从 10k 降到 6k
-  L_FN_gbp: 2000        # ✅ 从 150k 降到 120k，但比例提升到 20:1
-  L_TN_gbp: 0
+  L_FP_gbp: 500.0      # 保持或修改
+  L_FN_gbp: 10000.0    # 🔥 增大到 FP 的 10-20 倍
+  L_TP_gbp: 800.0
+  L_TN_gbp: 0.0
   # 🔥 新增：DDI 控制
   target_ddi: 0.30  # 目标：30% 像元在阈值附近
 
@@ -173,17 +174,17 @@ selection:
 
   # 🔥 EVI Configuration - CRITICAL OPTIMIZATION
   greedy_evi:
-    n_y_samples: 8          # ✅ 启用少量 MC 校准
+    n_y_samples: 0         # 🔥 改为 0（解析法更快）
     use_cost: true
+    mi_prescreen: true     # 🔥 确保启用
+    keep_fraction: 0.5     # 🔥 从 0.25 放宽到 0.5
 
-    # 🔥 关键改动：放宽预筛选
-    mi_prescreen: true
-    keep_fraction: 0.7      # ✅ 从 0.25 提升到 0.7（避免误杀）
 
     # 运行策略
-    must_budgets: [5, 10, 20, 30]
-    every_n_folds: 1
+    # 🔥 新增子集运行配置
     budgets_subset: []
+    must_budgets: [10, 30]
+    every_n_folds: 2
     max_folds: null
 
   maxmin:

@@ -91,7 +91,7 @@ def build_graph_precision(L: sp.spmatrix, alpha: float, beta: float) -> sp.spmat
 def sample_gmrf(Q: sp.spmatrix,
                 mu: np.ndarray = None,
                 rng: np.random.Generator = None) -> np.ndarray:
-    """从 GMRF 采样（原函数保持不变）"""
+    """从 GMRF 采样（使用 Cholesky 下三角 - 正确方法）"""
     n = Q.shape[0]
     if mu is None:
         mu = np.zeros(n)
@@ -103,13 +103,13 @@ def sample_gmrf(Q: sp.spmatrix,
     try:
         from sksparse.cholmod import cholesky
         factor = cholesky(Q)
+        # ✅ 正确：使用 solve_Lt (解 L^T x = z)
         x_centered = factor.solve_Lt(z, use_LDLt_decomposition=False)
     except ImportError:
         lu = spla.splu(Q)
         x_centered = lu.solve(z)
 
     return mu + x_centered
-
 
 # =====================================================================
 # 🔥 新增函数：节点化 nugget（创建空间异质性）

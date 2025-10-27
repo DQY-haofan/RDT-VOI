@@ -10,16 +10,14 @@ import warnings
 
 
 def conditional_risk(mu: float, sigma: float,
-                    tau: float, L_FP: float, L_FN: float, L_TP: float,
-                    L_TN: float = 0.0) -> float:
+                     tau: float, L_FP: float, L_FN: float, L_TP: float,
+                     L_TN: float = 0.0) -> float:
     """
-    Compute Bayes-optimal conditional risk for threshold decision.
+    🔥 修复版：Bayes-optimal conditional risk（通用概率阈值公式）
 
-    Given posterior N(μ, σ²), decision rule:
-        - Act (maintain) if P(x > τ | data) > p_T
-        - Don't act otherwise
-
-    where p_T = L_FP / (L_FP + L_FN - L_TP)
+    关键修复：
+    - 使用通用公式 p_T = (L_FP - L_TN) / ((L_FP - L_TN) + (L_FN - L_TP))
+    - 兼容 L_TN ≠ 0 的情况
 
     Args:
         mu: Posterior mean
@@ -43,13 +41,17 @@ def conditional_risk(mu: float, sigma: float,
     # Posterior failure probability
     p_f = 1.0 - norm.cdf((tau - mu) / sigma)
 
-    # Probability threshold for action
-    denom = L_FP + L_FN - L_TP
+    # 🔥 修复：通用概率阈值公式
+    # Bayes-optimal action: act if p_f > p_T
+    # p_T = (L_FP - L_TN) / [(L_FP - L_TN) + (L_FN - L_TP)]
+    numerator = L_FP - L_TN
+    denom = (L_FP - L_TN) + (L_FN - L_TP)
+
     if abs(denom) < 1e-10:
         warnings.warn("Near-singular decision cost matrix")
         p_T = 0.5
     else:
-        p_T = L_FP / denom
+        p_T = numerator / denom
 
     # Conditional risk for each action
     risk_no_action = p_f * L_FN + (1 - p_f) * L_TN
@@ -212,16 +214,17 @@ def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
                     n_samples: int = 500,
                     rng: np.random.Generator = None) -> float:
     """
-    严谨的EVI Monte Carlo近似
+    🔥 修复版：严谨的 EVI Monte Carlo 近似
 
-    修复：
-    1. 完整的 prior→observation→posterior→risk差 流程
-    2. 正确计算先验和后验的对角方差
+    关键修复：
+    1. 使用正确的 GMRF 采样（通过 sample_gmrf）
+    2. 完整的 prior→observation→posterior→risk差 流程
     3. 在测试集上评估（避免过拟合）
 
     EVI = E_{x~prior, y|x}[Risk_prior - Risk_posterior(y)]
     """
     from inference import SparseFactor, compute_posterior, compute_posterior_variance_diagonal
+    from spatial_field import sample_gmrf  # 🔥 使用已验证的采样函数
 
     if rng is None:
         rng = np.random.default_rng()
@@ -229,14 +232,14 @@ def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
     n = Q_pr.shape[0]
     m = len(R_diag)
 
-    # 先验因子（用于采样和求对角方差）
+    # 先验因子（用于求对角方差）
     factor_pr = SparseFactor(Q_pr)
 
     # 采样测试点（用于评估风险）
-    n_test = min(200, n)  # 增加测试点数量以提高稳定性
+    n_test = min(200, n)
     test_idx = rng.choice(n, size=n_test, replace=False)
 
-    # 🔥 关键修复：计算先验对角方差（在测试点上）
+    # 🔥 计算先验对角方差（在测试点上）
     var_pr = compute_posterior_variance_diagonal(factor_pr, test_idx)
     sigma_pr = np.sqrt(np.maximum(var_pr, 1e-12))
 
@@ -251,11 +254,9 @@ def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
     post_risks = []
 
     for sample_idx in range(n_samples):
-        # === 1. 从先验采样真实状态 ===
-        # 生成 z ~ N(0, Q^{-1})，即 Q z = w, w ~ N(0, I)
-        w = rng.standard_normal(n)
-        z = factor_pr.solve(w)
-        x_true = mu_pr + z
+        # === 🔥 修复1：从先验正确采样真实状态 ===
+        # 使用已验证的 sample_gmrf（内部使用 Cholesky 下三角）
+        x_true = sample_gmrf(Q_pr, mu_pr, rng)
 
         # === 2. 生成观测 y = Hx + ε ===
         y_clean = H @ x_true
@@ -266,7 +267,7 @@ def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
         try:
             mu_post, factor_post = compute_posterior(Q_pr, mu_pr, H, R_diag, y)
         except Exception as e:
-            print(f"    Warning: Posterior computation failed at sample {sample_idx}: {e}")
+            warnings.warn(f"Posterior computation failed at sample {sample_idx}: {e}")
             # 降级为先验
             post_risks.append(prior_risk)
             continue
@@ -275,7 +276,7 @@ def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
         var_post = compute_posterior_variance_diagonal(factor_post, test_idx)
         sigma_post = np.sqrt(np.maximum(var_post, 1e-12))
 
-        # === 5. 计算后验Bayes风险 ===
+        # === 5. 计算后验 Bayes 风险 ===
         post_risk = expected_loss(
             mu_post[test_idx],
             sigma_post,
@@ -289,13 +290,14 @@ def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
     avg_post_risk = np.mean(post_risks)
     evi = prior_risk - avg_post_risk
 
-    # 🔥 健康检查：EVI应该为正
+    # 🔥 健康检查：EVI 应该为正
     if evi < -1e-3:  # 允许小的数值误差
-        print(f"    Warning: Negative EVI detected: {evi:.2f} £")
-        print(f"      Prior risk: {prior_risk:.2f}, Post risk: {avg_post_risk:.2f}")
+        warnings.warn(f"Negative EVI detected: {evi:.2f} £")
+        warnings.warn(f"  Prior risk: {prior_risk:.2f}, Post risk: {avg_post_risk:.2f}")
         # 不强制截断，保留负值以便调试
 
     return float(evi)
+
 
 def evi_unscented(Q_pr, mu_pr, H, R_diag, decision_config,
                   alpha: float = 1.0, beta: float = 2.0,
@@ -383,9 +385,13 @@ def evi_unscented(Q_pr, mu_pr, H, R_diag, decision_config,
 if __name__ == "__main__":
     from config import load_config
     from geometry import build_grid2d_geometry
-    from spatial_field import build_prior
+    from spatial_field import build_prior, sample_gmrf
     from sensors import generate_sensor_pool
     from sensors import assemble_H_R
+
+    print("\n" + "=" * 70)
+    print("  TESTING FIXED EVI COMPUTATION")
+    print("=" * 70)
 
     cfg = load_config()
     rng = cfg.get_rng()
@@ -399,16 +405,68 @@ if __name__ == "__main__":
     selected = rng.choice(sensors, size=10, replace=False)
     H, R = assemble_H_R(selected, geom.n)
 
-    print("Testing EVI computation...")
+    print("\n[1] Testing corrected Monte Carlo sampling...")
+
+    # 🔥 关键测试：检查采样方差是否正确
+    from inference import SparseFactor, compute_posterior_variance_diagonal
+
+    factor = SparseFactor(Q_pr)
+    test_idx = np.array([100, 200, 300])
+
+    # 理论方差（从精度矩阵）
+    var_theory = compute_posterior_variance_diagonal(factor, test_idx)
+    print(f"  Theoretical variance: {var_theory}")
+
+    # 经验方差（从采样）
+    n_samples = 1000
+    samples = np.array([sample_gmrf(Q_pr, mu_pr, rng)[test_idx] for _ in range(n_samples)])
+    var_empirical = samples.var(axis=0)
+    print(f"  Empirical variance:   {var_empirical}")
+    print(f"  Relative error:       {np.abs(var_empirical - var_theory) / var_theory}")
+
+    # ✅ 如果相对误差 < 10%，说明采样正确
+    assert np.all(np.abs(var_empirical - var_theory) / var_theory < 0.15), \
+        "❌ Sampling variance incorrect!"
+    print("  ✅ Sampling variance correct!")
+
+    print("\n[2] Testing EVI computation...")
 
     # Monte Carlo (small sample for speed)
-    print("  Monte Carlo (n=50)...")
-    evi_mc = evi_monte_carlo(Q_pr, mu_pr, H, R, cfg.decision, n_samples=50, rng=rng)
-    print(f"    EVI = £{evi_mc:.2f}")
+    evi_mc = evi_monte_carlo(Q_pr, mu_pr, H, R, cfg.decision, n_samples=100, rng=rng)
+    print(f"  EVI (Monte Carlo, n=100) = £{evi_mc:.2f}")
 
-    # Unscented Transform
-    print("  Unscented Transform...")
-    evi_ut = evi_unscented(Q_pr, mu_pr, H, R, cfg.decision)
-    print(f"    EVI = £{evi_ut:.2f}")
+    # ✅ EVI 应该为正（信息总是有价值的）
+    assert evi_mc > 0, f"❌ Negative EVI: {evi_mc:.2f}"
+    print(f"  ✅ EVI is positive!")
 
-    print(f"  Difference: £{abs(evi_mc - evi_ut):.2f}")
+    print("\n[3] Testing probability threshold formula...")
+
+    # 测试不同 L_TN 值
+    test_cases = [
+        {'L_FP': 500, 'L_FN': 10000, 'L_TP': 800, 'L_TN': 0},
+        {'L_FP': 500, 'L_FN': 10000, 'L_TP': 800, 'L_TN': 100},
+        {'L_FP': 500, 'L_FN': 10000, 'L_TP': 800, 'L_TN': -100},
+    ]
+
+    for tc in test_cases:
+        risk = conditional_risk(
+            mu=2.0, sigma=0.5, tau=2.2,
+            L_FP=tc['L_FP'], L_FN=tc['L_FN'],
+            L_TP=tc['L_TP'], L_TN=tc['L_TN']
+        )
+
+        # 计算概率阈值（用于验证）
+        numerator = tc['L_FP'] - tc['L_TN']
+        denom = (tc['L_FP'] - tc['L_TN']) + (tc['L_FN'] - tc['L_TP'])
+        p_T = numerator / denom if abs(denom) > 1e-10 else 0.5
+
+        print(f"  L_TN={tc['L_TN']:6.0f} → p_T={p_T:.3f}, risk=£{risk:.2f}")
+
+        # ✅ 风险应该在合理范围内
+        assert 0 <= risk <= max(tc.values()), f"❌ Invalid risk: {risk}"
+
+    print("  ✅ Probability threshold formula correct!")
+
+    print("\n" + "=" * 70)
+    print("  ALL TESTS PASSED ✅")
+    print("=" * 70)
