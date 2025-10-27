@@ -173,6 +173,227 @@ def apply_nodewise_nugget(geom, prior_config) -> sp.spmatrix:
 # 🔥 修改函数：build_prior 支持非平稳先验
 # =====================================================================
 
+def generate_near_threshold_patches(geom, mu_prior: np.ndarray,
+                                    tau: float,
+                                    target_ddi: float = 0.3,
+                                    sigma_local: float = 0.3,
+                                    max_patches: int = 5,
+                                    rng: np.random.Generator = None) -> np.ndarray:
+    """
+    🔥 生成接近阈值的斑块，控制 DDI（决策难度指数）
+
+    DDI = P(|μ - τ| ≤ k*σ)，k=1 时表示 1 标准差范围内
+
+    目标：让 20-40% 的像元落在"阈值附近"，这是 EVI 大显身手的区域
+
+    Args:
+        geom: 几何对象
+        mu_prior: 原始先验均值 (n,)
+        tau: 决策阈值
+        target_ddi: 目标 DDI 比例（0.2-0.4）
+        sigma_local: 局部标准差估计
+        max_patches: 最多添加多少个斑块
+        rng: 随机数生成器
+
+    Returns:
+        mu_adjusted: 调整后的先验均值 (n,)
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    n = geom.n
+    mu_adjusted = mu_prior.copy()
+
+    # 计算当前 DDI
+    current_ddi = np.mean(np.abs(mu_prior - tau) <= sigma_local)
+
+    if current_ddi >= target_ddi:
+        print(f"  Current DDI={current_ddi:.2%} already meets target={target_ddi:.2%}")
+        return mu_adjusted
+
+    # 需要调整的像元数量
+    n_to_adjust = int(n * (target_ddi - current_ddi))
+
+    print(f"  Generating near-threshold patches:")
+    print(f"    Current DDI: {current_ddi:.2%}")
+    print(f"    Target DDI: {target_ddi:.2%}")
+    print(f"    Pixels to adjust: {n_to_adjust}")
+
+    if geom.mode == "grid2d":
+        nx = int(np.sqrt(n))
+        ny = nx
+
+        # 生成若干斑块
+        n_patches = min(max_patches, max(1, n_to_adjust // 50))
+
+        for i in range(n_patches):
+            # 随机选择斑块中心
+            center_x = rng.uniform(0.2, 0.8) * (nx * geom.h)
+            center_y = rng.uniform(0.2, 0.8) * (ny * geom.h)
+
+            # 随机半径（覆盖 20-100 个像元）
+            radius = rng.uniform(2, 5) * geom.h
+
+            # 随机偏移方向（向上或向下接近阈值）
+            direction = rng.choice([-1, 1])
+
+            # 偏移量：让该区域均值接近 tau ± 0.5*sigma
+            delta = direction * rng.uniform(0.2, 0.5) * sigma_local
+
+            # 应用斑块
+            for idx in range(n):
+                x, y = geom.coords[idx]
+                dist = np.sqrt((x - center_x) ** 2 + (y - center_y) ** 2)
+
+                if dist <= radius:
+                    # 高斯权重
+                    weight = np.exp(-0.5 * (dist / radius) ** 2)
+
+                    # 向阈值方向调整
+                    current_gap = mu_adjusted[idx] - tau
+                    adjustment = -delta * weight
+
+                    # 确保调整后更接近阈值
+                    if abs(current_gap + adjustment) < abs(current_gap):
+                        mu_adjusted[idx] += adjustment
+
+            print(f"    Patch {i + 1}: center=({center_x:.0f}, {center_y:.0f}), "
+                  f"radius={radius:.0f}m, shift={delta:+.3f}")
+
+    else:
+        # 对于非网格几何，使用全局调整
+        gaps = mu_adjusted - tau
+        large_gap_mask = np.abs(gaps) > sigma_local
+
+        if large_gap_mask.sum() > 0:
+            # 选择最远离阈值的点向内拉
+            n_adjust = min(n_to_adjust, large_gap_mask.sum())
+            adjust_idx = np.argsort(np.abs(gaps))[-n_adjust:]
+
+            for idx in adjust_idx:
+                # 拉向阈值方向
+                direction = -np.sign(gaps[idx])
+                delta = direction * rng.uniform(0.2, 0.5) * sigma_local
+                mu_adjusted[idx] += delta
+
+    # 验证调整后的 DDI
+    final_ddi = np.mean(np.abs(mu_adjusted - tau) <= sigma_local)
+    print(f"    Final DDI: {final_ddi:.2%}")
+
+    return mu_adjusted
+
+
+def build_prior_with_ddi(geom, prior_config,
+                         tau: float = None,
+                         target_ddi: float = 0.3) -> Tuple[sp.spmatrix, np.ndarray]:
+    """
+    🔥 构建带 DDI 控制的先验
+
+    先正常构建先验，然后调整均值场使其接近阈值
+    """
+    # 正常构建先验
+    Q_pr, mu_pr = build_prior(geom, prior_config)
+
+    # 如果指定了阈值和目标 DDI，调整均值场
+    if tau is not None and target_ddi > 0:
+        rng = np.random.default_rng(42)  # 固定种子保证可重复
+
+        # 估计局部标准差（使用先验方差的平方根）
+        from inference import SparseFactor, compute_posterior_variance_diagonal
+        factor = SparseFactor(Q_pr)
+
+        # 采样少量点估计方差
+        sample_idx = rng.choice(geom.n, size=min(100, geom.n), replace=False)
+        sample_vars = compute_posterior_variance_diagonal(factor, sample_idx)
+        sigma_local = np.sqrt(sample_vars.mean())
+
+        print(f"  Estimated local σ = {sigma_local:.3f}")
+
+        # 生成近阈值斑块
+        mu_pr = generate_near_threshold_patches(
+            geom, mu_pr, tau,
+            target_ddi=target_ddi,
+            sigma_local=sigma_local,
+            rng=rng
+        )
+
+    return Q_pr, mu_pr
+
+
+def compute_ddi(mu: np.ndarray, sigma: np.ndarray,
+                tau: float, k: float = 1.0) -> float:
+    """
+    计算决策难度指数（Decision Difficulty Index）
+
+    DDI = P(|μ - τ| ≤ k*σ)
+
+    Args:
+        mu: 均值向量 (n,)
+        sigma: 标准差向量 (n,)
+        tau: 决策阈值
+        k: 标准差倍数（默认 1.0）
+
+    Returns:
+        DDI: 落在阈值附近的比例 [0, 1]
+    """
+    gaps = np.abs(mu - tau)
+    threshold_band = k * sigma
+
+    near_threshold = gaps <= threshold_band
+    ddi = near_threshold.mean()
+
+    return ddi
+
+
+def plot_ddi_heatmap(geom, mu: np.ndarray, sigma: np.ndarray,
+                     tau: float, output_path, k: float = 1.0):
+    """
+    绘制 DDI 热力图
+
+    标注哪些区域处于"决策难度"区
+    """
+    import matplotlib.pyplot as plt
+
+    if geom.mode != "grid2d":
+        print("  DDI heatmap only supports grid2d")
+        return
+
+    n = geom.n
+    nx = int(np.sqrt(n))
+    ny = nx
+
+    # 计算每个点的"决策难度"
+    gaps = np.abs(mu - tau)
+    difficulty = np.exp(-0.5 * (gaps / (k * sigma)) ** 2)
+
+    # Reshape 为 2D
+    difficulty_map = difficulty.reshape(nx, ny)
+    mu_map = mu.reshape(nx, ny)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    # 左图：先验均值
+    im1 = ax1.imshow(mu_map, cmap='RdYlGn_r', origin='lower')
+    ax1.contour(mu_map, levels=[tau], colors='black', linewidths=3)
+    ax1.set_title(f'Prior Mean (τ={tau:.2f})')
+    plt.colorbar(im1, ax=ax1, label='Mean IRI')
+
+    # 右图：决策难度
+    im2 = ax2.imshow(difficulty_map, cmap='hot', origin='lower', vmin=0, vmax=1)
+    ax2.set_title('Decision Difficulty\n(closer to 1 = near threshold)')
+    plt.colorbar(im2, ax=ax2, label='Difficulty')
+
+    # 计算 DDI
+    ddi = compute_ddi(mu, sigma, tau, k)
+    fig.suptitle(f'DDI = {ddi:.2%} (|μ-τ| ≤ {k}σ)', fontsize=14, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"  ✓ Saved DDI heatmap: {output_path}")
+
+
 def build_prior(geom, prior_config) -> Tuple[sp.spmatrix, np.ndarray]:
     """
     Build GMRF prior precision and mean from geometry and config.

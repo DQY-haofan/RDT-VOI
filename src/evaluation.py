@@ -61,6 +61,197 @@ def spatial_block_cv(coords: np.ndarray,
     return folds
 
 
+def compute_roi(prior_loss: float,
+                posterior_loss: float,
+                sensor_cost: float) -> float:
+    """
+    计算投资回报率（Return on Investment）
+
+    ROI = (节省的损失 - 传感成本) / 传感成本
+
+    Args:
+        prior_loss: 先验决策损失（£）
+        posterior_loss: 后验决策损失（£）
+        sensor_cost: 传感器总成本（£）
+
+    Returns:
+        ROI: 投资回报率
+    """
+    savings = prior_loss - posterior_loss
+
+    if sensor_cost <= 0:
+        return np.inf if savings > 0 else 0.0
+
+    roi = (savings - sensor_cost) / sensor_cost
+
+    return roi
+
+
+def compute_action_constrained_loss(mu_post: np.ndarray,
+                                    sigma_post: np.ndarray,
+                                    x_true: np.ndarray,
+                                    decision_config,
+                                    K: int = None,
+                                    tau: float = None) -> Dict:
+    """
+    🔥 计算行动受限场景下的损失
+
+    实际工程中，只能维护前 K 个最危险的路段/聚类
+
+    Args:
+        mu_post: 后验均值 (n,)
+        sigma_post: 后验标准差 (n,)
+        x_true: 真实状态 (n,)
+        decision_config: 决策配置
+        K: 允许维护的最大数量（None = 无限制）
+        tau: 决策阈值
+
+    Returns:
+        结果字典
+    """
+    from decision import conditional_risk
+
+    if tau is None:
+        tau = decision_config.get_threshold()
+
+    n = len(mu_post)
+
+    # 计算每个位置的后验故障概率
+    from scipy.stats import norm
+    p_failure = 1.0 - norm.cdf((tau - mu_post) / np.maximum(sigma_post, 1e-12))
+
+    # 无限制情况：Bayes 最优决策
+    unrestricted_risks = np.array([
+        conditional_risk(
+            mu_post[i], sigma_post[i], tau,
+            decision_config.L_FP_gbp,
+            decision_config.L_FN_gbp,
+            decision_config.L_TP_gbp,
+            decision_config.L_TN_gbp
+        )
+        for i in range(n)
+    ])
+    unrestricted_loss = unrestricted_risks.mean()
+
+    # 行动受限情况
+    if K is not None and K < n:
+        # 策略1：维护后验故障概率最高的 K 个
+        top_k_idx = np.argsort(p_failure)[-K:]
+
+        # 这 K 个执行维护（承担 TP/TN 损失）
+        # 其余 n-K 个不维护（承担 FP/FN 损失）
+        constrained_risks = np.zeros(n)
+
+        for i in range(n):
+            if i in top_k_idx:
+                # 维护：承担 L_TP 或 L_TN
+                if x_true[i] > tau:
+                    constrained_risks[i] = decision_config.L_TP_gbp
+                else:
+                    constrained_risks[i] = decision_config.L_FP_gbp
+            else:
+                # 不维护：承担 L_FN 或 L_TN
+                if x_true[i] > tau:
+                    constrained_risks[i] = decision_config.L_FN_gbp
+                else:
+                    constrained_risks[i] = decision_config.L_TN_gbp
+
+        constrained_loss = constrained_risks.mean()
+
+        # 计算遗憾（相对于无限制）
+        regret = constrained_loss - unrestricted_loss
+
+        # 命中率：在真实超阈值的点中，我们维护了多少
+        true_exceed = x_true > tau
+        if true_exceed.sum() > 0:
+            hit_rate = np.sum(np.isin(np.where(true_exceed)[0], top_k_idx)) / true_exceed.sum()
+        else:
+            hit_rate = 1.0
+
+        return {
+            'unrestricted_loss': unrestricted_loss,
+            'constrained_loss': constrained_loss,
+            'regret': regret,
+            'hit_rate': hit_rate,
+            'K': K,
+            'n_true_exceed': true_exceed.sum(),
+            'n_maintained': K
+        }
+
+    else:
+        return {
+            'unrestricted_loss': unrestricted_loss,
+            'constrained_loss': unrestricted_loss,
+            'regret': 0.0,
+            'hit_rate': 1.0,
+            'K': n,
+            'n_true_exceed': (x_true > tau).sum(),
+            'n_maintained': n
+        }
+
+
+def compute_enhanced_metrics(mu_post: np.ndarray,
+                             sigma_post: np.ndarray,
+                             x_true: np.ndarray,
+                             test_idx: np.ndarray,
+                             decision_config,
+                             sensor_cost: float = 0.0,
+                             prior_loss: float = None,
+                             K_action: int = None) -> Dict[str, float]:
+    """
+    🔥 增强的性能指标计算
+
+    包含：
+    - 基础指标（RMSE, MAE, R²）
+    - 决策损失
+    - ROI
+    - 行动受限后损失
+    - DDI 统计
+    """
+    # 基础指标
+    base_metrics = compute_metrics(
+        mu_post, sigma_post, x_true, test_idx, decision_config
+    )
+
+    # ROI（如果提供了先验损失）
+    if prior_loss is not None and sensor_cost > 0:
+        roi = compute_roi(
+            prior_loss,
+            base_metrics['expected_loss_gbp'],
+            sensor_cost
+        )
+        base_metrics['roi'] = roi
+        base_metrics['cost_efficiency'] = (prior_loss - base_metrics['expected_loss_gbp']) / sensor_cost
+
+    # 行动受限损失（如果指定了 K）
+    if K_action is not None:
+        tau = decision_config.get_threshold()
+        action_metrics = compute_action_constrained_loss(
+            mu_post[test_idx],
+            sigma_post[test_idx],
+            x_true[test_idx],
+            decision_config,
+            K=K_action,
+            tau=tau
+        )
+
+        for key, val in action_metrics.items():
+            base_metrics[f'action_{key}'] = val
+
+    # DDI 统计
+    tau = decision_config.get_threshold()
+    from spatial_field import compute_ddi
+
+    ddi = compute_ddi(
+        mu_post[test_idx],
+        sigma_post[test_idx],
+        tau,
+        k=1.0
+    )
+    base_metrics['ddi'] = ddi
+
+    return base_metrics
+
 def compute_metrics(mu_post: np.ndarray,
                     sigma_post: np.ndarray,
                     x_true: np.ndarray,

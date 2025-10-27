@@ -92,7 +92,9 @@ class SensorsConfig:
     pool_strategy: str
     pool_fraction: float
     type_mix: List[float]
-
+    # 🔥 新增：异质化配置
+    use_heterogeneous: bool = False  # 是否使用异质化传感器
+    cost_zones: List[Dict] = None  # 成本区域定义
 
 @dataclass
 class DecisionConfig:
@@ -105,6 +107,12 @@ class DecisionConfig:
     # 🔥 阈值配置：两种模式二选一
     tau_iri: float = None  # 模式1：固定阈值（如 2.2）
     tau_quantile: float = None  # 模式2：动态分位数阈值（如 0.88）
+
+    # 🔥 新增：行动约束
+    K_action: int = None  # 最多维护多少个位置（None = 无限制）
+
+    # 🔥 新增：DDI 控制
+    target_ddi: float = 0.0  # 目标 DDI（0 = 不调整）
 
     def __post_init__(self):
         # 验证：必须指定一种阈值模式
@@ -230,6 +238,10 @@ class PlotsConfig:
     effect_size: Dict[str, Any] = None  # 🔥 新增：效应量分析
     critical_region: Dict[str, Any] = None  # 🔥 新增：近阈值区域分析
     expert_plots: Dict[str, Any] = None  # 🔥 新增字段（可选）
+    # 🔥 新增：ROI 和鲁棒性分析图
+    roi_curves: Dict[str, Any] = None
+    robustness_heatmap: Dict[str, Any] = None
+    ddi_overlay: Dict[str, Any] = None
 
     def __post_init__(self):
         """处理可选的expert_plots字段"""
@@ -254,6 +266,15 @@ class PlotsConfig:
 
         if self.critical_region is None:
             self.critical_region = {'enable': False}
+        # 设置默认值
+        if self.roi_curves is None:
+            self.roi_curves = {'enable': True}
+
+        if self.robustness_heatmap is None:
+            self.robustness_heatmap = {'enable': False}
+
+        if self.ddi_overlay is None:
+            self.ddi_overlay = {'enable': True}
 
 
 @dataclass

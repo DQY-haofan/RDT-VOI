@@ -1144,6 +1144,284 @@ def plot_critical_difference(df_results: pd.DataFrame,
     return fig
 
 
+"""
+visualization.py - 新增图表
+ROI 曲线、鲁棒性热图、DDI 叠加等
+"""
+
+
+# ... 保留原有函数 ...
+
+# ============================================================================
+# 🔥 新增：ROI 曲线
+# ============================================================================
+
+def plot_budget_roi_curves(df_results: pd.DataFrame,
+                           output_dir: Path = None,
+                           config=None) -> plt.Figure:
+    """
+    绘制预算-ROI 曲线
+
+    展示每个方法的投资回报率随预算的变化
+    """
+    # 过滤 ROI 数据
+    df_roi = df_results[df_results['metric'] == 'roi'].copy()
+
+    if df_roi.empty:
+        warnings.warn("No ROI data found")
+        return None
+
+    # 只使用聚合统计（不是fold级别）
+    df_roi = df_roi[df_roi['fold'].isna()].copy()
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    methods = df_roi['method'].unique()
+    colors = sns.color_palette('Set2', n_colors=len(methods))
+    method_colors = dict(zip(methods, colors))
+
+    for method in methods:
+        df_method = df_roi[df_roi['method'] == method].sort_values('budget')
+
+        ax.plot(
+            df_method['budget'],
+            df_method['mean'],
+            marker='o',
+            linewidth=2.5,
+            markersize=8,
+            label=method,
+            color=method_colors[method]
+        )
+
+        # 添加置信区间
+        ax.fill_between(
+            df_method['budget'],
+            df_method['mean'] - df_method['std'],
+            df_method['mean'] + df_method['std'],
+            alpha=0.2,
+            color=method_colors[method]
+        )
+
+    # 添加 ROI=0 参考线
+    ax.axhline(y=0, color='gray', linestyle='--', linewidth=2, alpha=0.5,
+               label='Break-even')
+
+    ax.set_xlabel('Budget (k sensors)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('ROI (Return on Investment)', fontsize=12, fontweight='bold')
+    ax.set_title('Cost-Benefit Analysis: ROI vs Budget\n'
+                 'ROI = (Savings - Cost) / Cost',
+                 fontsize=13, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    if output_dir:
+        for fmt in ['png', 'pdf']:
+            save_path = output_dir / f'roi_curves.{fmt}'
+            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"      Saved: {save_path.name}")
+
+    return fig
+
+
+# ============================================================================
+# 🔥 新增：鲁棒性热图
+# ============================================================================
+
+def plot_robustness_heatmap(results_matrix: np.ndarray,
+                            ddi_values: List[float],
+                            loss_ratios: List[float],
+                            method_names: List[str],
+                            output_dir: Path = None) -> plt.Figure:
+    """
+    绘制鲁棒性热图
+
+    横轴：DDI（决策难度）
+    纵轴：L_FN/L_FP（代价不对称性）
+    颜色：各方法的相对排名
+
+    Args:
+        results_matrix: (n_ddi, n_ratios, n_methods) 数组
+        ddi_values: DDI 值列表
+        loss_ratios: 损失比率列表
+        method_names: 方法名称
+        output_dir: 输出目录
+    """
+    n_ddi, n_ratios, n_methods = results_matrix.shape
+
+    # 为每个方法创建子图
+    fig, axes = plt.subplots(1, n_methods, figsize=(5 * n_methods, 4))
+
+    if n_methods == 1:
+        axes = [axes]
+
+    for i, (ax, method) in enumerate(zip(axes, method_names)):
+        # 提取该方法的排名矩阵
+        rank_matrix = results_matrix[:, :, i]
+
+        # 绘制热力图
+        im = ax.imshow(
+            rank_matrix.T,
+            cmap='RdYlGn_r',
+            aspect='auto',
+            origin='lower',
+            vmin=1,
+            vmax=n_methods
+        )
+
+        # 设置刻度
+        ax.set_xticks(np.arange(n_ddi))
+        ax.set_yticks(np.arange(n_ratios))
+        ax.set_xticklabels([f'{d:.1%}' for d in ddi_values])
+        ax.set_yticklabels([f'{r:.0f}' for r in loss_ratios])
+
+        ax.set_xlabel('DDI (Decision Difficulty)', fontsize=10)
+        ax.set_ylabel('$L_{FN}/L_{FP}$ Ratio', fontsize=10)
+        ax.set_title(f'{method}\n(darker = better rank)', fontsize=11, fontweight='bold')
+
+        # 添加数值标注
+        for row in range(n_ratios):
+            for col in range(n_ddi):
+                rank = int(rank_matrix[col, row])
+                text_color = 'white' if rank > n_methods / 2 else 'black'
+                ax.text(col, row, str(rank),
+                        ha="center", va="center",
+                        color=text_color, fontsize=9, fontweight='bold')
+
+        # 颜色条
+        plt.colorbar(im, ax=ax, label='Rank (1=best)', fraction=0.046, pad=0.04)
+
+    plt.suptitle('Robustness Analysis: Method Ranking Across Scenarios',
+                 fontsize=14, fontweight='bold', y=1.02)
+    plt.tight_layout()
+
+    if output_dir:
+        for fmt in ['png', 'pdf']:
+            save_path = output_dir / f'robustness_heatmap.{fmt}'
+            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"      Saved: {save_path.name}")
+
+    return fig
+
+
+# ============================================================================
+# 🔥 新增：DDI 叠加的传感器布局图
+# ============================================================================
+
+def plot_sensor_placement_with_ddi(coords: np.ndarray,
+                                   selected_ids: List[int],
+                                   sensors: List,
+                                   mu: np.ndarray,
+                                   sigma: np.ndarray,
+                                   tau: float,
+                                   output_path: Path):
+    """
+    传感器布局 + DDI 热力图叠加
+
+    解释为什么 EVI 选择这些位置
+    """
+    from spatial_field import compute_ddi
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+
+    # 计算决策难度
+    n = len(mu)
+    gaps = np.abs(mu - tau)
+    difficulty = np.exp(-0.5 * (gaps / sigma) ** 2)
+
+    # 左图：DDI 热力图 + 候选池
+    all_sensor_coords = np.array([coords[sensors[i].idxs[0]] for i in range(len(sensors))])
+
+    scatter1 = ax1.scatter(
+        coords[:, 0], coords[:, 1],
+        c=difficulty,
+        cmap='hot',
+        s=30,
+        vmin=0, vmax=1,
+        alpha=0.6
+    )
+
+    ax1.scatter(
+        all_sensor_coords[:, 0], all_sensor_coords[:, 1],
+        c='lightgray',
+        s=40,
+        alpha=0.3,
+        label='Candidate Pool',
+        edgecolors='black',
+        linewidth=0.5
+    )
+
+    cbar1 = plt.colorbar(scatter1, ax=ax1, label='Decision Difficulty')
+    ax1.set_title('Decision Difficulty Map\n(brighter = closer to threshold)')
+    ax1.legend(loc='upper right')
+
+    # 右图：选中的传感器
+    ax2.scatter(
+        coords[:, 0], coords[:, 1],
+        c=difficulty,
+        cmap='hot',
+        s=30,
+        vmin=0, vmax=1,
+        alpha=0.3
+    )
+
+    # 类型颜色
+    type_colors = {
+        'inertial_profiler': '#1f77b4',
+        'photogrammetry': '#ff7f0e',
+        'smartphone': '#2ca02c'
+    }
+
+    # 绘制选中传感器
+    for i, sensor_id in enumerate(selected_ids):
+        sensor = sensors[sensor_id]
+        loc = coords[sensor.idxs[0]]
+
+        color = type_colors.get(sensor.type_name, 'black')
+
+        ax2.scatter(
+            loc[0], loc[1],
+            c=color,
+            s=200,
+            marker='*',
+            edgecolors='white',
+            linewidth=2,
+            zorder=10,
+            alpha=0.9
+        )
+
+        ax2.text(
+            loc[0], loc[1],
+            str(i + 1),
+            fontsize=8,
+            ha='center',
+            va='center',
+            color='white',
+            fontweight='bold',
+            zorder=11
+        )
+
+    ax2.set_title(f'Selected Sensors (k={len(selected_ids)})')
+
+    # 图例
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor=c, label=t.replace('_', ' ').title())
+                       for t, c in type_colors.items()]
+    ax2.legend(handles=legend_elements, loc='upper right')
+
+    # 全局标题
+    ddi = compute_ddi(mu, sigma, tau, k=1.0)
+    fig.suptitle(f'Sensor Placement Strategy Visualization\nDDI = {ddi:.2%}',
+                 fontsize=14, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"  ✓ Saved DDI overlay: {output_path}")
+
+
 if __name__ == "__main__":
     # 测试新增可视化函数
     setup_style()

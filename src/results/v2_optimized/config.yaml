@@ -22,11 +22,13 @@ cv:
   morans_permutations: 999
   scheme: spatial_block
 decision:
-  L_FN_gbp: 120000
-  L_FP_gbp: 6000
+  K_action: 20
+  L_FN_gbp: 2000
+  L_FP_gbp: 100
   L_TN_gbp: 0
-  L_TP_gbp: 5000
-  tau_quantile: 0.88
+  L_TP_gbp: 500
+  target_ddi: 0.3
+  tau_quantile: 0.85
 diagnostics:
   calibration:
     coverage_curves: true
@@ -87,6 +89,8 @@ plots:
   expert_plots:
     calibration_plots:
       enable: true
+    ddi_overlay:
+      enable: true
     enable_all: true
     marginal_efficiency:
       enable: true
@@ -97,6 +101,20 @@ plots:
       methods:
       - greedy_mi
       - greedy_evi
+    robustness_heatmap:
+      ddi_range:
+      - 0.1
+      - 0.2
+      - 0.3
+      - 0.4
+      enable: true
+      loss_ratios:
+      - 1
+      - 5
+      - 10
+      - 20
+    roi_curves:
+      enable: true
     sensor_placement_map:
       budgets_to_show:
       - 5
@@ -219,19 +237,27 @@ selection:
   - uniform
   - random
 sensors:
-  pool_fraction: 0.15
+  cost_zones:
+  - allowed_types:
+    - inertial_profiler
+    - photogrammetry
+    center:
+    - 100
+    - 100
+    cost_multiplier: 1.5
+    noise_multiplier: 0.7
+    radius: 40
+  pool_fraction: 0.5
   pool_strategy: grid_subsample
   type_mix:
-  - 0.15
-  - 0.35
-  - 0.15
-  - 0.2
-  - 0.15
+  - 0.3
+  - 0.4
+  - 0.3
   types:
-  - cost_gbp: 50
+  - cost_gbp: 30
     footprint: point
     name: smartphone
-    noise_std: 1.0
+    noise_std: 0.5
   - cost_gbp: 150
     footprint: point
     name: basic_point
@@ -240,14 +266,19 @@ sensors:
     footprint: point
     name: laser_profiler
     noise_std: 0.05
-  - cost_gbp: 400
-    footprint: avg5x5
+  - cost_gbp: 100
+    footprint: avg3x3
     name: photogrammetry
     noise_std: 0.25
   - cost_gbp: 100
     footprint: avg5x5
     name: vehicle_avg
     noise_std: 0.35
+  - cost_gbp: 300
+    footprint: avg3x3
+    name: inertial_profiler
+    noise_std: 0.15
+  use_heterogeneous: true
 uq:
   bootstrap_method: spatial_block
   bootstrap_samples: 1000

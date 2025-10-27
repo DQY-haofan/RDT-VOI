@@ -67,10 +67,10 @@ prior:
 sensors:
   types:
     # 极便宜但噪声极大
-    - name: "smartphone"
-      noise_std: 1.0
-      cost_gbp: 50
-      footprint: "point"
+    - name: smartphone
+      noise_std: 0.50
+      cost_gbp: 30
+      footprint: point
 
     # 中等精度+中等成本
     - name: "basic_point"
@@ -85,10 +85,10 @@ sensors:
       footprint: "point"
 
     # 大足迹+中高噪声
-    - name: "photogrammetry"
+    - name: photogrammetry
       noise_std: 0.25
-      cost_gbp: 400
-      footprint: "avg5x5"
+      cost_gbp: 100
+      footprint: avg3x3
 
     # 极大足迹+高噪声
     - name: "vehicle_avg"
@@ -96,26 +96,46 @@ sensors:
       cost_gbp: 100
       footprint: "avg5x5"
 
+    - name: inertial_profiler
+      noise_std: 0.15
+      cost_gbp: 300
+      footprint: avg3x3
+
   pool_strategy: "grid_subsample"
 
   # 🔥 关键改动：稀疏池（从 0.3 降到 0.15）
-  pool_fraction: 0.15  # ✅ 让"选错"的代价更大
+  pool_fraction: 0.5  # ✅ 让"选错"的代价更大
 
-  type_mix: [0.15, 0.35, 0.15, 0.20, 0.15]
+  type_mix: [0.3, 0.4, 0.3]
+
+  # 🔥 新增：异质化配置
+  use_heterogeneous: true
+  cost_zones:
+    - center: [100, 100]
+      radius: 40
+      cost_multiplier: 1.5
+      noise_multiplier: 0.7
+      allowed_types: ['inertial_profiler', 'photogrammetry']
 
 # ----------------------------------------------------------------------------
 # Decision Model - 🔥 优化 V2（拉大任务难度）
 # ----------------------------------------------------------------------------
 decision:
   # 🔥 关键改动 1：使用分位数阈值（而非固定值）
-  tau_quantile: 0.88       # ✅ τ = quantile(μ_prior, 0.88)
+  tau_quantile: 0.85      # ✅ τ = quantile(μ_prior, 0.88)
   # tau_iri: 2.2           # 如果设置了 tau_quantile，此项被忽略
 
   # 🔥 关键改动 2：加大误判代价比
-  L_TP_gbp: 5000
-  L_FP_gbp: 6000          # ✅ 从 10k 降到 6k
-  L_FN_gbp: 120000        # ✅ 从 150k 降到 120k，但比例提升到 20:1
+  L_TP_gbp: 500
+  L_FP_gbp: 100       # ✅ 从 10k 降到 6k
+  L_FN_gbp: 2000        # ✅ 从 150k 降到 120k，但比例提升到 20:1
   L_TN_gbp: 0
+  # 🔥 新增：DDI 控制
+  target_ddi: 0.30  # 目标：30% 像元在阈值附近
+
+  # 🔥 新增：行动约束
+  K_action: 20  # 最多维护 20 个位置
+
 
   # 🎯 成本比例: FN:FP = 120k:6k = 20:1 ✓
 
@@ -281,6 +301,17 @@ plots:
       enable: true
       budgets_to_show: [5, 10, 20, 30, 50]
 
+    # 🔥 新增图表
+    roi_curves:
+      enable: true
+
+    robustness_heatmap:
+      enable: true
+      ddi_range: [ 0.1, 0.2, 0.3, 0.4 ]
+      loss_ratios: [ 1, 5, 10, 20 ]
+
+    ddi_overlay:
+      enable: true
 # ----------------------------------------------------------------------------
 # Acceptance Criteria
 # ----------------------------------------------------------------------------

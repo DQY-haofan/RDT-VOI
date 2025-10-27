@@ -68,8 +68,14 @@ class NumpyEncoder(json.JSONEncoder):
 
 def run_single_fold_worker(fold_data: Dict) -> Dict:
     """
-    Worker function for a single CV fold.
-    Separates selection from evaluation for parallel execution.
+    完整增强版 CV fold worker，支持所有新指标
+
+    包含：
+    - 先验/后验损失对比
+    - ROI 计算
+    - DDI 统计
+    - 行动受限评估
+    - 完整诊断信息
 
     Args:
         fold_data: Dictionary containing:
@@ -80,12 +86,23 @@ def run_single_fold_worker(fold_data: Dict) -> Dict:
             - x_true: True state
             - sensors: Sensor pool
             - decision_config: Decision model
+            - geom: Geometry object
             - rng_seed: Random seed for this fold
 
     Returns:
-        Dictionary with metrics and selection results
+        Dictionary with comprehensive metrics and selection results
     """
-    # Unpack data
+    import time
+    import warnings
+    import numpy as np
+    from inference import compute_posterior, compute_posterior_variance_diagonal, SparseFactor
+    from sensors import get_observation
+    from evaluation import compute_metrics, morans_i
+    from decision import expected_loss
+
+    # =========================================================================
+    # 解包数据
+    # =========================================================================
     train_idx = fold_data['train_idx']
     test_idx = fold_data['test_idx']
     selection_method = fold_data['selection_method']
@@ -99,71 +116,298 @@ def run_single_fold_worker(fold_data: Dict) -> Dict:
     rng = np.random.default_rng(fold_data['rng_seed'])
 
     try:
-        # 🔥 Run selection (pass mu_pr for methods that need it)
-        t_start = time.time()
+        # =====================================================================
+        # 1. 计算先验损失（用于 ROI）
+        # =====================================================================
+        t_prior_start = time.time()
+
+        # 获取决策阈值
+        tau = decision_config.get_threshold(mu_pr)
+
+        # 计算测试集上的先验方差
+        factor_pr = SparseFactor(Q_pr)
+        var_pr_test = compute_posterior_variance_diagonal(factor_pr, test_idx)
+        sigma_pr_test = np.sqrt(np.maximum(var_pr_test, 1e-12))
+
+        # 先验决策损失
+        prior_loss = expected_loss(
+            mu_pr[test_idx],
+            sigma_pr_test,
+            decision_config,
+            test_indices=np.arange(len(test_idx)),
+            tau=tau
+        )
+
+        prior_time = time.time() - t_prior_start
+
+        # =====================================================================
+        # 2. 传感器选择
+        # =====================================================================
+        t_sel_start = time.time()
         selection_result = selection_method(sensors, k, Q_pr, mu_pr)
-        selection_time = time.time() - t_start
+        selection_time = time.time() - t_sel_start
 
-        # Get selected sensors
         selected_sensors = [sensors[i] for i in selection_result.selected_ids]
+        sensor_cost = selection_result.total_cost
 
-        # Generate observations
+        # =====================================================================
+        # 3. 生成观测
+        # =====================================================================
         y, H, R = get_observation(x_true, selected_sensors, rng)
 
-        # Compute posterior
-        t_start = time.time()
-        mu_post, factor = compute_posterior(Q_pr, mu_pr, H, R, y)
-        inference_time = time.time() - t_start
+        # =====================================================================
+        # 4. 计算后验
+        # =====================================================================
+        t_inf_start = time.time()
+        mu_post, factor_post = compute_posterior(Q_pr, mu_pr, H, R, y)
+        inference_time = time.time() - t_inf_start
 
-        # Get posterior uncertainties on test set
-        var_post_test = compute_posterior_variance_diagonal(factor, test_idx)
+        # 测试集后验不确定性
+        var_post_test = compute_posterior_variance_diagonal(factor_post, test_idx)
         sigma_post_test = np.sqrt(np.maximum(var_post_test, 1e-12))
 
-        # Expand to full arrays for metrics
+        # 扩展到全域（供 compute_metrics 使用）
         sigma_post = np.zeros(len(mu_post))
         sigma_post[test_idx] = sigma_post_test
 
-        # Compute metrics
+        # =====================================================================
+        # 5. 基础指标（调用已更新的 compute_metrics）
+        # =====================================================================
+        # 假设 compute_metrics 已返回：RMSE, MAE, R², loss, coverage, MSSE, z_scores
         metrics = compute_metrics(
             mu_post, sigma_post, x_true, test_idx, decision_config
         )
 
-        # Spatial diagnostics
-        residuals = mu_post - x_true
-        if geom.adjacency is not None:
-            I_stat, I_pval = morans_i(
-                residuals[test_idx],
-                geom.adjacency[test_idx][:, test_idx],
-                n_permutations=999,
-                rng=rng
+        posterior_loss = metrics['expected_loss_gbp']
+
+        # =====================================================================
+        # 6. ROI 和成本效率
+        # =====================================================================
+        savings = prior_loss - posterior_loss
+
+        if sensor_cost > 0:
+            roi = (savings - sensor_cost) / sensor_cost
+            cost_efficiency = savings / sensor_cost
+        else:
+            roi = np.inf if savings > 0 else 0.0
+            cost_efficiency = np.inf if savings > 0 else 0.0
+
+        metrics['roi'] = float(roi)
+        metrics['cost_efficiency'] = float(cost_efficiency)
+        metrics['prior_loss_gbp'] = float(prior_loss)
+        metrics['posterior_loss_gbp'] = float(posterior_loss)
+        metrics['savings_gbp'] = float(savings)
+
+        # =====================================================================
+        # 7. DDI（决策难度指数）统计
+        # =====================================================================
+        try:
+            from spatial_field import compute_ddi
+
+            # 测试集 DDI
+            ddi_test = compute_ddi(
+                mu_post[test_idx],
+                sigma_post_test,
+                tau,
+                k=1.0
             )
-            metrics['morans_i'] = I_stat
-            metrics['morans_pval'] = I_pval
+            metrics['ddi_test'] = float(ddi_test)
 
-        # Add timing
-        metrics['selection_time_sec'] = selection_time
-        metrics['inference_time_sec'] = inference_time
+            # 先验 DDI（采样估计）
+            sample_size = min(200, len(mu_pr))
+            sample_idx = rng.choice(len(mu_pr), size=sample_size, replace=False)
+            var_pr_sample = compute_posterior_variance_diagonal(factor_pr, sample_idx)
+            sigma_pr_sample = np.sqrt(np.maximum(var_pr_sample, 1e-12))
 
-        # Add selection diagnostics
+            ddi_prior = compute_ddi(
+                mu_pr[sample_idx],
+                sigma_pr_sample,
+                tau,
+                k=1.0
+            )
+            metrics['ddi_prior'] = float(ddi_prior)
+
+        except Exception as e:
+            warnings.warn(f"DDI computation failed: {e}")
+            metrics['ddi_test'] = np.nan
+            metrics['ddi_prior'] = np.nan
+
+        # =====================================================================
+        # 8. 行动受限评估（如果配置了 K_action）
+        # =====================================================================
+        if hasattr(decision_config, 'K_action') and decision_config.K_action is not None:
+            try:
+                K_action = decision_config.K_action
+
+                from scipy.stats import norm
+                from decision import conditional_risk
+
+                # 计算后验故障概率
+                p_failure = 1.0 - norm.cdf(
+                    (tau - mu_post[test_idx]) / np.maximum(sigma_post_test, 1e-12)
+                )
+
+                # 选择风险最高的 K 个位置（在测试集内）
+                if K_action < len(test_idx):
+                    top_k_local = np.argsort(p_failure)[-K_action:]
+                else:
+                    top_k_local = np.arange(len(test_idx))
+
+                # 计算行动受限后的损失
+                constrained_risks = np.zeros(len(test_idx))
+
+                for i in range(len(test_idx)):
+                    global_idx = test_idx[i]
+
+                    if i in top_k_local:
+                        # 维护：承担 L_TP 或 L_FP
+                        if x_true[global_idx] > tau:
+                            constrained_risks[i] = decision_config.L_TP_gbp
+                        else:
+                            constrained_risks[i] = decision_config.L_FP_gbp
+                    else:
+                        # 不维护：承担 L_FN 或 L_TN
+                        if x_true[global_idx] > tau:
+                            constrained_risks[i] = decision_config.L_FN_gbp
+                        else:
+                            constrained_risks[i] = decision_config.L_TN_gbp
+
+                constrained_loss = constrained_risks.mean()
+
+                # 命中率：真实超阈值的点中，我们维护了多少
+                true_exceed = x_true[test_idx] > tau
+                if true_exceed.sum() > 0:
+                    hit_rate = np.sum(np.isin(top_k_local, np.where(true_exceed)[0])) / true_exceed.sum()
+                else:
+                    hit_rate = 1.0
+
+                # 添加到指标
+                metrics['action_K'] = int(K_action)
+                metrics['action_constrained_loss'] = float(constrained_loss)
+                metrics['action_regret'] = float(constrained_loss - posterior_loss)
+                metrics['action_hit_rate'] = float(hit_rate)
+                metrics['action_n_true_exceed'] = int(true_exceed.sum())
+                metrics['action_n_maintained'] = int(len(top_k_local))
+
+            except Exception as e:
+                warnings.warn(f"Action-constrained evaluation failed: {e}")
+
+        # =====================================================================
+        # 9. 空间诊断（Moran's I）
+        # =====================================================================
+        residuals = mu_post - x_true
+
+        if geom.adjacency is not None:
+            try:
+                I_stat, I_pval = morans_i(
+                    residuals[test_idx],
+                    geom.adjacency[test_idx][:, test_idx],
+                    n_permutations=999,
+                    rng=rng
+                )
+                metrics['morans_i'] = float(I_stat)
+                metrics['morans_pval'] = float(I_pval)
+            except Exception as e:
+                warnings.warn(f"Moran's I computation failed: {e}")
+                metrics['morans_i'] = np.nan
+                metrics['morans_pval'] = np.nan
+
+        # =====================================================================
+        # 10. 时间统计
+        # =====================================================================
+        metrics['prior_computation_time_sec'] = float(prior_time)
+        metrics['selection_time_sec'] = float(selection_time)
+        metrics['inference_time_sec'] = float(inference_time)
+        metrics['total_time_sec'] = float(prior_time + selection_time + inference_time)
+
+        # =====================================================================
+        # 11. 传感器选择诊断
+        # =====================================================================
         metrics['n_selected'] = len(selection_result.selected_ids)
-        metrics['total_cost'] = selection_result.total_cost
+        metrics['total_cost'] = float(sensor_cost)
 
+        # 类型分布
+        type_counts = {}
+        for sid in selection_result.selected_ids:
+            stype = sensors[sid].type_name
+            type_counts[stype] = type_counts.get(stype, 0) + 1
+
+        # 转换为可序列化格式
+        metrics['type_counts'] = {k: int(v) for k, v in type_counts.items()}
+
+        # 成本分布
+        selected_costs = [sensors[i].cost for i in selection_result.selected_ids]
+        metrics['cost_mean'] = float(np.mean(selected_costs))
+        metrics['cost_std'] = float(np.std(selected_costs))
+        metrics['cost_min'] = float(np.min(selected_costs))
+        metrics['cost_max'] = float(np.max(selected_costs))
+
+        # 噪声分布
+        selected_noise_vars = [sensors[i].noise_var for i in selection_result.selected_ids]
+        metrics['noise_mean'] = float(np.mean(selected_noise_vars))
+        metrics['noise_std'] = float(np.std(selected_noise_vars))
+
+        # =====================================================================
+        # 12. 近阈值区域统计（额外诊断）
+        # =====================================================================
+        # 统计选择的传感器中有多少在"决策难度区"
+        try:
+            selected_locs = [sensors[i].idxs[0] for i in selection_result.selected_ids]
+            selected_gaps = np.abs(mu_pr[selected_locs] - tau)
+
+            # 估计这些位置的先验标准差
+            var_selected = compute_posterior_variance_diagonal(factor_pr, np.array(selected_locs))
+            sigma_selected = np.sqrt(np.maximum(var_selected, 1e-12))
+
+            # 有多少传感器在 1σ 阈值带内
+            near_threshold = selected_gaps <= sigma_selected
+            metrics['frac_sensors_near_threshold'] = float(near_threshold.mean())
+
+        except Exception as e:
+            warnings.warn(f"Near-threshold statistics failed: {e}")
+            metrics['frac_sensors_near_threshold'] = np.nan
+
+        # =====================================================================
+        # 13. 返回完整结果
+        # =====================================================================
         return {
             'success': True,
             'metrics': metrics,
             'selection_result': selection_result,
             'mu_post': mu_post,
-            'sigma_post': sigma_post
+            'sigma_post': sigma_post,
+            'residuals': residuals[test_idx],
+            'test_idx': test_idx,
+            'tau': tau,
+            'prior_loss': prior_loss,
+            'posterior_loss': posterior_loss,
+            'savings': savings,
+            'roi': roi
         }
 
     except Exception as e:
-        warnings.warn(f"Fold evaluation failed: {str(e)}")
+        import traceback
+        error_msg = str(e)
+        error_trace = traceback.format_exc()
+
+        warnings.warn(f"Fold evaluation failed: {error_msg}")
+
         return {
             'success': False,
-            'error': str(e),
-            'metrics': {}
+            'error': error_msg,
+            'traceback': error_trace,
+            'metrics': {},
+            'selection_result': None,
+            'mu_post': None,
+            'sigma_post': None,
+            'residuals': None,
+            'test_idx': test_idx,
+            'tau': None,
+            'prior_loss': None,
+            'posterior_loss': None,
+            'savings': None,
+            'roi': None
         }
-
 
 def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
                           x_true, sensors, test_idx_global=None) -> Dict:
@@ -1124,13 +1368,50 @@ def main():
     # ========================================================================
     print("\n[2] Building spatial domain...")
     geom = build_grid2d_geometry(cfg.geometry.nx, cfg.geometry.ny, cfg.geometry.h)
-    print(f"    Domain: {geom.n} locations, {geom.adjacency.nnz} edges")
 
     # ========================================================================
     # 3. CONSTRUCT PRIOR
     # ========================================================================
-    print("\n[3] Constructing GMRF prior...")
-    Q_pr, mu_pr = build_prior(geom, cfg.prior)
+    print("\n[3] Constructing GMRF prior with DDI control...")
+
+    # 🔥 如果配置了目标 DDI，使用增强版构建函数
+    if hasattr(cfg.decision, 'target_ddi') and cfg.decision.target_ddi > 0:
+        # 先获取阈值
+        from spatial_field import build_prior_with_ddi
+
+        # 临时构建一次先验以获取初始 mu
+        Q_temp, mu_temp = build_prior(geom, cfg.prior)
+        tau = cfg.decision.get_threshold(mu_temp)
+
+        print(f"    Target DDI: {cfg.decision.target_ddi:.2%}")
+        print(f"    Decision threshold: τ = {tau:.3f}")
+
+        # 使用 DDI 控制重新构建
+        Q_pr, mu_pr = build_prior_with_ddi(
+            geom, cfg.prior,
+            tau=tau,
+            target_ddi=cfg.decision.target_ddi
+        )
+    else:
+        Q_pr, mu_pr = build_prior(geom, cfg.prior)
+
+    # 绘制 DDI 热力图
+    if cfg.plots.ddi_overlay.get('enable', True):
+        from spatial_field import plot_ddi_heatmap, compute_ddi
+        from inference import SparseFactor, compute_posterior_variance_diagonal
+
+        # 估计先验标准差
+        factor = SparseFactor(Q_pr)
+        sample_idx = rng.choice(geom.n, size=min(100, geom.n), replace=False)
+        sample_vars = compute_posterior_variance_diagonal(factor, sample_idx)
+        sigma_est = np.sqrt(np.mean(sample_vars)) * np.ones(geom.n)
+
+        tau = cfg.decision.get_threshold(mu_pr)
+
+        plot_ddi_heatmap(
+            geom, mu_pr, sigma_est, tau,
+            output_path=output_dir / 'ddi_heatmap_prior.png'
+        )
     print(f"    Precision sparsity: {Q_pr.nnz / geom.n ** 2 * 100:.2f}%")
     print(f"    Correlation length: {cfg.prior.correlation_length:.1f} m")
 
@@ -1149,16 +1430,23 @@ def main():
     # 5. GENERATE SENSOR POOL
     # ========================================================================
     print("\n[5] Generating sensor pool...")
-    sensors = generate_sensor_pool(geom, cfg.sensors, rng)
-    print(f"    Pool size: {len(sensors)} candidates")
 
-    # Type distribution
-    type_counts = {}
-    for s in sensors:
-        type_counts[s.type_name] = type_counts.get(s.type_name, 0) + 1
-    print("    Type distribution:")
-    for tname, count in type_counts.items():
-        print(f"      {tname}: {count} ({count / len(sensors) * 100:.1f}%)")
+    if cfg.sensors.use_heterogeneous:
+        # 🔥 使用异质化传感器生成
+        from sensors import generate_heterogeneous_sensor_pool, create_cost_zones_example
+
+        if cfg.sensors.cost_zones:
+            cost_zones = cfg.sensors.cost_zones
+        else:
+            cost_zones = create_cost_zones_example(geom)
+
+        sensors = generate_heterogeneous_sensor_pool(
+            geom, cfg.sensors,
+            cost_zones=cost_zones,
+            rng=rng
+        )
+    else:
+        sensors = generate_sensor_pool(geom, cfg.sensors, rng)
 
     # ========================================================================
     # 6. PREPARE TEST SET (for EVI and diagnostics)
