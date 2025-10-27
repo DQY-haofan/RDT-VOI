@@ -386,8 +386,6 @@ def generate_expert_plots(all_results, sensors, geom, Q_pr,
         )
 
     # 3. Spatial Diagnostics（取一个代表性case）
-    print("\n3. Spatial Diagnostics...")
-
     # 找一个成功的fold结果
     for method_name, method_data in all_results.items():
         budgets_data = method_data.get('budgets', {})
@@ -395,30 +393,48 @@ def generate_expert_plots(all_results, sensors, geom, Q_pr,
         for budget_key, budget_data in budgets_data.items():
             fold_results = budget_data.get('fold_results', [])
 
-            for fold_res in fold_results:
+            for fold_idx, fold_res in enumerate(fold_results):
                 if not fold_res or not fold_res.get('success', False):
                     continue
 
                 # 找到一个有效的case
                 sel_result = fold_res.get('selection_result')
-                metrics = fold_res.get('metrics', {})
 
-                if sel_result and 'residuals' in fold_res:
+                # 🔥 关键修复：检查是否有完整的残差
+                if 'mu_post' not in fold_res or 'x_true' not in fold_res:
+                    continue
+
+                mu_post = fold_res['mu_post']
+                x_true = fold_res['x_true']
+
+                # 🔥 计算完整域的残差（而不是测试集）
+                if len(mu_post) == geom.n and len(x_true) == geom.n:
+                    residuals = mu_post - x_true
+                else:
+                    # 如果只有测试集数据，跳过
+                    print(f"    Skipping: incomplete posterior data")
+                    continue
+
+                if sel_result:
                     selected = [sensors[i] for i in sel_result.selected_ids]
-                    residuals = fold_res['residuals']
 
-                    plot_spatial_diagnostics(
-                        geom, Q_pr, selected, residuals,
-                        output_path=curves_dir / f"f6_spatial_diagnostics_{method_name}_k{budget_key}.png"
-                    )
+                    try:
+                        plot_spatial_diagnostics(
+                            geom, Q_pr, selected, residuals,
+                            output_path=curves_dir / f"f6_spatial_diagnostics_{method_name}_k{budget_key}.png"
+                        )
 
-                    # 只画一个就够了
-                    print("\n" + "=" * 70)
-                    return
+                        # 只画一个就够了
+                        print("\n" + "=" * 70)
+                        return
+                    except Exception as e:
+                        print(f"    Failed to plot spatial diagnostics: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
 
     print("  Warning: No valid fold results found for spatial diagnostics")
     print("\n" + "=" * 70)
-
 
 
 # ============================================================================

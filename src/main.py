@@ -571,9 +571,9 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
 
 def aggregate_results_for_visualization(all_results: Dict) -> pd.DataFrame:
     """
-    🔥 强化修复版：将结果转换为DataFrame供可视化使用
+    🔥 修复版：将结果转换为DataFrame供可视化使用
 
-    处理所有方法的数据，包括可能的结构差异
+    过滤掉非标量字段（字典、列表等）
     """
     rows = []
 
@@ -582,10 +582,6 @@ def aggregate_results_for_visualization(all_results: Dict) -> pd.DataFrame:
     for method_name, method_data in all_results.items():
         print(f"      处理方法: {method_name}")
 
-        # 🔥 统一方法显示名称
-        method_display = method_name.replace('_', ' ').title()
-
-        # 🔥 检查数据结构
         if not isinstance(method_data, dict):
             print(f"        ⚠️  跳过：数据类型错误 ({type(method_data)})")
             continue
@@ -599,22 +595,17 @@ def aggregate_results_for_visualization(all_results: Dict) -> pd.DataFrame:
         print(f"        找到 {len(budgets_data)} 个budgets")
 
         for budget, budget_data in budgets_data.items():
-            # 🔥 安全地获取fold_results
-            if isinstance(budget_data, dict):
-                fold_results = budget_data.get('fold_results', [])
-            else:
-                print(f"          Budget {budget}: 数据类型错误 ({type(budget_data)})")
+            if not isinstance(budget_data, dict):
                 continue
+
+            fold_results = budget_data.get('fold_results', [])
 
             if not fold_results:
-                print(f"          Budget {budget}: 无fold结果")
                 continue
 
-            # 收集所有fold的指标
             valid_folds = 0
 
             for fold_idx, fold_res in enumerate(fold_results):
-                # 🔥 检查fold_res结构
                 if not isinstance(fold_res, dict):
                     continue
 
@@ -628,28 +619,42 @@ def aggregate_results_for_visualization(all_results: Dict) -> pd.DataFrame:
 
                 valid_folds += 1
 
-                # 🔥 为每个指标创建行
+                # 🔥 为每个指标创建行，但跳过非标量字段
                 for metric_name, metric_value in metrics.items():
-                    # 跳过非标量指标
-                    if metric_name in ['z_scores'] or metric_name.startswith('_'):
+                    # 跳过非标量字段
+                    if metric_name in ['z_scores', 'type_counts']:
+                        continue
+
+                    # 跳过内部字段
+                    if metric_name.startswith('_'):
                         continue
 
                     # 🔥 确保值是标量
-                    if isinstance(metric_value, (list, np.ndarray)):
+                    if isinstance(metric_value, (list, np.ndarray, dict)):
                         continue
 
-                    if metric_value is None or (isinstance(metric_value, float) and np.isnan(metric_value)):
+                    if metric_value is None:
+                        continue
+
+                    # 转换为标量
+                    try:
+                        scalar_value = float(metric_value)
+                    except (ValueError, TypeError):
+                        continue
+
+                    if np.isnan(scalar_value):
                         continue
 
                     rows.append({
-                        'method': method_display,
+                        'method': method_name,
                         'budget': int(budget),
                         'fold': fold_idx + 1,
                         'metric': metric_name,
-                        'value': float(metric_value)
+                        'value': scalar_value
                     })
 
-            print(f"          Budget {budget}: {valid_folds} 个有效folds")
+            if valid_folds > 0:
+                print(f"          Budget {budget}: {valid_folds} 个有效folds")
 
     if not rows:
         warnings.warn("没有有效的结果可以聚合")
@@ -684,6 +689,7 @@ def aggregate_results_for_visualization(all_results: Dict) -> pd.DataFrame:
     print(f"    ✓ 指标: {len(df['metric'].unique())} 个")
 
     return df_combined
+
 
 def serialize_sparse_matrix(mat):
     """将稀疏矩阵序列化为字典"""
