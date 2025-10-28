@@ -1,6 +1,19 @@
 """
-Main experimental script for RDT-VoI simulation.
-Runs complete benchmarking suite with spatial CV.
+Main experimental script for RDT-VoI simulation (CLI version with parallel support)
+支持命令行参数指定配置文件和输出目录，集成并行处理
+
+# 场景A（串行）
+python main.py --scenario A
+
+# 场景B（并行，5 workers）
+python main.py -s B --parallel --workers 5
+
+# 快速测试（并行）
+python main.py -s A --quick-test --parallel
+
+# 自定义配置
+python main.py --config my_config.yaml --parallel
+
 """
 
 from pathlib import Path
@@ -11,46 +24,31 @@ import sys
 import warnings
 import numpy as np
 import pandas as pd
+import argparse
+from matplotlib import pyplot as plt
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
-from visualization_helpers import generate_expert_plots
-
-from matplotlib import pyplot as plt
+import time
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
-from typing import Dict, List
-import pickle
-import time
-from config import load_config
+
+from config import load_config, load_scenario_config
 from geometry import build_grid2d_geometry
-from spatial_field import build_prior, sample_gmrf
+from spatial_field import build_prior, sample_gmrf, build_prior_with_ddi
 from sensors import generate_sensor_pool
 from inference import compute_posterior, compute_posterior_variance_diagonal
 from sensors import get_observation
 
-from selection import greedy_mi, greedy_aopt, uniform_selection, random_selection
+from method_wrappers import get_selection_method, get_available_methods
 from evaluation import spatial_block_cv, compute_metrics, morans_i
-# 🔥 Import new method wrappers
-from method_wrappers import (
-    get_selection_method,
-    get_available_methods,
-    should_use_evi
-)
 
-# 🔥 Import visualization
 from visualization import (
-    plot_budget_curves,
-    plot_performance_profile,
-    plot_critical_difference,
-    plot_marginal_mi,
-    plot_mi_evi_correlation,
-    plot_marginal_efficiency,
-    plot_calibration_diagnostics,
-    plot_sensor_placement_map, setup_style
+    setup_style,
+    generate_all_visualizations_v2
 )
 
-# 🔥 添加自定义JSON encoder
+
 class NumpyEncoder(json.JSONEncoder):
     """处理numpy类型的JSON encoder"""
     def default(self, obj):
@@ -64,11 +62,234 @@ class NumpyEncoder(json.JSONEncoder):
             return obj.tolist()
         return super(NumpyEncoder, self).default(obj)
 
-# ✅ 在顶层定义方法映射函数（可以被 pickle）
 
-def run_single_fold_worker(fold_data: Dict) -> Dict:
+def parse_arguments():
     """
-    完整增强版 CV fold worker，支持所有新指标
+    解析命令行参数
+    """
+    parser = argparse.ArgumentParser(
+        description='RDT-VoI Simulation Framework',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # 使用场景A配置
+  python main.py --scenario A
+  
+  # 使用场景B配置，指定输出目录
+  python main.py --scenario B --output results/scenario_B
+  
+  # 快速测试运行
+  python main.py -s A --quick-test
+  
+  # 自定义配置文件
+  python main.py --config path/to/custom.yaml
+  
+  # 并行处理（5个worker）
+  python main.py -s A --parallel --workers 5
+        """
+    )
+
+    # 主要参数
+    parser.add_argument(
+        '-s', '--scenario',
+        type=str,
+        choices=['A', 'B', 'a', 'b'],
+        default=None,
+        help='场景类型 (A=高风险, B=算力/鲁棒性) - 优先级高于 --config'
+    )
+
+    parser.add_argument(
+        '-c', '--config',
+        type=str,
+        default=None,
+        help='自定义配置文件路径（仅在未指定 --scenario 时使用）'
+    )
+
+    parser.add_argument(
+        '-o', '--output',
+        type=str,
+        default=None,
+        help='输出根目录 (默认: 从配置文件读取)'
+    )
+
+    # 可选覆盖参数
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=None,
+        help='随机种子 (覆盖配置文件)'
+    )
+
+    parser.add_argument(
+        '--budgets',
+        type=int,
+        nargs='+',
+        default=None,
+        help='预算列表 (覆盖配置文件), 例如: --budgets 5 10 20'
+    )
+
+    parser.add_argument(
+        '--methods',
+        type=str,
+        nargs='+',
+        default=None,
+        help='要运行的方法 (覆盖配置文件), 例如: --methods greedy_mi greedy_evi'
+    )
+
+    # 🔥 并行处理选项
+    parser.add_argument(
+        '--parallel',
+        action='store_true',
+        help='启用并行处理（显著加速CV折叠）'
+    )
+
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=None,
+        help='并行worker数量（默认：CPU核心数-1）'
+    )
+
+    # 测试和调试选项
+    parser.add_argument(
+        '--quick-test',
+        action='store_true',
+        help='快速测试模式 (小网格, 少预算, 少fold)'
+    )
+
+    parser.add_argument(
+        '--skip-viz',
+        action='store_true',
+        help='跳过可视化生成 (仅运行实验)'
+    )
+
+    parser.add_argument(
+        '--viz-only',
+        action='store_true',
+        help='仅生成可视化 (加载已有结果)'
+    )
+
+    parser.add_argument(
+        '--results-file',
+        type=str,
+        default=None,
+        help='已有结果文件路径 (用于 --viz-only)'
+    )
+
+    # 详细程度
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='详细输出模式'
+    )
+
+    parser.add_argument(
+        '-q', '--quiet',
+        action='store_true',
+        help='静默模式（最少输出）'
+    )
+
+    return parser.parse_args()
+
+
+def detect_scenario_from_config(cfg) -> str:
+    """从配置自动检测场景类型"""
+    exp_name = cfg.experiment.name.lower()
+    if 'highstakes' in exp_name or 'high_stakes' in exp_name or '_a_' in exp_name:
+        return 'A'
+    elif 'proxy' in exp_name or 'compute' in exp_name or '_b_' in exp_name:
+        return 'B'
+
+    ddi = getattr(cfg.decision, 'target_ddi', 0.0)
+    fn_fp_ratio = cfg.decision.L_FN_gbp / cfg.decision.L_FP_gbp if cfg.decision.L_FP_gbp > 0 else 1.0
+
+    if ddi >= 0.2 or fn_fp_ratio > 10:
+        return 'A'
+    elif ddi < 0.15 or fn_fp_ratio < 5:
+        return 'B'
+
+    print("  ⚠️  Cannot determine scenario, defaulting to A (high-stakes)")
+    return 'A'
+
+
+def create_output_dir_from_config(cfg, config_path: str, custom_output: str = None) -> Path:
+    """根据配置文件名创建输出目录"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # 从配置文件名提取场景标识
+    config_name = Path(config_path).stem
+
+    # 移除 "config_" 前缀（如果有）
+    if config_name.startswith('config_'):
+        scenario_name = config_name[7:]
+    else:
+        scenario_name = config_name
+
+    # 确定输出根目录
+    if custom_output:
+        base_dir = Path(custom_output)
+    else:
+        base_dir = Path(cfg.experiment.output_dir)
+
+    # 创建层级目录结构
+    output_dir = base_dir / f"scenario_{scenario_name}" / f"exp_{timestamp}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 创建子目录
+    (output_dir / "curves").mkdir(exist_ok=True)
+    (output_dir / "diagnostics").mkdir(exist_ok=True)
+    (output_dir / "plots").mkdir(exist_ok=True)
+
+    # 保存配置副本
+    cfg.save_to(output_dir)
+
+    # 保存环境信息
+    import subprocess
+    try:
+        env_info = subprocess.check_output(['pip', 'freeze']).decode()
+        with open(output_dir / "environment.txt", 'w', encoding='utf-8') as f:
+            f.write(env_info)
+    except:
+        pass
+
+    # 保存运行命令
+    with open(output_dir / "run_command.txt", 'w', encoding='utf-8') as f:
+        f.write(' '.join(sys.argv))
+
+    return output_dir
+
+
+def apply_quick_test_overrides(cfg):
+    """应用快速测试模式的覆盖"""
+    print("\n  🚀 Quick test mode enabled:")
+
+    # 小网格
+    cfg.geometry.nx = 10
+    cfg.geometry.ny = 10
+    print(f"    → Grid: {cfg.geometry.nx}×{cfg.geometry.ny}")
+
+    # 少预算
+    cfg.selection.budgets = [3, 5]
+    print(f"    → Budgets: {cfg.selection.budgets}")
+
+    # 少fold
+    cfg.cv.k_folds = 2
+    print(f"    → CV folds: {cfg.cv.k_folds}")
+
+    # 减少采样
+    cfg.evi.monte_carlo_samples = 8
+    print(f"    → MC samples: {cfg.evi.monte_carlo_samples}")
+
+    return cfg
+
+
+# ============================================================================
+# 🔥 并行处理函数（从旧版移植）
+# ============================================================================
+
+def run_single_fold_worker(fold_data: dict) -> dict:
+    """
+    单fold评估worker（完整增强版）
 
     包含：
     - 先验/后验损失对比
@@ -76,21 +297,6 @@ def run_single_fold_worker(fold_data: Dict) -> Dict:
     - DDI 统计
     - 行动受限评估
     - 完整诊断信息
-
-    Args:
-        fold_data: Dictionary containing:
-            - train_idx, test_idx: CV split
-            - selection_method: Function to call
-            - k: Budget
-            - Q_pr, mu_pr: Prior
-            - x_true: True state
-            - sensors: Sensor pool
-            - decision_config: Decision model
-            - geom: Geometry object
-            - rng_seed: Random seed for this fold
-
-    Returns:
-        Dictionary with comprehensive metrics and selection results
     """
     import time
     import warnings
@@ -100,9 +306,7 @@ def run_single_fold_worker(fold_data: Dict) -> Dict:
     from evaluation import compute_metrics, morans_i
     from decision import expected_loss
 
-    # =========================================================================
     # 解包数据
-    # =========================================================================
     train_idx = fold_data['train_idx']
     test_idx = fold_data['test_idx']
     selection_method = fold_data['selection_method']
@@ -116,33 +320,19 @@ def run_single_fold_worker(fold_data: Dict) -> Dict:
     rng = np.random.default_rng(fold_data['rng_seed'])
 
     try:
-        # =====================================================================
         # 1. 计算先验损失（用于 ROI）
-        # =====================================================================
         t_prior_start = time.time()
-
-        # 获取决策阈值
         tau = decision_config.get_threshold(mu_pr)
-
-        # 计算测试集上的先验方差
         factor_pr = SparseFactor(Q_pr)
         var_pr_test = compute_posterior_variance_diagonal(factor_pr, test_idx)
         sigma_pr_test = np.sqrt(np.maximum(var_pr_test, 1e-12))
-
-        # 先验决策损失
         prior_loss = expected_loss(
-            mu_pr[test_idx],
-            sigma_pr_test,
-            decision_config,
-            test_indices=np.arange(len(test_idx)),
-            tau=tau
+            mu_pr[test_idx], sigma_pr_test, decision_config,
+            test_indices=np.arange(len(test_idx)), tau=tau
         )
-
         prior_time = time.time() - t_prior_start
 
-        # =====================================================================
         # 2. 传感器选择
-        # =====================================================================
         t_sel_start = time.time()
         selection_result = selection_method(sensors, k, Q_pr, mu_pr)
         selection_time = time.time() - t_sel_start
@@ -150,41 +340,25 @@ def run_single_fold_worker(fold_data: Dict) -> Dict:
         selected_sensors = [sensors[i] for i in selection_result.selected_ids]
         sensor_cost = selection_result.total_cost
 
-        # =====================================================================
         # 3. 生成观测
-        # =====================================================================
         y, H, R = get_observation(x_true, selected_sensors, rng)
 
-        # =====================================================================
         # 4. 计算后验
-        # =====================================================================
         t_inf_start = time.time()
         mu_post, factor_post = compute_posterior(Q_pr, mu_pr, H, R, y)
         inference_time = time.time() - t_inf_start
 
-        # 测试集后验不确定性
         var_post_test = compute_posterior_variance_diagonal(factor_post, test_idx)
         sigma_post_test = np.sqrt(np.maximum(var_post_test, 1e-12))
-
-        # 扩展到全域（供 compute_metrics 使用）
         sigma_post = np.zeros(len(mu_post))
         sigma_post[test_idx] = sigma_post_test
 
-        # =====================================================================
-        # 5. 基础指标（调用已更新的 compute_metrics）
-        # =====================================================================
-        # 假设 compute_metrics 已返回：RMSE, MAE, R², loss, coverage, MSSE, z_scores
-        metrics = compute_metrics(
-            mu_post, sigma_post, x_true, test_idx, decision_config
-        )
-
+        # 5. 基础指标
+        metrics = compute_metrics(mu_post, sigma_post, x_true, test_idx, decision_config)
         posterior_loss = metrics['expected_loss_gbp']
 
-        # =====================================================================
         # 6. ROI 和成本效率
-        # =====================================================================
         savings = prior_loss - posterior_loss
-
         if sensor_cost > 0:
             roi = (savings - sensor_cost) / sensor_cost
             cost_efficiency = savings / sensor_cost
@@ -198,112 +372,73 @@ def run_single_fold_worker(fold_data: Dict) -> Dict:
         metrics['posterior_loss_gbp'] = float(posterior_loss)
         metrics['savings_gbp'] = float(savings)
 
-        # =====================================================================
         # 7. DDI（决策难度指数）统计
-        # =====================================================================
         try:
             from spatial_field import compute_ddi
-
-            # 测试集 DDI
-            ddi_test = compute_ddi(
-                mu_post[test_idx],
-                sigma_post_test,
-                tau,
-                k=1.0
-            )
+            ddi_test = compute_ddi(mu_post[test_idx], sigma_post_test, tau, k=1.0)
             metrics['ddi_test'] = float(ddi_test)
 
-            # 先验 DDI（采样估计）
             sample_size = min(200, len(mu_pr))
             sample_idx = rng.choice(len(mu_pr), size=sample_size, replace=False)
             var_pr_sample = compute_posterior_variance_diagonal(factor_pr, sample_idx)
             sigma_pr_sample = np.sqrt(np.maximum(var_pr_sample, 1e-12))
-
-            ddi_prior = compute_ddi(
-                mu_pr[sample_idx],
-                sigma_pr_sample,
-                tau,
-                k=1.0
-            )
+            ddi_prior = compute_ddi(mu_pr[sample_idx], sigma_pr_sample, tau, k=1.0)
             metrics['ddi_prior'] = float(ddi_prior)
-
         except Exception as e:
             warnings.warn(f"DDI computation failed: {e}")
             metrics['ddi_test'] = np.nan
             metrics['ddi_prior'] = np.nan
 
-        # =====================================================================
         # 8. 行动受限评估（如果配置了 K_action）
-        # =====================================================================
         if hasattr(decision_config, 'K_action') and decision_config.K_action is not None:
             try:
-                K_action = decision_config.K_action
-
                 from scipy.stats import norm
-                from decision import conditional_risk
+                K_action = decision_config.K_action
+                p_failure = 1.0 - norm.cdf((tau - mu_post[test_idx]) / np.maximum(sigma_post_test, 1e-12))
 
-                # 计算后验故障概率
-                p_failure = 1.0 - norm.cdf(
-                    (tau - mu_post[test_idx]) / np.maximum(sigma_post_test, 1e-12)
-                )
-
-                # 选择风险最高的 K 个位置（在测试集内）
                 if K_action < len(test_idx):
                     top_k_local = np.argsort(p_failure)[-K_action:]
                 else:
                     top_k_local = np.arange(len(test_idx))
 
-                # 计算行动受限后的损失
                 constrained_risks = np.zeros(len(test_idx))
-
                 for i in range(len(test_idx)):
                     global_idx = test_idx[i]
-
                     if i in top_k_local:
-                        # 维护：承担 L_TP 或 L_FP
                         if x_true[global_idx] > tau:
                             constrained_risks[i] = decision_config.L_TP_gbp
                         else:
                             constrained_risks[i] = decision_config.L_FP_gbp
                     else:
-                        # 不维护：承担 L_FN 或 L_TN
                         if x_true[global_idx] > tau:
                             constrained_risks[i] = decision_config.L_FN_gbp
                         else:
                             constrained_risks[i] = decision_config.L_TN_gbp
 
                 constrained_loss = constrained_risks.mean()
-
-                # 命中率：真实超阈值的点中，我们维护了多少
                 true_exceed = x_true[test_idx] > tau
                 if true_exceed.sum() > 0:
                     hit_rate = np.sum(np.isin(top_k_local, np.where(true_exceed)[0])) / true_exceed.sum()
                 else:
                     hit_rate = 1.0
 
-                # 添加到指标
                 metrics['action_K'] = int(K_action)
                 metrics['action_constrained_loss'] = float(constrained_loss)
                 metrics['action_regret'] = float(constrained_loss - posterior_loss)
                 metrics['action_hit_rate'] = float(hit_rate)
                 metrics['action_n_true_exceed'] = int(true_exceed.sum())
                 metrics['action_n_maintained'] = int(len(top_k_local))
-
             except Exception as e:
                 warnings.warn(f"Action-constrained evaluation failed: {e}")
 
-        # =====================================================================
         # 9. 空间诊断（Moran's I）
-        # =====================================================================
         residuals = mu_post - x_true
-
         if geom.adjacency is not None:
             try:
                 I_stat, I_pval = morans_i(
                     residuals[test_idx],
                     geom.adjacency[test_idx][:, test_idx],
-                    n_permutations=999,
-                    rng=rng
+                    n_permutations=999, rng=rng
                 )
                 metrics['morans_i'] = float(I_stat)
                 metrics['morans_pval'] = float(I_pval)
@@ -312,64 +447,44 @@ def run_single_fold_worker(fold_data: Dict) -> Dict:
                 metrics['morans_i'] = np.nan
                 metrics['morans_pval'] = np.nan
 
-        # =====================================================================
         # 10. 时间统计
-        # =====================================================================
         metrics['prior_computation_time_sec'] = float(prior_time)
         metrics['selection_time_sec'] = float(selection_time)
         metrics['inference_time_sec'] = float(inference_time)
         metrics['total_time_sec'] = float(prior_time + selection_time + inference_time)
 
-        # =====================================================================
         # 11. 传感器选择诊断
-        # =====================================================================
         metrics['n_selected'] = len(selection_result.selected_ids)
         metrics['total_cost'] = float(sensor_cost)
 
-        # 类型分布
         type_counts = {}
         for sid in selection_result.selected_ids:
             stype = sensors[sid].type_name
             type_counts[stype] = type_counts.get(stype, 0) + 1
-
-        # 转换为可序列化格式
         metrics['type_counts'] = {k: int(v) for k, v in type_counts.items()}
 
-        # 成本分布
         selected_costs = [sensors[i].cost for i in selection_result.selected_ids]
         metrics['cost_mean'] = float(np.mean(selected_costs))
         metrics['cost_std'] = float(np.std(selected_costs))
         metrics['cost_min'] = float(np.min(selected_costs))
         metrics['cost_max'] = float(np.max(selected_costs))
 
-        # 噪声分布
         selected_noise_vars = [sensors[i].noise_var for i in selection_result.selected_ids]
         metrics['noise_mean'] = float(np.mean(selected_noise_vars))
         metrics['noise_std'] = float(np.std(selected_noise_vars))
 
-        # =====================================================================
-        # 12. 近阈值区域统计（额外诊断）
-        # =====================================================================
-        # 统计选择的传感器中有多少在"决策难度区"
+        # 12. 近阈值区域统计
         try:
             selected_locs = [sensors[i].idxs[0] for i in selection_result.selected_ids]
             selected_gaps = np.abs(mu_pr[selected_locs] - tau)
-
-            # 估计这些位置的先验标准差
             var_selected = compute_posterior_variance_diagonal(factor_pr, np.array(selected_locs))
             sigma_selected = np.sqrt(np.maximum(var_selected, 1e-12))
-
-            # 有多少传感器在 1σ 阈值带内
             near_threshold = selected_gaps <= sigma_selected
             metrics['frac_sensors_near_threshold'] = float(near_threshold.mean())
-
         except Exception as e:
             warnings.warn(f"Near-threshold statistics failed: {e}")
             metrics['frac_sensors_near_threshold'] = np.nan
 
-        # =====================================================================
-        # 13. 返回完整结果
-        # =====================================================================
         return {
             'success': True,
             'metrics': metrics,
@@ -389,7 +504,6 @@ def run_single_fold_worker(fold_data: Dict) -> Dict:
         import traceback
         error_msg = str(e)
         error_trace = traceback.format_exc()
-
         warnings.warn(f"Fold evaluation failed: {error_msg}")
 
         return {
@@ -409,16 +523,26 @@ def run_single_fold_worker(fold_data: Dict) -> Dict:
             'roi': None
         }
 
-def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
-                          x_true, sensors, test_idx_global=None) -> Dict:
-    """
-    🔥 修复版：运行完整的方法评估
 
-    Run complete evaluation for one method across all budgets and CV folds.
+def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
+                          x_true, sensors, test_idx_global=None,
+                          use_parallel=False, n_workers=None, verbose=True) -> dict:
     """
-    print(f"\n{'=' * 70}")
-    print(f"  Method: {method_name.upper()}")
-    print(f"{'=' * 70}")
+    运行方法评估（支持并行处理）
+
+    Args:
+        use_parallel: 是否使用并行处理
+        n_workers: 并行worker数量（None=自动检测）
+        verbose: 是否输出详细信息
+    """
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print(f"  Method: {method_name.upper()}")
+        if use_parallel:
+            print(f"  Mode: PARALLEL ({n_workers or 'auto'} workers)")
+        else:
+            print(f"  Mode: SEQUENTIAL")
+        print(f"{'=' * 70}")
 
     rng = cfg.get_rng()
 
@@ -432,22 +556,20 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
             test_idx=test_idx_global
         )
     except Exception as e:
-        print(f"  ✗ Failed to create method wrapper: {e}")
+        if verbose:
+            print(f"  ✗ Failed to create method wrapper: {e}")
         raise
 
     # 生成CV folds
     buffer_width = cfg.cv.buffer_width_multiplier * cfg.prior.correlation_length
     folds = spatial_block_cv(
-        geom.coords,
-        cfg.cv.k_folds,
-        buffer_width,
-        cfg.cv.block_strategy,
-        rng
+        geom.coords, cfg.cv.k_folds, buffer_width,
+        cfg.cv.block_strategy, rng
     )
 
-    # 打印fold信息
-    for fold_idx, (train_idx, test_idx) in enumerate(folds):
-        print(f"  Fold {fold_idx + 1}: train={len(train_idx)}, test={len(test_idx)}")
+    if verbose:
+        for fold_idx, (train_idx, test_idx) in enumerate(folds):
+            print(f"  Fold {fold_idx + 1}: train={len(train_idx)}, test={len(test_idx)}")
 
     results = {
         'budgets': {},
@@ -457,23 +579,25 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
 
     # 遍历budgets
     for k in cfg.selection.budgets:
-        print(f"\n  Budget k={k}")
-        print(f"  {'-' * 50}")
+        if verbose:
+            print(f"\n  Budget k={k}")
+            print(f"  {'-' * 50}")
 
         budget_results = {
             'fold_results': [],
             'fold_metrics': []
         }
 
-        # 遍历folds
+        # 🔥 准备所有fold的数据
+        fold_data_list = []
         for fold_idx, (train_idx, test_idx) in enumerate(folds):
-            # 🔥 关键修复：只对 EVI 方法检查是否跳过
+            # 检查是否需要跳过（仅EVI方法）
             is_evi_method = method_name.lower() in ['greedy_evi', 'evi', 'greedy-evi', 'myopic_evi']
-
             if is_evi_method:
-                # EVI 方法可能需要跳过某些配置以节省时间
+                from method_wrappers import should_use_evi
                 if not should_use_evi(method_name, k, fold_idx, cfg):
-                    print(f"    Fold {fold_idx + 1}/{len(folds)}: SKIPPED (EVI subset)")
+                    if verbose:
+                        print(f"    Fold {fold_idx + 1}/{len(folds)}: SKIPPED (EVI subset)")
                     budget_results['fold_results'].append({
                         'success': False,
                         'skipped': True,
@@ -481,9 +605,6 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
                     })
                     continue
 
-            print(f"    Fold {fold_idx + 1}/{len(folds)}: train={len(train_idx)}, test={len(test_idx)}")
-
-            # 准备fold数据
             fold_data = {
                 'train_idx': train_idx,
                 'test_idx': test_idx,
@@ -497,43 +618,91 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
                 'geom': geom,
                 'rng_seed': rng.integers(0, 2 ** 31)
             }
+            fold_data_list.append((fold_idx, fold_data))
 
-            # 运行fold
-            try:
-                fold_result = run_single_fold_worker(fold_data)
-                budget_results['fold_results'].append(fold_result)
+        # 🔥 并行或串行执行
+        if use_parallel and len(fold_data_list) > 1:
+            # 并行模式
+            if n_workers is None:
+                n_workers = max(1, mp.cpu_count() - 1)
 
-                if fold_result['success']:
-                    metrics = fold_result['metrics']
-                    budget_results['fold_metrics'].append(metrics)
+            if verbose:
+                print(f"    Running {len(fold_data_list)} folds in parallel "
+                      f"with {n_workers} workers...")
 
-                    # 打印关键指标
-                    print(f"        RMSE={metrics['rmse']:.3f}, "
-                          f"Loss=£{metrics['expected_loss_gbp']:.0f}, "
-                          f"Coverage={metrics['coverage_90'] * 100:.2f}%")
-                else:
-                    print(f"        ✗ FAILED: {fold_result.get('error', 'unknown error')}")
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                # 提交所有任务
+                future_to_fold = {
+                    executor.submit(run_single_fold_worker, fold_data): fold_idx
+                    for fold_idx, fold_data in fold_data_list
+                }
 
-            except Exception as e:
-                print(f"        ✗ Exception: {str(e)}")
-                import traceback
-                traceback.print_exc()
+                # 收集结果
+                for future in as_completed(future_to_fold):
+                    fold_idx = future_to_fold[future]
+                    try:
+                        fold_result = future.result()
+                        budget_results['fold_results'].append(fold_result)
 
-                budget_results['fold_results'].append({
-                    'success': False,
-                    'error': str(e),
-                    'traceback': traceback.format_exc()
-                })
+                        if fold_result['success']:
+                            metrics = fold_result['metrics']
+                            budget_results['fold_metrics'].append(metrics)
+                            if verbose:
+                                print(f"    Fold {fold_idx + 1}: "
+                                      f"RMSE={metrics['rmse']:.3f}, "
+                                      f"Loss=£{metrics['expected_loss_gbp']:.0f}")
+                        else:
+                            if verbose:
+                                print(f"    Fold {fold_idx + 1}: "
+                                      f"✗ {fold_result.get('error', 'unknown')}")
+                    except Exception as e:
+                        if verbose:
+                            print(f"    Fold {fold_idx + 1}: ✗ Exception: {e}")
+                        budget_results['fold_results'].append({
+                            'success': False,
+                            'error': str(e)
+                        })
+        else:
+            # 串行模式
+            for fold_idx, fold_data in fold_data_list:
+                if verbose:
+                    print(f"    Fold {fold_idx + 1}/{len(folds)}: "
+                          f"train={len(fold_data['train_idx'])}, "
+                          f"test={len(fold_data['test_idx'])}")
+
+                try:
+                    fold_result = run_single_fold_worker(fold_data)
+                    budget_results['fold_results'].append(fold_result)
+
+                    if fold_result['success']:
+                        metrics = fold_result['metrics']
+                        budget_results['fold_metrics'].append(metrics)
+                        if verbose:
+                            print(f"        RMSE={metrics['rmse']:.3f}, "
+                                  f"Loss=£{metrics['expected_loss_gbp']:.0f}, "
+                                  f"Coverage={metrics['coverage_90'] * 100:.2f}%")
+                    else:
+                        if verbose:
+                            print(f"        ✗ FAILED: "
+                                  f"{fold_result.get('error', 'unknown error')}")
+                except Exception as e:
+                    if verbose:
+                        print(f"        ✗ Exception: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    budget_results['fold_results'].append({
+                        'success': False,
+                        'error': str(e),
+                        'traceback': traceback.format_exc()
+                    })
 
         # 计算budget级别的统计
         if budget_results['fold_metrics']:
             n_folds = len(budget_results['fold_metrics'])
-
-            # 聚合指标
             aggregated = {}
+
             for key in budget_results['fold_metrics'][0].keys():
-                # 跳过非数值指标
-                if key in ['z_scores', 'n_test', 'n_selected']:
+                if key in ['z_scores', 'n_test', 'n_selected', 'type_counts']:
                     continue
 
                 values = [m[key] for m in budget_results['fold_metrics'] if key in m]
@@ -546,97 +715,70 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
 
             budget_results['aggregated'] = aggregated
 
-            print(f"\n    Summary (n={n_folds} folds):")
-            for metric in ['expected_loss_gbp', 'rmse']:
-                if metric in aggregated:
-                    stats = aggregated[metric]
-
-                    # 🔥 修复：条件格式化
-                    if 'loss' in metric:
-                        mean_str = f"{stats['mean']:.0f}"
-                        std_str = f"{stats['std']:.0f}"
-                    else:
-                        mean_str = f"{stats['mean']:.3f}"
-                        std_str = f"{stats['std']:.3f}"
-
-                    print(f"      {metric.replace('_', ' ').title()}: "
-                          f"{mean_str} ± {std_str}")
+            if verbose:
+                print(f"\n    Summary (n={n_folds} folds):")
+                for metric in ['expected_loss_gbp', 'rmse']:
+                    if metric in aggregated:
+                        stats = aggregated[metric]
+                        if 'loss' in metric:
+                            mean_str = f"{stats['mean']:.0f}"
+                            std_str = f"{stats['std']:.0f}"
+                        else:
+                            mean_str = f"{stats['mean']:.3f}"
+                            std_str = f"{stats['std']:.3f}"
+                        print(f"      {metric.replace('_', ' ').title()}: "
+                              f"{mean_str} ± {std_str}")
         else:
-            print(f"\n    ⚠️  No successful folds for budget k={k}")
+            if verbose:
+                print(f"\n    ⚠️  No successful folds for budget k={k}")
 
         results['budgets'][k] = budget_results
 
     return results
 
 
-def aggregate_results_for_visualization(all_results: Dict) -> pd.DataFrame:
-    """
-    🔥 修复版：将结果转换为DataFrame供可视化使用
-
-    过滤掉非标量字段（字典、列表等）
-    """
+def aggregate_results_for_visualization(all_results: dict) -> pd.DataFrame:
+    """将结果转换为DataFrame供可视化使用"""
     rows = []
-
     print("    开始聚合结果...")
 
     for method_name, method_data in all_results.items():
         print(f"      处理方法: {method_name}")
-
         if not isinstance(method_data, dict):
-            print(f"        ⚠️  跳过：数据类型错误 ({type(method_data)})")
             continue
 
         budgets_data = method_data.get('budgets', {})
-
         if not budgets_data:
-            print(f"        ⚠️  跳过：无budgets数据")
             continue
-
-        print(f"        找到 {len(budgets_data)} 个budgets")
 
         for budget, budget_data in budgets_data.items():
             if not isinstance(budget_data, dict):
                 continue
 
             fold_results = budget_data.get('fold_results', [])
-
             if not fold_results:
                 continue
-
-            valid_folds = 0
 
             for fold_idx, fold_res in enumerate(fold_results):
                 if not isinstance(fold_res, dict):
                     continue
-
                 if not fold_res.get('success', False):
                     continue
 
                 metrics = fold_res.get('metrics', {})
-
                 if not metrics or not isinstance(metrics, dict):
                     continue
 
-                valid_folds += 1
-
-                # 🔥 为每个指标创建行，但跳过非标量字段
                 for metric_name, metric_value in metrics.items():
-                    # 跳过非标量字段
                     if metric_name in ['z_scores', 'type_counts']:
                         continue
-
-                    # 跳过内部字段
                     if metric_name.startswith('_'):
                         continue
-
-                    # 🔥 确保值是标量
                     if isinstance(metric_value, (list, np.ndarray, dict)):
                         continue
-
                     if metric_value is None:
                         continue
 
-                    # 转换为标量
                     try:
                         scalar_value = float(metric_value)
                     except (ValueError, TypeError):
@@ -653,24 +795,20 @@ def aggregate_results_for_visualization(all_results: Dict) -> pd.DataFrame:
                         'value': scalar_value
                     })
 
-            if valid_folds > 0:
-                print(f"          Budget {budget}: {valid_folds} 个有效folds")
-
     if not rows:
         warnings.warn("没有有效的结果可以聚合")
         return pd.DataFrame()
 
-    # 创建DataFrame
     df = pd.DataFrame(rows)
 
-    # 🔥 计算统计量
+    # 计算统计量
     stats_rows = []
     for (method, budget, metric), group in df.groupby(['method', 'budget', 'metric']):
         values = group['value'].values
         stats_rows.append({
             'method': method,
             'budget': budget,
-            'fold': None,  # 聚合统计
+            'fold': None,
             'metric': metric,
             'value': np.mean(values),
             'mean': np.mean(values),
@@ -680,1003 +818,276 @@ def aggregate_results_for_visualization(all_results: Dict) -> pd.DataFrame:
             'n_folds': len(values)
         })
 
-    # 合并原始数据和统计数据
     df_stats = pd.DataFrame(stats_rows)
     df_combined = pd.concat([df, df_stats], ignore_index=True)
 
     print(f"    ✓ 聚合完成: {len(df)} 行原始数据 + {len(df_stats)} 行统计数据")
-    print(f"    ✓ 方法: {sorted(df['method'].unique())}")
-    print(f"    ✓ 指标: {len(df['metric'].unique())} 个")
-
     return df_combined
 
 
-def serialize_sparse_matrix(mat):
-    """将稀疏矩阵序列化为字典"""
-    mat_csr = mat.tocsr()
-    return {
-        'data': mat_csr.data,
-        'indices': mat_csr.indices,
-        'indptr': mat_csr.indptr,
-        'shape': mat_csr.shape
-    }
-
-
-def serialize_geometry(geom):
-    """将 Geometry 对象序列化"""
-    return {
-        'mode': geom.mode,
-        'n': geom.n,
-        'coords': geom.coords,
-        'adj_data': geom.adjacency.data,
-        'adj_indices': geom.adjacency.indices,
-        'adj_indptr': geom.adjacency.indptr,
-        'lap_data': geom.laplacian.data,
-        'lap_indices': geom.laplacian.indices,
-        'lap_indptr': geom.laplacian.indptr,
-        'h': geom.h
-    }
-
-
-def serialize_sensors(sensors):
-    """将传感器列表序列化"""
-    return [
-        {
-            'id': s.id,
-            'idxs': s.idxs,
-            'weights': s.weights,
-            'noise_var': s.noise_var,
-            'cost': s.cost,
-            'type_name': s.type_name
-        }
-        for s in sensors
-    ]
-
-
-def run_cv_experiment_parallel(geom, Q_pr, mu_pr, x_true, sensors,
-                               method_name, k, cv_config,
-                               decision_config, seed, n_workers=5):
-    """
-    并行运行CV实验
-
-    Args:
-        geom: 几何对象
-        Q_pr, mu_pr: 先验参数
-        x_true: 真实状态
-        sensors: 候选传感器池
-        method_name: 方法名称
-        k: 预算
-        cv_config: CV配置
-        decision_config: 决策配置
-        seed: 随机种子
-        n_workers: 并行worker数量
-
-    Returns:
-        results: CV结果字典
-    """
-    from evaluation import spatial_block_cv
-    import numpy as np
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-
-    # 生成CV折
-    buffer_width = 15.0  # 或从 cv_config 获取
-    folds = spatial_block_cv(
-        geom.coords,
-        k_folds=cv_config.get('k_folds', 3),
-        buffer_width=buffer_width,
-        block_strategy=cv_config.get('block_strategy', 'kmeans'),
-        rng=np.random.default_rng(seed)
-    )
-
-    print(f"\n  Running {len(folds)} folds in parallel with {n_workers} workers...")
-
-    # 提交所有任务
-    futures = []
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        for fold_idx, (train_idx, test_idx) in enumerate(folds):
-            # 🔥 关键修复：传递所有参数
-            future = executor.submit(
-                run_single_fold_worker,
-                method_name,  # 参数1
-                geom,  # 参数2
-                Q_pr,  # 参数3
-                mu_pr,  # 参数4
-                x_true,  # 参数5
-                sensors,  # 参数6
-                k,  # 参数7
-                train_idx,  # 参数8
-                test_idx,  # 参数9
-                decision_config,  # 参数10
-                fold_idx,  # 参数11
-                seed  # 参数12
-            )
-            futures.append(future)
-
-        # 收集结果
-        fold_results = []
-        for future in as_completed(futures):
-            try:
-                fold_idx, metrics = future.result()
-                fold_results.append(metrics)
-            except Exception as e:
-                print(f"\n✗ ERROR: {e}")
-                import traceback
-                traceback.print_exc()
-                raise
-
-    # 按fold_idx排序
-    # fold_results.sort(key=lambda x: x.get('fold_idx', 0))
-
-    # 聚合结果
-    aggregated = {}
-    for key in fold_results[0].keys():
-        # 跳过非数值字段
-        if key in ['selection_result', 'mu_post', 'x_true', 'test_idx', 'fold_idx']:
-            continue
-
-        values = np.array([fr[key] for fr in fold_results])
-        aggregated[key] = {
-            'mean': float(values.mean()),
-            'std': float(values.std()),
-            'values': values.tolist()
-        }
-
-    return {
-        'fold_results': fold_results,
-        'aggregated': aggregated
-    }
-
-def create_output_dir(cfg) -> Path:
-    """Create timestamped output directory."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(cfg.experiment.output_dir) / f"{cfg.experiment.name}_{timestamp}"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    (output_dir / "curves").mkdir(exist_ok=True)
-    (output_dir / "diagnostics").mkdir(exist_ok=True)
-
-    # Save config
-    cfg.save_to(output_dir)
-
-    # Save environment
-    import subprocess
-    try:
-        env_info = subprocess.check_output(['pip', 'freeze']).decode()
-        with open(output_dir / "environment.txt", 'w', encoding='utf-8') as f:
-            f.write(env_info)
-    except:
-        pass
-
-    return output_dir
-
-
-def run_milestone_m1(cfg, output_dir):
-    """
-    Milestone M1: Single-fold validation on small grid.
-    Verify monotonic decrease and diminishing returns.
-    """
-    print("\n" + "="*60)
-    print("MILESTONE M1: Small-scale validation")
-    print("="*60)
-
-    rng = cfg.get_rng()
-
-    # Override config for M1
-    nx = ny = int(np.sqrt(cfg.acceptance.m1_grid_size))
-    geom = build_grid2d_geometry(nx, ny, h=cfg.geometry.h)
-
-    print(f"Grid: {nx}×{ny} = {geom.n} locations")
-
-    # Build prior and sample true state
-    Q_pr, mu_pr = build_prior(geom, cfg.prior)
-    x_true = sample_gmrf(Q_pr, mu_pr, rng)
-
-    # Generate sensors
-    sensors = generate_sensor_pool(geom, cfg.sensors, rng)
-    print(f"Sensor pool: {len(sensors)} candidates")
-
-    # 只运行一次最大 budget
-    max_budget = max(cfg.acceptance.m1_budgets)
-    print(f"\nRunning Greedy-MI with budget k={max_budget}")
-    result = greedy_mi(sensors, max_budget, Q_pr, lazy=True)
-
-    # Save marginal VoI plot
-    plot_marginal_mi(
-        result,
-        output_dir / "curves" / f"m1_marginal_voi_full.png"
-    )
-
-    # Check monotonicity
-    is_monotonic = all(
-        result.objective_values[i] <= result.objective_values[i+1]
-        for i in range(len(result.objective_values)-1)
-    )
-
-    # Check diminishing returns
-    is_diminishing = all(
-        result.marginal_gains[i] >= result.marginal_gains[i+1] - 1e-6
-        for i in range(len(result.marginal_gains)-1)
-    )
-
-    print("\n" + "-"*60)
-    print(f"M1 RESULTS:")
-    print(f"  Total steps: {len(result.objective_values)}")
-    print(f"  Final MI: {result.objective_values[-1]:.3f} nats")
-    print(f"  Monotonic increase: {'✓ PASS' if is_monotonic else '✗ FAIL'}")
-    print(f"  Diminishing returns: {'✓ PASS' if is_diminishing else '✗ FAIL'}")
-    print(f"\n  First 5 marginal gains: {result.marginal_gains[:5]}")
-    print(f"  Last 5 marginal gains: {result.marginal_gains[-5:]}")
-    print("-"*60)
-
-    # Save results
-    m1_summary = {
-        'monotonic': is_monotonic,
-        'diminishing': is_diminishing,
-        'final_mi': float(result.objective_values[-1]),
-        'marginal_gains': [float(x) for x in result.marginal_gains],
-        'max_budget': max_budget
-    }
-
-    with open(output_dir / "m1_summary.json", 'w', encoding='utf-8') as f:
-        json.dump(m1_summary, f, indent=2, cls=NumpyEncoder)
-
-    return m1_summary
-
-
-def run_milestone_m2(cfg, output_dir):
-    """
-    Milestone M2: Baseline comparison with spatial CV.
-    """
-    print("\n" + "="*60)
-    print("MILESTONE M2: Baseline comparison")
-    print("="*60)
-
-    rng = cfg.get_rng()
-
-    # Build full geometry
-    geom = build_grid2d_geometry(cfg.geometry.nx, cfg.geometry.ny, h=cfg.geometry.h)
-    print(f"Grid: {cfg.geometry.nx}×{cfg.geometry.ny} = {geom.n} locations")
-
-    # Build prior and sample
-    Q_pr, mu_pr = build_prior(geom, cfg.prior)
-    x_true = sample_gmrf(Q_pr, mu_pr, rng)
-
-    # Generate sensors
-    sensors = generate_sensor_pool(geom, cfg.sensors, rng)
-    print(f"Sensor pool: {len(sensors)} candidates")
-
-    # 方法名称列表
-    method_names = ['Greedy-MI', 'Greedy-A', 'Uniform', 'Random']
-
-    # Run experiments for each method and budget
-    all_results = {}
-
-    for method_name in method_names:
-        print(f"\n{'='*60}")
-        print(f"Method: {method_name}")
-        print(f"{'='*60}")
-
-        all_results[method_name] = {}
-
-        for k in cfg.selection.budgets:
-            print(f"\nBudget k={k}")
-
-            # 使用并行版本
-            cv_results = run_cv_experiment_parallel(
-                geom=geom,
-                Q_pr=Q_pr,
-                mu_pr=mu_pr,
-                x_true=x_true,
-                sensors=sensors,
-                method_name=method_name,
-                k=k,
-                cv_config=cfg.cv.__dict__,  # 或直接传cfg.cv
-                decision_config=cfg.decision,
-                seed=cfg.experiment.seed,
-                n_workers=5
-            )
-
-            all_results[method_name][k] = cv_results
-
-    # Save results
-    with open(output_dir / "m2_results.pkl", 'wb') as f:
-        pickle.dump(all_results, f)
-
-    # Generate plots
-    print("\nGenerating plots...")
-
-    # Budget curves for each metric
-    for metric in ['expected_loss_gbp', 'rmse', 'mae']:
-        plot_budget_curves(
-            all_results, metric,
-            output_dir / "curves" / f"m2_budget_{metric}.png",
-            show_ci=True
-        )
-
-    # Performance profile
-    perf_data = {}
-    for method in method_names:
-        perf_data[method] = {
-            f"k{k}": all_results[method][k]['aggregated']['expected_loss_gbp']['mean']
-            for k in cfg.selection.budgets
-        }
-
-    plot_performance_profile(
-        perf_data, 'expected_loss_gbp',
-        output_dir / "curves" / "m2_performance_profile.png"
-    )
-
-    # Critical difference diagram
-    plot_critical_difference(
-        perf_data, 'expected_loss_gbp',
-        output_dir / "curves" / "m2_critical_difference.png"
-    )
-
-    # Check acceptance criterion
-    greedy_mi_loss = all_results['Greedy-MI'][cfg.selection.budgets[-1]]['aggregated']['expected_loss_gbp']['mean']
-    random_loss = all_results['Random'][cfg.selection.budgets[-1]]['aggregated']['expected_loss_gbp']['mean']
-
-    improvement = (random_loss - greedy_mi_loss) / random_loss
-    passes_m2 = improvement >= cfg.acceptance.m2_min_improvement_vs_random
-
-    print("\n" + "-"*60)
-    print(f"M2 RESULTS:")
-    print(f"  Greedy-MI loss: £{greedy_mi_loss:.0f}")
-    print(f"  Random loss: £{random_loss:.0f}")
-    print(f"  Improvement: {improvement*100:.1f}%")
-    print(f"  Threshold: {cfg.acceptance.m2_min_improvement_vs_random*100:.1f}%")
-    print(f"  Status: {'✓ PASS' if passes_m2 else '✗ FAIL'}")
-    print("-"*60)
-
-    m2_summary = {
-        'passes': passes_m2,
-        'improvement': improvement,
-        'greedy_mi_loss': greedy_mi_loss,
-        'random_loss': random_loss
-    }
-
-
-    with open(output_dir / "m2_summary.json", 'w', encoding='utf-8') as f:
-        json.dump(m2_summary, f, indent=2, cls=NumpyEncoder)
-
-    try:
-        generate_all_expert_plots(all_results, cfg, geom, sensors, output_dir)
-    except Exception as e:
-        print(f"⚠️  Visualization generation failed: {e}")
-        import traceback
-        traceback.print_exc()
-
-    return m2_summary, all_results
-
-
-def generate_all_expert_plots(all_results, cfg, geom, sensors, output_dir):
-    """
-    生成专家建议的所有图像（改进的错误处理版本）
-    """
-    from visualization import (
-        setup_style,
-        plot_budget_curves,
-        plot_marginal_efficiency,
-        plot_type_composition,
-        plot_mi_voi_correlation,
-        plot_calibration_diagnostics,
-        plot_spatial_diagnostics_enhanced,
-        plot_performance_profile,
-        plot_critical_difference,
-        plot_sensor_placement_map
-    )
-    import traceback
-
-    print("\n" + "=" * 60)
-    print("GENERATING EXPERT-RECOMMENDED VISUALIZATIONS")
-    print("=" * 60)
-
-    setup_style()
-
-    # 创建输出子目录
-    curves_dir = output_dir / "curves"
-    maps_dir = output_dir / "maps"
-    calibration_dir = output_dir / "calibration"
-    comparison_dir = output_dir / "comparison"
-
-    for d in [curves_dir, maps_dir, calibration_dir, comparison_dir]:
-        d.mkdir(exist_ok=True)
-
-    # ========== F1: 预算-损失前沿 ==========
-    print("\n📈 F1: Budget-Loss Frontier...")
-    try:
-        results_by_method = {}
-        for method_name in all_results.keys():
-            results_by_method[method_name] = {}
-            for budget in all_results[method_name].keys():
-                results_by_method[method_name][budget] = all_results[method_name][budget]
-
-        plot_budget_curves(
-            results_by_method,
-            metric='expected_loss_gbp',
-            output_path=curves_dir / "f1_budget_loss_frontier.png",
-            show_ci=True
-        )
-        print("  ✅ F1 saved")
-    except Exception as e:
-        print(f"  ❌ F1 failed: {e}")
-        traceback.print_exc()
-
-    # ========== F2 + F3 + F10: 需要 selection_result ==========
-    print("\n💰 F2, 🎨 F3, 🗺️ F10: Processing selection results...")
-
-    for method_name in ['Greedy-MI', 'Greedy-A']:
-        if method_name not in all_results:
-            print(f"  ⏭️ Skipping {method_name} (not in results)")
-            continue
-
-        budgets = sorted(all_results[method_name].keys())
-
-        for budget in budgets:
-            result_data = all_results[method_name][budget]
-
-            # 🔥 调试：检查数据结构
-            print(f"\n  Debug {method_name} k={budget}:")
-            print(f"    Keys in result_data: {list(result_data.keys())}")
-
-            if 'fold_results' not in result_data:
-                print(f"    ❌ No fold_results")
-                continue
-
-            fold_results = result_data['fold_results']
-            print(f"    Number of folds: {len(fold_results)}")
-
-            if len(fold_results) == 0:
-                print(f"    ❌ Empty fold_results")
-                continue
-
-            # 检查第一个fold
-            fold_0 = fold_results[0]
-            print(f"    Keys in fold_0: {list(fold_0.keys())}")
-
-            if 'selection_result' not in fold_0:
-                print(f"    ❌ No selection_result in fold")
-                continue
-
-            selection_result = fold_0['selection_result']
-            print(f"    ✅ Found selection_result with {len(selection_result.selected_ids)} sensors")
-
-            # ========== F2: 单位成本效率 ==========
-            try:
-                print(f"\n  💰 Generating F2 for {method_name} k={budget}...")
-                plot_marginal_efficiency(
-                    selection_result,
-                    sensors,
-                    output_path=curves_dir / f"f2_efficiency_{method_name.lower().replace('-', '_')}_k{budget}.png"
-                )
-                print(f"    ✅ F2 saved")
-            except Exception as e:
-                print(f"    ❌ F2 failed: {e}")
-                traceback.print_exc()
-
-            # ========== F3: 类型堆叠图 ==========
-            try:
-                print(f"\n  🎨 Generating F3 for {method_name} k={budget}...")
-                plot_type_composition(
-                    selection_result,
-                    sensors,
-                    output_path=curves_dir / f"f3_type_composition_{method_name.lower().replace('-', '_')}_k{budget}.png"
-                )
-                print(f"    ✅ F3 saved")
-            except Exception as e:
-                print(f"    ❌ F3 failed: {e}")
-                traceback.print_exc()
-
-            # ========== F10: 选址地图 ==========
-            try:
-                print(f"\n  🗺️ Generating F10 for {method_name} k={budget}...")
-                plot_sensor_placement_map(
-                    geom.coords,
-                    selection_result.selected_ids,
-                    sensors,
-                    output_path=maps_dir / f"f10_placement_{method_name.lower().replace('-', '_')}_k{budget}.png"
-                )
-                print(f"    ✅ F10 saved")
-            except Exception as e:
-                print(f"    ❌ F10 failed: {e}")
-                traceback.print_exc()
-
-    # ========== F4: MI vs VoI 相关性 ==========
-    print("\n🔗 F4: MI vs VoI Correlation...")
-    print("  ⏭️ F4 skipped (requires EVI computation)")
-
-    # ========== F5: 校准诊断 ==========
-    print("\n📊 F5: Calibration Diagnostics...")
-    try:
-        for method_name in ['Greedy-MI']:
-            if method_name not in all_results:
-                continue
-
-            all_fold_results = []
-            for budget in all_results[method_name].keys():
-                result_data = all_results[method_name][budget]
-                if 'fold_results' in result_data:
-                    all_fold_results.extend(result_data['fold_results'])
-
-            if all_fold_results:
-                print(f"  Processing {len(all_fold_results)} folds for {method_name}...")
-                plot_calibration_diagnostics(
-                    all_fold_results,
-                    output_path=calibration_dir / f"f5_calibration_{method_name.lower().replace('-', '_')}.png"
-                )
-                print(f"  ✅ F5 saved")
-            else:
-                print(f"  ❌ No fold results for {method_name}")
-    except Exception as e:
-        print(f"  ❌ F5 failed: {e}")
-        traceback.print_exc()
-
-    # ========== F6: 空间诊断 ==========
-    print("\n🗺️ F6: Spatial Diagnostics...")
-    try:
-        for method_name in ['Greedy-MI', 'Random']:
-            if method_name not in all_results:
-                continue
-
-            budgets = list(all_results[method_name].keys())
-            mid_budget = budgets[len(budgets) // 2]
-            result_data = all_results[method_name][mid_budget]
-
-            if 'fold_results' in result_data and len(result_data['fold_results']) > 0:
-                fold_0 = result_data['fold_results'][0]
-
-                # 🔥 检查是否有需要的数据
-                if all(k in fold_0 for k in ['mu_post', 'x_true', 'test_idx']):
-                    print(f"  Generating F6 for {method_name}...")
-                    plot_spatial_diagnostics_enhanced(
-                        fold_0['mu_post'],
-                        fold_0['x_true'],
-                        geom.coords,
-                        fold_0['test_idx'],
-                        method_name,
-                        output_path=maps_dir / f"f6_spatial_{method_name.lower().replace('-', '_')}.png"
-                    )
-                    print(f"  ✅ F6 for {method_name} saved")
-                else:
-                    print(f"  ⏭️ F6 for {method_name} skipped (missing data)")
-    except Exception as e:
-        print(f"  ❌ F6 failed: {e}")
-        traceback.print_exc()
-
-    # ========== F7: 性能剖面 + CD图 ==========
-    print("\n📉 F7: Performance Profile & Critical Difference...")
-    try:
-        perf_data = {}
-        for method_name in all_results.keys():
-            perf_data[method_name] = {}
-            for budget in all_results[method_name].keys():
-                instance_key = f"k={budget}"
-                agg = all_results[method_name][budget]['aggregated']
-                perf_data[method_name][instance_key] = agg['expected_loss_gbp']['mean']
-
-        plot_performance_profile(
-            perf_data,
-            metric='expected_loss_gbp',
-            output_path=comparison_dir / "f7a_performance_profile.png",
-            tau_max=3.0
-        )
-
-        plot_critical_difference(
-            perf_data,
-            metric='expected_loss_gbp',
-            output_path=comparison_dir / "f7b_critical_difference.png",
-            alpha=0.05
-        )
-        print("  ✅ F7 saved")
-    except Exception as e:
-        print(f"  ❌ F7 failed: {e}")
-        traceback.print_exc()
-
-    # ========== F8 & F9 ==========
-    print("\n🔬 F8: Ablation Study...")
-    print("  ⏭️ F8 skipped (requires separate experiments)")
-
-    print("\n⏱️ F9: Complexity Analysis...")
-    print("  ⏭️ F9 skipped (requires timing instrumentation)")
-
-    print("\n" + "=" * 60)
-    print("VISUALIZATION COMPLETE")
-    print("=" * 60)
-    print(f"\n📂 All plots saved to: {output_dir}")
-
-
-def run_full_experiment(cfg):
-    """Run complete experimental pipeline."""
-    print("\n" + "="*70)
-    print(" RDT-VoI SIMULATION: FULL EXPERIMENTAL PIPELINE")
-    print("="*70)
-    print(f"\nExperiment: {cfg.experiment.name}")
-    print(f"Random seed: {cfg.experiment.seed}")
-    print(f"Output directory: {cfg.experiment.output_dir}")
-
-    # Create output directory
-    output_dir = create_output_dir(cfg)
-    print(f"\nOutput directory: {output_dir}")
-
-    # Setup visualization
-    setup_style(cfg.plots.style)
-
-    # Run milestones
-    try:
-        # M1: Small-scale validation
-        m1_summary = run_milestone_m1(cfg, output_dir)
-
-        # M2: Full comparison
-        m2_summary, all_results = run_milestone_m2(cfg, output_dir)
-
-        # Final summary
-        print("\n" + "="*70)
-        print(" EXPERIMENT COMPLETE")
-        print("="*70)
-        print(f"\nAll results saved to: {output_dir}")
-        print("\nMilestone Status:")
-        print(f"  M1 (Monotonicity): {'✓ PASS' if m1_summary['monotonic'] else '✗ FAIL'}")
-        print(f"  M1 (Diminishing):  {'✓ PASS' if m1_summary['diminishing'] else '✗ FAIL'}")
-        print(f"  M2 (Improvement):  {'✓ PASS' if m2_summary['passes'] else '✗ FAIL'}")
-
-        # Write final summary
-        final_summary = {
-            'experiment_name': cfg.experiment.name,
-            'timestamp': datetime.now().isoformat(),
-            'milestones': {
-                'M1': m1_summary,
-                'M2': m2_summary
-            },
-            'output_directory': str(output_dir)
-        }
-
-        with open(output_dir / "final_summary.json", 'w', encoding='utf-8') as f:
-            json.dump(final_summary, f, indent=2, cls=NumpyEncoder)
-
-        print(f"\n✓ Summary saved: {output_dir / 'final_summary.json'}")
-
-    except Exception as e:
-        print(f"\n✗ ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-
-        # Save error log
-        with open(output_dir / "error.log", 'w', encoding='utf-8') as f:
-            traceback.print_exc(file=f)
-
-        raise
-
-
 def main():
-    """Main evaluation pipeline."""
+    """主评估流程 - CLI版本"""
 
-    print("=" * 70)
-    print("  RDT-VoI EVALUATION FRAMEWORK")
-    print("=" * 70)
+    # 解析命令行参数
+    args = parse_arguments()
 
-    # ========================================================================
-    # 1. SETUP
-    # ========================================================================
-    print("\n[1] Loading configuration...")
-    cfg = load_config()
+    # 设置输出详细程度
+    verbose = not args.quiet
+
+    if verbose:
+        print("=" * 70)
+        print("  RDT-VoI EVALUATION FRAMEWORK (CLI VERSION)")
+        print("=" * 70)
+
+    # 1. 加载配置
+    if verbose:
+        print(f"\n[1] Loading configuration...")
+
+    # 🔥 场景模式：优先级最高
+    if args.scenario:
+        scenario_upper = args.scenario.upper()
+        cfg = load_scenario_config(scenario_upper)
+        config_path = f"config_{scenario_upper}_{'highstakes' if scenario_upper == 'A' else 'proxy'}.yaml"
+        if verbose:
+            print(f"    ✓ Loaded scenario {scenario_upper} config")
+    elif args.config:
+        cfg = load_config(args.config)
+        config_path = args.config
+        if verbose:
+            print(f"    ✓ Loaded custom config: {args.config}")
+    else:
+        print("ERROR: Must specify either --scenario or --config")
+        print("Examples:")
+        print("  python main.py --scenario A")
+        print("  python main.py --config path/to/config.yaml")
+        sys.exit(1)
+
+    # 应用命令行覆盖
+    if args.seed:
+        cfg.experiment.seed = args.seed
+        if verbose:
+            print(f"    → Override seed: {args.seed}")
+
+    if args.budgets:
+        cfg.selection.budgets = args.budgets
+        if verbose:
+            print(f"    → Override budgets: {args.budgets}")
+
+    if args.methods:
+        cfg.selection.methods = args.methods
+        if verbose:
+            print(f"    → Override methods: {args.methods}")
+
+    # 快速测试模式
+    if args.quick_test:
+        cfg = apply_quick_test_overrides(cfg)
+
     rng = cfg.get_rng()
 
-    # Create output directory
-    output_dir = Path(cfg.experiment.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"    Output directory: {output_dir}")
+    # 检测场景类型
+    scenario = detect_scenario_from_config(cfg)
+    if verbose:
+        print(f"\n    🎯 Detected Scenario: {scenario}")
+        if scenario == 'A':
+            print("       → High-stakes / Near-threshold decision focus")
+        else:
+            print("       → Compute efficiency / Robustness focus")
 
-    # Save config copy
-    cfg.save_to(output_dir)
+    # 🔥 并行处理设置
+    use_parallel = args.parallel
+    n_workers = args.workers
+    if use_parallel and verbose:
+        if n_workers is None:
+            n_workers = max(1, mp.cpu_count() - 1)
+        print(f"\n    ⚡ Parallel processing enabled: {n_workers} workers")
 
-    # ========================================================================
-    # 2. BUILD SPATIAL DOMAIN
-    # ========================================================================
-    print("\n[2] Building spatial domain...")
+    # 2. 创建输出目录
+    output_dir = create_output_dir_from_config(cfg, config_path, args.output)
+    if verbose:
+        print(f"\n[2] Output directory: {output_dir}")
+
+    # 仅可视化模式
+    if args.viz_only:
+        if not args.results_file:
+            print("  ✗ Error: --viz-only requires --results-file")
+            sys.exit(1)
+
+        print(f"\n[VIZ-ONLY] Loading results from: {args.results_file}")
+        with open(args.results_file, 'rb') as f:
+            all_results = pickle.load(f)
+
+        df_results = aggregate_results_for_visualization(all_results)
+        print("  ⚠️  Visualization-only mode: skipping full pipeline")
+        return
+
+    # 3-8. 完整实验流程
+    if verbose:
+        print("\n[3] Building spatial domain...")
     geom = build_grid2d_geometry(cfg.geometry.nx, cfg.geometry.ny, cfg.geometry.h)
 
-    # ========================================================================
-    # 3. CONSTRUCT PRIOR
-    # ========================================================================
-    print("\n[3] Constructing GMRF prior with DDI control...")
+    if verbose:
+        print("\n[4] Constructing GMRF prior with DDI control...")
 
-    # 🔥 如果配置了目标 DDI，使用增强版构建函数
     if hasattr(cfg.decision, 'target_ddi') and cfg.decision.target_ddi > 0:
-        # 先获取阈值
-        from spatial_field import build_prior_with_ddi
-
-        # 临时构建一次先验以获取初始 mu
         Q_temp, mu_temp = build_prior(geom, cfg.prior)
         tau = cfg.decision.get_threshold(mu_temp)
-
-        print(f"    Target DDI: {cfg.decision.target_ddi:.2%}")
-        print(f"    Decision threshold: τ = {tau:.3f}")
-
-        # 使用 DDI 控制重新构建
+        if verbose:
+            print(f"    Target DDI: {cfg.decision.target_ddi:.2%}")
+            print(f"    Decision threshold: τ = {tau:.3f}")
         Q_pr, mu_pr = build_prior_with_ddi(
-            geom, cfg.prior,
-            tau=tau,
-            target_ddi=cfg.decision.target_ddi
+            geom, cfg.prior, tau=tau, target_ddi=cfg.decision.target_ddi
         )
     else:
         Q_pr, mu_pr = build_prior(geom, cfg.prior)
 
-    # 绘制 DDI 热力图
-    if cfg.plots.ddi_overlay.get('enable', True):
+    if cfg.plots.ddi_overlay.get('enable', True) and verbose:
         from spatial_field import plot_ddi_heatmap, compute_ddi
         from inference import SparseFactor, compute_posterior_variance_diagonal
-
-        # 估计先验标准差
         factor = SparseFactor(Q_pr)
         sample_idx = rng.choice(geom.n, size=min(100, geom.n), replace=False)
         sample_vars = compute_posterior_variance_diagonal(factor, sample_idx)
         sigma_est = np.sqrt(np.mean(sample_vars)) * np.ones(geom.n)
-
         tau = cfg.decision.get_threshold(mu_pr)
+        plot_ddi_heatmap(geom, mu_pr, sigma_est, tau,
+                        output_path=output_dir / 'ddi_heatmap_prior.png')
 
-        plot_ddi_heatmap(
-            geom, mu_pr, sigma_est, tau,
-            output_path=output_dir / 'ddi_heatmap_prior.png'
-        )
-    print(f"    Precision sparsity: {Q_pr.nnz / geom.n ** 2 * 100:.2f}%")
-    print(f"    Correlation length: {cfg.prior.correlation_length:.1f} m")
+    if verbose:
+        print(f"    Precision sparsity: {Q_pr.nnz / geom.n ** 2 * 100:.2f}%")
+        print(f"    Correlation length: {cfg.prior.correlation_length:.1f} m")
 
-    # ========================================================================
-    # 4. SAMPLE TRUE STATE
-    # ========================================================================
-    print("\n[4] Sampling true deterioration state...")
+    if verbose:
+        print("\n[5] Sampling true deterioration state...")
     x_true = sample_gmrf(Q_pr, mu_pr, rng)
-    print(f"    State range: [{x_true.min():.2f}, {x_true.max():.2f}]")
-    print(f"    Mean: {x_true.mean():.2f}, Std: {x_true.std():.2f}")
-
-    # Save true state
+    if verbose:
+        print(f"    State range: [{x_true.min():.2f}, {x_true.max():.2f}]")
+        print(f"    Mean: {x_true.mean():.2f}, Std: {x_true.std():.2f}")
     np.save(output_dir / 'x_true.npy', x_true)
 
-    # ========================================================================
-    # 5. GENERATE SENSOR POOL
-    # ========================================================================
-    print("\n[5] Generating sensor pool...")
-
+    if verbose:
+        print("\n[6] Generating sensor pool...")
     if cfg.sensors.use_heterogeneous:
-        # 🔥 使用异质化传感器生成
         from sensors import generate_heterogeneous_sensor_pool, create_cost_zones_example
-
         if cfg.sensors.cost_zones:
             cost_zones = cfg.sensors.cost_zones
         else:
             cost_zones = create_cost_zones_example(geom)
-
         sensors = generate_heterogeneous_sensor_pool(
-            geom, cfg.sensors,
-            cost_zones=cost_zones,
-            rng=rng
+            geom, cfg.sensors, cost_zones=cost_zones, rng=rng
         )
     else:
         sensors = generate_sensor_pool(geom, cfg.sensors, rng)
 
-    # ========================================================================
-    # 6. PREPARE TEST SET (for EVI and diagnostics)
-    # ========================================================================
-    print("\n[6] Preparing global test set for EVI...")
+    if verbose:
+        print("\n[7] Preparing global test set for EVI...")
     n_test = min(200, geom.n)
     test_idx_global = rng.choice(geom.n, size=n_test, replace=False)
-    print(f"    Test set size: {n_test}")
+    if verbose:
+        print(f"    Test set size: {n_test}")
 
-    # ========================================================================
-    # 7. RUN METHOD EVALUATIONS
-    # ========================================================================
-    print("\n[7] Running method evaluations...")
-
+    if verbose:
+        print("\n[8] Running method evaluations...")
     methods = get_available_methods(cfg)
-    print(f"    Methods to evaluate: {', '.join(methods)}")
+    if verbose:
+        print(f"    Methods to evaluate: {', '.join(methods)}")
 
     all_results = {}
-
     for method_name in methods:
-        t_method_start = time.time()
-
+        t_method_start = datetime.now()
         try:
             results = run_method_evaluation(
                 method_name=method_name,
-                cfg=cfg,  # 🔥 确保参数名与函数定义匹配
+                cfg=cfg,
                 geom=geom,
                 Q_pr=Q_pr,
                 mu_pr=mu_pr,
                 x_true=x_true,
                 sensors=sensors,
-                test_idx_global=test_idx_global
+                test_idx_global=test_idx_global,
+                use_parallel=use_parallel,  # 🔥 传递并行参数
+                n_workers=n_workers,
+                verbose=verbose
             )
             all_results[method_name] = results
-
-            t_method_elapsed = time.time() - t_method_start
-            print(f"\n  ✓ {method_name} completed in {t_method_elapsed:.1f}s")
-
+            t_method_elapsed = (datetime.now() - t_method_start).total_seconds()
+            if verbose:
+                print(f"\n  ✓ {method_name} completed in {t_method_elapsed:.1f}s")
         except Exception as e:
-            print(f"\n  ✗ {method_name} FAILED: {str(e)}")
+            if verbose:
+                print(f"\n  ✗ {method_name} FAILED: {str(e)}")
             warnings.warn(f"Method {method_name} failed: {str(e)}")
             import traceback
             traceback.print_exc()
             continue
 
-    # ========================================================================
-    # 8. SAVE RESULTS
-    # ========================================================================
-    print("\n[8] Saving results...")
-
-    # Save raw results
+    # 9. 保存结果
+    if verbose:
+        print("\n[9] Saving results...")
     with open(output_dir / 'results_raw.pkl', 'wb') as f:
         pickle.dump(all_results, f)
-    print(f"    Saved: results_raw.pkl")
+    if verbose:
+        print(f"    Saved: results_raw.pkl")
 
-    # 🔥 Convert to DataFrame with error handling
-    print("    Converting results to DataFrame...")
+    if verbose:
+        print("    Converting results to DataFrame...")
     try:
         df_results = aggregate_results_for_visualization(all_results)
-
         if df_results.empty:
-            print("    ⚠️  Warning: No results to aggregate (all methods may have failed)")
+            if verbose:
+                print("    ⚠️  Warning: No results to aggregate")
         else:
             df_results.to_csv(output_dir / 'results_aggregated.csv', index=False)
-            print(f"    Saved: results_aggregated.csv ({len(df_results)} rows)")
+            if verbose:
+                print(f"    Saved: results_aggregated.csv ({len(df_results)} rows)")
     except Exception as e:
-        print(f"    ✗ Failed to create aggregated DataFrame: {e}")
-        df_results = pd.DataFrame()  # Empty DataFrame
+        if verbose:
+            print(f"    ✗ Failed to create aggregated DataFrame: {e}")
+        df_results = pd.DataFrame()
 
-    # ========================================================================
-    # 9. VISUALIZATION
-    # ========================================================================
-    print("\n[9] Generating visualizations...")
+    # 10. 可视化
+    if not args.skip_viz and not df_results.empty:
+        if verbose:
+            print("\n[10] Generating visualizations...")
+        plots_dir = output_dir / 'plots'
+        plots_dir.mkdir(exist_ok=True)
 
-    plots_dir = output_dir / 'plots'
-    plots_dir.mkdir(exist_ok=True)
-
-    # 🔥 只有在有数据时才尝试可视化
-    if df_results.empty:
-        print("    ⚠️  Skipping visualization: no data available")
-    else:
         try:
-            # F1: Budget-performance curves
-            print("    [F1] Budget-performance curves...")
-            try:
-                fig = plot_budget_curves(
-                    df_results,
-                    output_dir=plots_dir,
-                    config=cfg
-                )
-                if fig:
-                    plt.close(fig)
-            except Exception as e:
-                print(f"      Skipped: {e}")
-
-            # F2: Marginal efficiency
-            print("    [F2] Marginal efficiency...")
-            try:
-                fig = plot_marginal_efficiency(
-                    all_results,
-                    output_dir=plots_dir,
-                    config=cfg
-                )
-                if fig:
-                    plt.close(fig)
-            except Exception as e:
-                print(f"      Skipped: {e}")
-
-            # F7a: Performance profile
-            print("    [F7a] Performance profile...")
-            try:
-                fig = plot_performance_profile(
-                    df_results,
-                    metric='expected_loss_gbp',
-                    output_dir=plots_dir,
-                    config=cfg
-                )
-                if fig:
-                    plt.close(fig)
-            except Exception as e:
-                print(f"      Skipped: {e}")
-
-            # F7b: Critical difference diagram
-            print("    [F7b] Critical difference diagram...")
-            try:
-                fig = plot_critical_difference(
-                    df_results,
-                    metric='expected_loss_gbp',
-                    output_dir=plots_dir,
-                    config=cfg
-                )
-                if fig:
-                    plt.close(fig)
-            except Exception as e:
-                print(f"      Skipped: {e}")
-
-            # F4: MI-EVI correlation (if both methods ran)
-            if 'greedy_mi' in all_results and 'greedy_evi' in all_results:
-                print("    [F4] MI-EVI correlation...")
-                try:
-                    fig = plot_mi_evi_correlation(
-                        all_results['greedy_mi'],
-                        all_results['greedy_evi'],
-                        output_dir=plots_dir,
-                        config=cfg
-                    )
-                    if fig:
-                        plt.close(fig)
-                except Exception as e:
-                    print(f"      Skipped: {e}")
-
-            # F5: Calibration diagnostics
-            print("    [F5] Calibration diagnostics...")
-            try:
-                fig = plot_calibration_diagnostics(
-                    all_results,
-                    output_dir=plots_dir,
-                    config=cfg
-                )
-                if fig:
-                    plt.close(fig)
-            except Exception as e:
-                print(f"      Skipped: {e}")
-
-            print(f"    ✓ Visualization complete")
-
+            generate_all_visualizations_v2(
+                all_results=all_results,
+                df_results=df_results,
+                geom=geom,
+                sensors=sensors,
+                Q_pr=Q_pr,
+                mu_pr=mu_pr,
+                output_dir=output_dir,
+                config=cfg,
+                scenario=scenario
+            )
+            if verbose:
+                print(f"    ✓ Visualization complete")
         except Exception as e:
-            print(f"    ✗ Visualization phase failed: {str(e)}")
+            if verbose:
+                print(f"    ✗ Visualization phase failed: {str(e)}")
             import traceback
             traceback.print_exc()
+    elif args.skip_viz:
+        if verbose:
+            print("\n[10] Skipping visualization (--skip-viz)")
 
-    generate_expert_plots(
-        all_results=all_results,
-        sensors=sensors,
-        geom=geom,
-        Q_pr=Q_pr,
-        output_dir=output_dir,
-        config=cfg
-    )
-    # ========================================================================
-    # 10. SUMMARY REPORT
-    # ========================================================================
-    print("\n" + "=" * 70)
-    print("  EVALUATION COMPLETE")
-    print("=" * 70)
-
-    print("\nSummary:")
-    print(f"  Methods attempted: {len(methods)}")
-    print(f"  Methods completed: {len(all_results)}")
-    print(f"  Budgets: {cfg.selection.budgets}")
-    print(f"  CV folds: {cfg.cv.k_folds}")
-    print(f"  Total domain size: {geom.n}")
-    print(f"  Candidate pool: {len(sensors)}")
-
-    print(f"\nResults saved to: {output_dir}")
-    print(f"  - results_raw.pkl")
-    if not df_results.empty:
-        print(f"  - results_aggregated.csv")
-        print(f"  - plots/ directory")
-
-    # Print best method per metric (if data available)
-    if not df_results.empty and 30 in cfg.selection.budgets:
-        print("\nBest methods (at k=30):")
-        for metric in ['rmse', 'expected_loss_gbp', 'coverage_90']:
-            try:
-                df_k30 = df_results[
-                    (df_results['budget'] == 30) &
-                    (df_results['metric'] == metric)
-                    ]
-                if not df_k30.empty:
-                    if metric == 'coverage_90':
-                        # Closer to 0.90 is better
-                        df_k30 = df_k30.copy()
-                        df_k30['score'] = -np.abs(df_k30['mean'] - 0.90)
-                        best_row = df_k30.loc[df_k30['score'].idxmax()]
-                    else:
-                        # Lower is better
-                        best_row = df_k30.loc[df_k30['mean'].idxmin()]
-                    print(f"  {metric:20s}: {best_row['method']:15s} "
-                          f"({best_row['mean']:.3f} ± {best_row['std']:.3f})")
-            except Exception:
-                pass
-
-    print("\n" + "=" * 70)
+    # 总结
+    if verbose:
+        print("\n" + "=" * 70)
+        print(f"  EVALUATION COMPLETE - SCENARIO {scenario}")
+        print("=" * 70)
+        print("\nSummary:")
+        print(f"  Scenario: {scenario}")
+        print(f"  Config: {config_path}")
+        print(f"  Methods completed: {len(all_results)}/{len(methods)}")
+        print(f"  Budgets: {cfg.selection.budgets}")
+        print(f"  CV folds: {cfg.cv.k_folds}")
+        if use_parallel:
+            print(f"  Parallel workers: {n_workers}")
+        print(f"\nResults saved to: {output_dir}")
+        print("=" * 70)
 
 
 if __name__ == "__main__":

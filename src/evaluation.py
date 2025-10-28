@@ -538,13 +538,13 @@ def run_cv_experiment(geom, Q_pr, mu_pr, x_true, sensors,
 
 
 if __name__ == "__main__":
-    from config import load_config
+    from config import load_scenario_config  # ✅ 改用场景加载
     from geometry import build_grid2d_geometry
     from spatial_field import build_prior, sample_gmrf
     from sensors import generate_sensor_pool
     from selection import greedy_mi
 
-    cfg = load_config()
+    cfg = load_scenario_config('A')  # ✅ 明确指定场景
     rng = cfg.get_rng()
 
     # Setup

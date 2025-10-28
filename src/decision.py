@@ -383,7 +383,7 @@ def evi_unscented(Q_pr, mu_pr, H, R_diag, decision_config,
 
 
 if __name__ == "__main__":
-    from config import load_config
+
     from geometry import build_grid2d_geometry
     from spatial_field import build_prior, sample_gmrf
     from sensors import generate_sensor_pool
@@ -393,7 +393,8 @@ if __name__ == "__main__":
     print("  TESTING FIXED EVI COMPUTATION")
     print("=" * 70)
 
-    cfg = load_config()
+    from config import load_scenario_config
+    cfg = load_scenario_config('A')
     rng = cfg.get_rng()
 
     # Setup

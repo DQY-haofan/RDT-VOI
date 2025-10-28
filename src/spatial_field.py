@@ -523,10 +523,10 @@ def validate_prior(Q: sp.spmatrix, mu: np.ndarray,
 
 if __name__ == "__main__":
     # 测试非平稳先验
-    from config import load_config
     from geometry import build_grid2d_geometry
 
-    cfg = load_config()
+    from config import load_scenario_config
+    cfg = load_scenario_config('A')
     geom = build_grid2d_geometry(20, 20, h=cfg.geometry.h)
 
     Q_pr, mu_pr = build_prior(geom, cfg.prior)

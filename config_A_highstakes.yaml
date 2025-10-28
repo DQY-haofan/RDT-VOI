@@ -1,0 +1,303 @@
+# ============================================================================
+# RDT-VoI Configuration - SCENARIO A: HIGH-STAKES
+# 场景 A：高风险/近阈值决策 - 凸显 EVI 优势
+#
+# 核心特征：
+#   - 高 DDI (0.20-0.35): 大量像元处于决策临界区
+#   - 强不对称代价 (FN:FP = 25:1): 漏检代价远高于误报
+#   - 稀疏候选池 (20%): 选点难度大
+#   - 行动受限 (K_action=10): 维护预算紧张
+#
+# 预期结果：EVI 在期望损失、ROI、Top-K 命中率上显著领先 MI
+# ============================================================================
+
+experiment:
+  name: "rdt_voi_A_highstakes"
+  seed: 42
+  output_dir: "results/A_highstakes"
+
+# ----------------------------------------------------------------------------
+# Numerical Settings
+# ----------------------------------------------------------------------------
+numerics:
+  linear_solver_tol: 1.0e-8
+  cholesky_nugget: 1.0e-6
+  pcg_max_iter: 500
+  logdet_method: "cholmod"
+
+# ----------------------------------------------------------------------------
+# Spatial Domain (20x20 网格，总 400 像元)
+# ----------------------------------------------------------------------------
+geometry:
+  mode: "grid2d"
+  nx: 20
+  ny: 20
+  h: 5.0
+
+# ----------------------------------------------------------------------------
+# Prior Distribution (GMRF/SPDE) - 保持高方差热点
+# ----------------------------------------------------------------------------
+prior:
+  nu: 1.0
+  kappa: 0.10
+  sigma2: 0.30
+  alpha: 2
+  beta: 1.0e-6
+  mu_prior_mean: 2.2
+  mu_prior_std: 0.3
+
+  beta_base: 5.0
+  beta_hot: 1.0e-4
+
+  hotspots:
+    - center_m: [25, 75]
+      radius_m: 20
+    - center_m: [75, 25]
+      radius_m: 25
+    - center_m: [50, 50]
+      radius_m: 15
+
+# ----------------------------------------------------------------------------
+# Sensor Pool Configuration - 🔥 稀疏池（20%）
+# ----------------------------------------------------------------------------
+sensors:
+  types:
+    - name: smartphone
+      noise_std: 0.50
+      cost_gbp: 30
+      footprint: point
+
+    - name: "basic_point"
+      noise_std: 0.15
+      cost_gbp: 150
+      footprint: "point"
+
+    - name: "laser_profiler"
+      noise_std: 0.05
+      cost_gbp: 800
+      footprint: "point"
+
+    - name: photogrammetry
+      noise_std: 0.25
+      cost_gbp: 100
+      footprint: avg3x3
+
+    - name: "vehicle_avg"
+      noise_std: 0.35
+      cost_gbp: 100
+      footprint: "avg5x5"
+
+    - name: inertial_profiler
+      noise_std: 0.15
+      cost_gbp: 300
+      footprint: avg3x3
+
+  pool_strategy: "grid_subsample"
+  pool_fraction: 0.20  # 🔥 稀疏池：仅 80 个候选位置（400×0.2）
+  type_mix: [0.3, 0.4, 0.3]
+
+  use_heterogeneous: true
+  cost_zones:
+    - center_m: [100, 100]
+      radius_m: 50
+      cost_multiplier: 1.5
+      noise_multiplier: 0.8
+      allowed_types: ['inertial_profiler', 'photogrammetry']
+
+# ----------------------------------------------------------------------------
+# Decision Model - 🔥 高风险参数
+# ----------------------------------------------------------------------------
+decision:
+  tau_iri: null
+  tau_quantile: 0.85  # 🔥 高分位阈值，提升 DDI 但避免 100%
+
+  # 🔥 强不对称代价比 (25:1)
+  L_FP_gbp: 5000.0      # 误报：浪费维护资源
+  L_FN_gbp: 125000.0    # 🔥 漏检：路段失修导致事故/诉讼
+  L_TP_gbp: 800.0       # 正确维护的成本
+  L_TN_gbp: 0.0
+
+  target_ddi: 0.25      # 🎯 目标 DDI: 25%（配合逐点 σ 计算）
+  K_action: 10          # 🔥 行动受限：最多维护 10 个位置
+
+# ----------------------------------------------------------------------------
+# Sensor Selection Methods - 🔥 前段预算密集
+# ----------------------------------------------------------------------------
+selection:
+  methods:
+    - greedy_evi
+    - greedy_mi
+    - greedy_aopt
+    - maxmin
+    - uniform
+    - random
+
+  budget_type: "count"
+  budgets: [3, 5, 10, 15, 20]  # 🔥 前段密集，差距更明显
+
+  greedy_mi:
+    batch_size: 1
+    adaptive_pruning: true
+    prune_threshold: 0.10
+    use_cost: true
+
+  greedy_aopt:
+    n_probes: 32
+    use_cost: true
+
+  greedy_evi:
+    n_y_samples: 0        # 🔥 解析法（更快）
+    use_cost: true
+    mi_prescreen: true
+    keep_fraction: 0.50   # 🔥 预筛 50%，平衡精度与速度
+
+  maxmin:
+    use_cost: true
+
+# ----------------------------------------------------------------------------
+# Expected Value of Information - 🔥 足够样本确保稳定
+# ----------------------------------------------------------------------------
+evi:
+  compute_for: ["greedy_mi", "greedy_aopt", "greedy_evi"]
+  method: "monte_carlo"
+  monte_carlo_samples: 32  # 🔥 32 样本：够稳又不过慢
+
+# ----------------------------------------------------------------------------
+# Cross-Validation
+# ----------------------------------------------------------------------------
+cv:
+  scheme: "spatial_block"
+  k_folds: 3
+  buffer_width_multiplier: 1.5
+  block_strategy: "kmeans"
+  ensure_connected: true
+  morans_permutations: 999
+
+# ----------------------------------------------------------------------------
+# Uncertainty Quantification
+# ----------------------------------------------------------------------------
+uq:
+  bootstrap_method: "spatial_block"
+  bootstrap_samples: 1000
+  confidence_level: 0.95
+  coverage_percentile: 90
+  compute_crps: true
+
+# ----------------------------------------------------------------------------
+# Diagnostics
+# ----------------------------------------------------------------------------
+diagnostics:
+  morans_i:
+    compute: true
+    permutations: 999
+    alpha: 0.05
+
+  calibration:
+    pit_histogram: true
+    coverage_curves: true
+    reliability_diagram: true
+
+# ----------------------------------------------------------------------------
+# 🔥 Visualization - 突出 EVI 的业务价值优势
+# ----------------------------------------------------------------------------
+plots:
+  save_formats: [png, pdf]
+  dpi: 300
+  style: "seaborn-v0_8-paper"
+
+  budget_curves:
+    metrics: ["rmse", "expected_loss_gbp", "coverage_90"]
+    show_confidence: true
+    confidence_level: 0.95
+
+  performance_profile:
+    tau_values: [1.0, 1.05, 1.1, 1.2, 1.5, 2.0, 3.0]
+    use_budget_fold_instances: true
+
+  critical_difference:
+    alpha: 0.05
+    test: "nemenyi"
+
+  business_metrics:
+    enable: true
+    baseline_method: "uniform"
+    show_savings: true      # 🔥 显示 EVI 相对 MI 的省钱幅度
+    show_roi: true          # 🔥 显示投资回报率
+    show_cost_efficiency: true
+
+  effect_size:
+    enable: true
+    plot_heatmaps: true
+    plot_pairwise_table: true
+    top_k_comparisons: 20
+
+  critical_region:
+    enable: true
+    epsilon: 0.2
+    plot_heatmap: true
+
+  expert_plots:
+    enable_all: true
+
+    marginal_efficiency:
+      enable: true
+      normalize_by_cost: true
+      unit: "gbp_per_test_point"
+
+    type_composition:
+      enable: true
+      show_cost_breakdown: true
+
+    mi_voi_correlation:
+      enable: true
+      methods: ["greedy_mi", "greedy_evi"]
+
+    calibration_plots:
+      enable: true
+
+    spatial_diagnostics:
+      enable: true
+      show_morans_i: true
+
+    sensor_placement_map:
+      enable: true
+      budgets_to_show: [5, 10, 15, 20]
+
+    roi_curves:
+      enable: true  # 🔥 ROI 曲线：EVI 应更陡峭
+
+    robustness_heatmap:
+      enable: false  # 场景 A 不强调鲁棒性
+
+    ddi_overlay:
+      enable: true  # 🔥 叠加 EVI vs MI 的选点分布
+
+# ----------------------------------------------------------------------------
+# Acceptance Criteria
+# ----------------------------------------------------------------------------
+acceptance:
+  m1_grid_size: 100
+  m1_budgets: [5, 10, 20]
+  m1_check_monotonic: true
+  m1_check_diminishing: true
+
+  m2_min_improvement_vs_random: 0.15
+  m2_confidence_level: 0.95
+
+  m3_small_instance_n: 25
+  m3_small_instance_k: 5
+  m3_max_suboptimality: 0.10
+
+  m4_morans_alpha: 0.05
+  m4_coverage_tolerance: 0.10
+  m4_msse_tolerance: 0.25
+
+# ============================================================================
+# 场景 A 预期结果
+# ============================================================================
+# 1. EVI 期望损失比 MI 低 8-15%（在 n=5-15 段）
+# 2. EVI 的 ROI 曲线更陡峭（单位传感器成本的损失降低更大）
+# 3. Top-K=10 命中率：EVI 在真正高风险区域的覆盖率更高
+# 4. DDI 热图显示：EVI 选点更集中在 τ±0.2 的临界区
+# 5. Critical Difference 图：EVI 与 MI 达到统计显著性（p<0.05）
+# ============================================================================
