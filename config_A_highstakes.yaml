@@ -39,8 +39,8 @@ geometry:
 # ----------------------------------------------------------------------------
 prior:
   nu: 1.0
-  kappa: 0.10
-  sigma2: 0.30
+  kappa: 0.12
+  sigma2: 0.25
   alpha: 2
   beta: 1.0e-6
   mu_prior_mean: 2.2
@@ -69,27 +69,27 @@ sensors:
       footprint: point
 
     - name: "basic_point"
-      noise_std: 0.15
+      noise_std: 0.12
       cost_gbp: 150
       footprint: "point"
 
     - name: "laser_profiler"
-      noise_std: 0.05
+      noise_std: 0.035
       cost_gbp: 800
       footprint: "point"
 
     - name: photogrammetry
-      noise_std: 0.25
+      noise_std: 0.20
       cost_gbp: 100
       footprint: avg3x3
 
     - name: "vehicle_avg"
-      noise_std: 0.35
+      noise_std: 0.30
       cost_gbp: 100
       footprint: "avg5x5"
 
     - name: inertial_profiler
-      noise_std: 0.15
+      noise_std: 0.12
       cost_gbp: 300
       footprint: avg3x3
 

@@ -1517,6 +1517,205 @@ def plot_effect_size_heatmaps(delta_matrix: np.ndarray,
 # ============================================================================
 # 统一的可视化生成函数（供 main.py 调用）
 # ============================================================================
+def plot_mi_evi_correlation_stratified_v2(mi_results: Dict,
+                                          evi_results: Dict,
+                                          mu_pr: np.ndarray,
+                                          tau: float,
+                                          sigma_pr: np.ndarray,
+                                          output_dir: Path = None,
+                                          config=None) -> Optional[plt.Figure]:
+    """
+    ✅ 修复版：MI vs EVI 相关性（分层 + 扩大样本）
+
+    关键改进：
+    1. 收集所有 budget × fold × step 的边际增益对
+    2. 添加回归带和置信区间
+    3. 分层分析：near-threshold vs far-from-threshold
+    """
+    import warnings
+    import numpy as np
+    from scipy.stats import pearsonr, spearmanr
+    from numpy.polynomial import Polynomial
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    # 🔥 扩大样本：收集所有 (ΔMI, ΔEVI) 对
+    mi_gains_all = []
+    evi_gains_all = []
+    near_threshold_flags = []  # 是否在近阈值区域
+
+    mi_budgets = set(mi_results.get('budgets', {}).keys())
+    evi_budgets = set(evi_results.get('budgets', {}).keys())
+    common_budgets = mi_budgets & evi_budgets
+
+    if not common_budgets:
+        warnings.warn("No common budgets for MI-EVI correlation")
+        return None
+
+    print(f"  Collecting marginal gains from {len(common_budgets)} budgets...")
+
+    # 定义近阈值带：|μ - τ| ≤ 1.0σ
+    threshold_band = 1.0
+
+    for budget in sorted(common_budgets):
+        mi_budget_data = mi_results['budgets'][budget]
+        evi_budget_data = evi_results['budgets'][budget]
+
+        mi_folds = mi_budget_data.get('fold_results', [])
+        evi_folds = evi_budget_data.get('fold_results', [])
+
+        for mi_fold, evi_fold in zip(mi_folds, evi_folds):
+            if not (mi_fold.get('success') and evi_fold.get('success')):
+                continue
+
+            mi_sel = mi_fold.get('selection_result')
+            evi_sel = evi_fold.get('selection_result')
+
+            if mi_sel and evi_sel:
+                mi_gains = getattr(mi_sel, 'marginal_gains', [])
+                evi_gains = getattr(evi_sel, 'marginal_gains', [])
+                mi_ids = getattr(mi_sel, 'selected_ids', [])
+                evi_ids = getattr(evi_sel, 'selected_ids', [])
+
+                # 🔥 收集每一步的边际增益对
+                min_len = min(len(mi_gains), len(evi_gains), len(mi_ids), len(evi_ids))
+                for i in range(min_len):
+                    mi_gains_all.append(mi_gains[i])
+                    evi_gains_all.append(evi_gains[i])
+
+                    # 判断该传感器是否在近阈值区域
+                    # 简化：使用先验均值判断（理想情况应使用传感器位置的 μ_pr）
+                    try:
+                        sensor_loc = mi_ids[i]  # 假设ID对应位置索引
+                        if sensor_loc < len(mu_pr):
+                            gap = abs(mu_pr[sensor_loc] - tau)
+                            is_near = gap <= threshold_band * sigma_pr[sensor_loc]
+                        else:
+                            is_near = False
+                    except:
+                        is_near = False
+
+                    near_threshold_flags.append(is_near)
+
+    if len(mi_gains_all) < 10:
+        warnings.warn(f"Insufficient data for correlation plot (n={len(mi_gains_all)})")
+        return None
+
+    mi_gains_all = np.array(mi_gains_all)
+    evi_gains_all = np.array(evi_gains_all)
+    near_threshold_flags = np.array(near_threshold_flags)
+
+    print(f"  ✓ Collected {len(mi_gains_all)} marginal gain pairs")
+    print(f"    Near-threshold: {near_threshold_flags.sum()} ({near_threshold_flags.mean() * 100:.1f}%)")
+
+    # 创建图形
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+    # ========== 左图：整体相关性 + 回归带 ==========
+    ax1.scatter(mi_gains_all, evi_gains_all, alpha=0.4, s=30,
+                c='steelblue', edgecolors='black', linewidth=0.3)
+
+    # 拟合回归线 + 置信区间
+    try:
+        from scipy import stats
+
+        # 线性回归
+        slope, intercept, r_value, p_value, std_err = stats.linregress(mi_gains_all, evi_gains_all)
+        x_fit = np.linspace(mi_gains_all.min(), mi_gains_all.max(), 100)
+        y_fit = slope * x_fit + intercept
+
+        ax1.plot(x_fit, y_fit, 'r-', linewidth=2.5, label='Linear Fit', zorder=10)
+
+        # 95% 置信区间（简化：基于残差标准误）
+        residuals = evi_gains_all - (slope * mi_gains_all + intercept)
+        se = np.sqrt(np.sum(residuals ** 2) / (len(residuals) - 2))
+
+        # 预测区间（approximate）
+        margin = 1.96 * se
+        ax1.fill_between(x_fit, y_fit - margin, y_fit + margin,
+                         alpha=0.2, color='red', label='95% CI')
+    except Exception as e:
+        warnings.warn(f"Regression fit failed: {e}")
+
+    # 相关系数
+    try:
+        r_pearson, p_pearson = pearsonr(mi_gains_all, evi_gains_all)
+        r_spearman, p_spearman = spearmanr(mi_gains_all, evi_gains_all)
+
+        textstr = f'Pearson $r$ = {r_pearson:.3f} (p={p_pearson:.3e})\n'
+        textstr += f'Spearman $\\rho$ = {r_spearman:.3f} (p={p_spearman:.3e})\n'
+        textstr += f'$R^2$ = {r_pearson ** 2:.3f}\n'
+        textstr += f'n = {len(mi_gains_all)} pairs'
+
+        props = dict(boxstyle='round', facecolor='wheat', alpha=0.9)
+        ax1.text(0.05, 0.95, textstr, transform=ax1.transAxes, fontsize=10,
+                 verticalalignment='top', bbox=props)
+    except Exception as e:
+        warnings.warn(f"Correlation computation failed: {e}")
+
+    ax1.set_xlabel('MI Marginal Gain (nats)', fontweight='bold', fontsize=11)
+    ax1.set_ylabel('EVI Marginal Gain (£)', fontweight='bold', fontsize=11)
+    ax1.set_title('Overall Correlation (All Steps, All Budgets, All Folds)',
+                  fontsize=12, fontweight='bold')
+    ax1.legend(fontsize=9, loc='lower right')
+    ax1.grid(True, alpha=0.3)
+
+    # ========== 右图：分层相关性（near vs far threshold）==========
+    near_mask = near_threshold_flags
+    far_mask = ~near_threshold_flags
+
+    if near_mask.sum() > 0:
+        ax2.scatter(mi_gains_all[near_mask], evi_gains_all[near_mask],
+                    alpha=0.6, s=50, c='red', label=f'Near threshold (n={near_mask.sum()})',
+                    edgecolors='black', linewidth=0.5)
+
+    if far_mask.sum() > 0:
+        ax2.scatter(mi_gains_all[far_mask], evi_gains_all[far_mask],
+                    alpha=0.6, s=50, c='blue', label=f'Far from threshold (n={far_mask.sum()})',
+                    edgecolors='black', linewidth=0.5)
+
+    # 分别计算相关性
+    try:
+        textstr_lines = []
+
+        if near_mask.sum() > 2:
+            r_near, p_near = pearsonr(mi_gains_all[near_mask], evi_gains_all[near_mask])
+            textstr_lines.append(f'Near-threshold: $r$ = {r_near:.3f} (p={p_near:.2e})')
+        else:
+            textstr_lines.append(f'Near-threshold: n={near_mask.sum()} (insufficient)')
+
+        if far_mask.sum() > 2:
+            r_far, p_far = pearsonr(mi_gains_all[far_mask], evi_gains_all[far_mask])
+            textstr_lines.append(f'Far-threshold: $r$ = {r_far:.3f} (p={p_far:.2e})')
+        else:
+            textstr_lines.append(f'Far-threshold: n={far_mask.sum()} (insufficient)')
+
+        if near_mask.sum() > 2 and far_mask.sum() > 2:
+            textstr_lines.append(f'Δr = {abs(r_near - r_far):.3f}')
+
+        textstr = '\n'.join(textstr_lines)
+        props = dict(boxstyle='round', facecolor='wheat', alpha=0.9)
+        ax2.text(0.05, 0.95, textstr, transform=ax2.transAxes, fontsize=10,
+                 verticalalignment='top', bbox=props)
+    except Exception as e:
+        warnings.warn(f"Stratified correlation failed: {e}")
+
+    ax2.set_xlabel('MI Marginal Gain (nats)', fontweight='bold', fontsize=11)
+    ax2.set_ylabel('EVI Marginal Gain (£)', fontweight='bold', fontsize=11)
+    ax2.set_title('Stratified Correlation\n(By Distance to Threshold)',
+                  fontsize=12, fontweight='bold')
+    ax2.legend(fontsize=9, loc='best')
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    if output_dir:
+        for fmt in ['png', 'pdf']:
+            save_path = output_dir / f'f4_mi_evi_correlation_v2.{fmt}'
+            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"  ✓ Saved: {save_path.name}")
+
+    return fig
 
 def generate_all_visualizations_v2(all_results: Dict,
                                    df_results: pd.DataFrame,
@@ -1530,8 +1729,7 @@ def generate_all_visualizations_v2(all_results: Dict,
     """
     统一生成所有可视化（V2 - 支持场景切换）
 
-    Args:
-        scenario: 'A' (高风险) 或 'B' (算力/鲁棒性)
+    ✅ 修复：使用逐像元先验方差，避免 DDI=100% 问题
     """
     print("\n" + "=" * 70)
     print(f"  GENERATING VISUALIZATIONS - SCENARIO {scenario}")
@@ -1545,13 +1743,38 @@ def generate_all_visualizations_v2(all_results: Dict,
     # 获取决策阈值
     tau = config.decision.get_threshold(mu_pr)
 
-    # 估计先验标准差
+    # 🔥 修复：计算逐像元先验标准差（不再使用均值常数）
     from inference import SparseFactor, compute_posterior_variance_diagonal
+
     factor_pr = SparseFactor(Q_pr)
-    sample_idx = np.random.choice(geom.n, size=min(100, geom.n), replace=False)
-    sample_vars = compute_posterior_variance_diagonal(factor_pr, sample_idx)
-    sigma_pr_mean = np.sqrt(np.mean(sample_vars))
-    sigma_pr = np.full(geom.n, sigma_pr_mean)
+
+    # ✅ 关键修复：计算所有像元的方差（或大批量）
+    if geom.n <= 1000:
+        # 小域：直接计算所有像元
+        sample_idx = np.arange(geom.n)
+        sample_vars = compute_posterior_variance_diagonal(factor_pr, sample_idx)
+        sigma_pr = np.sqrt(np.maximum(sample_vars, 1e-12))
+        print(f"  ✓ Computed per-pixel prior std for all {geom.n} pixels")
+    else:
+        # 大域：分批计算
+        print(f"  Computing per-pixel prior std (n={geom.n})...")
+        batch_size = 200
+        sigma_pr = np.zeros(geom.n)
+        for i in range(0, geom.n, batch_size):
+            batch_idx = np.arange(i, min(i + batch_size, geom.n))
+            batch_vars = compute_posterior_variance_diagonal(factor_pr, batch_idx)
+            sigma_pr[batch_idx] = np.sqrt(np.maximum(batch_vars, 1e-12))
+        print(f"  ✓ Computed per-pixel prior std in batches")
+
+    # 🔥 验证方差的空间异质性
+    sigma_cv = sigma_pr.std() / sigma_pr.mean()
+    print(f"  Prior σ: mean={sigma_pr.mean():.4f}, std={sigma_pr.std():.4f}, CV={sigma_cv:.2%}")
+
+    if sigma_cv < 0.05:
+        warnings.warn(
+            f"Prior std has low spatial variation (CV={sigma_cv:.2%}). "
+            "This may reduce method differentiation. Consider adjusting hotspots or beta_base/beta_hot."
+        )
 
     # ========================================================================
     # 【核心图组 - 两个场景都需要】
@@ -1572,7 +1795,7 @@ def generate_all_visualizations_v2(all_results: Dict,
     except Exception as e:
         print(f"  ✗ Failed: {e}")
 
-    # F8: ROI 曲线
+    # F8: ROI 曲线（使用修复后的函数）
     print("\n[F8] ROI curves...")
     try:
         plot_roi_curves_fixed(df_results, plots_dir, config)
@@ -1585,13 +1808,13 @@ def generate_all_visualizations_v2(all_results: Dict,
     if scenario == 'A':
         print("\n  === Scenario A: High-stakes visualizations ===")
 
-        # F11: DDI 叠加（核心！）
+        # F11: DDI 叠加（核心！）- 🔥 使用修复后的 sigma_pr
         print("\n[F11] DDI overlay (EVI vs MI)...")
         try:
             budget = 10  # 选一个代表性预算
             plot_ddi_overlay(
                 geom.coords, all_results, sensors,
-                mu_pr, sigma_pr, tau, budget,
+                mu_pr, sigma_pr, tau, budget,  # 🔥 传入逐像元 sigma_pr
                 plots_dir,
                 methods_to_compare=['greedy_evi', 'greedy_mi']
             )
@@ -1605,11 +1828,11 @@ def generate_all_visualizations_v2(all_results: Dict,
         except Exception as e:
             print(f"  ✗ Failed: {e}")
 
-        # F4: MI-EVI 相关性（分层）
+        # F4: MI-EVI 相关性（分层）- 🔥 使用修复后的扩大样本版本
         if 'greedy_mi' in all_results and 'greedy_evi' in all_results:
-            print("\n[F4] MI-EVI correlation (stratified)...")
+            print("\n[F4] MI-EVI correlation (stratified, expanded)...")
             try:
-                plot_mi_evi_correlation_stratified(
+                plot_mi_evi_correlation_stratified_v2(
                     all_results['greedy_mi'],
                     all_results['greedy_evi'],
                     mu_pr, tau, sigma_pr,
@@ -1634,8 +1857,6 @@ def generate_all_visualizations_v2(all_results: Dict,
         # F9: 鲁棒性热图
         print("\n[F9] Robustness heatmap...")
         try:
-            # 需要先运行鲁棒性实验生成 results_matrix
-            # 这里暂时跳过
             print("  ⚠️  Requires robustness experiments (placeholder)")
         except Exception as e:
             print(f"  ✗ Failed: {e}")
@@ -1832,22 +2053,23 @@ def plot_roi_curves_fixed(df_results: pd.DataFrame,
                           config=None,
                           baseline_method: str = None) -> plt.Figure:
     """
-    ✅ 修复版：ROI vs Budget 曲线 + Near-Threshold 子集对比
+    ✅ 修复版：ROI vs Budget 曲线 + Sanity Check
 
-    改进：
-    1. 添加 near-threshold 子集的 ROI 曲线
-    2. 明确标注 "Domain-scaled"
-    3. 双面板展示：全域 vs 近阈值
+    关键修复：
+    1. 确保使用 total_cost（总成本）而不是 cost_mean（单台均价）
+    2. 添加成本增长检查，防止数据错误
+    3. 支持 near-threshold 子集展示
     """
     import matplotlib.pyplot as plt
     import seaborn as sns
+    import warnings
 
     # 🔥 提取全域指标
     df_roi = df_results[df_results['metric'] == 'roi'].copy()
     df_savings = df_results[df_results['metric'] == 'savings_gbp'].copy()
-    df_cost = df_results[df_results['metric'] == 'total_cost'].copy()
+    df_cost = df_results[df_results['metric'] == 'total_cost'].copy()  # ✅ 确保是 total_cost
 
-    # 🔥 提取 near-threshold 指标
+    # 提取 near-threshold 指标
     df_roi_near = df_results[df_results['metric'] == 'roi_near_threshold'].copy()
     df_savings_near = df_results[df_results['metric'] == 'savings_near_threshold'].copy()
 
@@ -1862,6 +2084,41 @@ def plot_roi_curves_fixed(df_results: pd.DataFrame,
     if df_roi.empty:
         warnings.warn("No fold-level ROI data")
         return None
+
+    # 🔥 Sanity Check 1: 检查 total_cost 是否随 budget 增长
+    print("\n  🔍 Sanity Check: Cost Growth Analysis")
+    try:
+        # 按方法和预算聚合成本
+        cost_pivot = df_cost.groupby(['method', 'budget'])['value'].mean().unstack()
+        cost_diff = cost_pivot.diff(axis=1)
+
+        print("  Cost increment by budget:")
+        print(cost_diff.to_string())
+
+        # 检查是否有异常的零增长或负增长
+        for method in cost_pivot.index:
+            increments = cost_diff.loc[method].dropna()
+            if (increments <= 0).any():
+                warnings.warn(f"  ⚠️  {method}: Cost not monotonically increasing!")
+            if (increments < 100).any():
+                warnings.warn(f"  ⚠️  {method}: Cost increments suspiciously small (< £100)")
+    except Exception as e:
+        warnings.warn(f"Cost sanity check failed: {e}")
+
+    # 🔥 Sanity Check 2: 检查 savings 是否为正且有意义
+    print("\n  🔍 Sanity Check: Savings Analysis")
+    try:
+        savings_stats = df_savings.groupby('method')['value'].agg(['mean', 'std', 'min', 'max'])
+        print("  Savings statistics (£):")
+        print(savings_stats.to_string())
+
+        for method in savings_stats.index:
+            if savings_stats.loc[method, 'mean'] < 0:
+                warnings.warn(f"  ⚠️  {method}: Negative mean savings!")
+            if savings_stats.loc[method, 'std'] < 100:
+                warnings.warn(f"  ⚠️  {method}: Savings variance very low (< £100)")
+    except Exception as e:
+        warnings.warn(f"Savings sanity check failed: {e}")
 
     # 按方法和预算聚合
     df_roi_agg = df_roi.groupby(['method', 'budget']).agg({
@@ -1880,7 +2137,7 @@ def plot_roi_curves_fixed(df_results: pd.DataFrame,
     df_plot = df_plot.merge(df_cost_agg, on=['method', 'budget'], how='left')
     df_plot['net_benefit'] = df_plot['savings_mean'] - df_plot['cost_mean']
 
-    # 🔥 Near-threshold 数据
+    # Near-threshold 数据
     if not df_roi_near.empty:
         df_roi_near_agg = df_roi_near.groupby(['method', 'budget']).agg({
             'value': ['mean', 'std']
@@ -1897,9 +2154,22 @@ def plot_roi_curves_fixed(df_results: pd.DataFrame,
     else:
         has_near_data = False
 
-    # 🔥 创建三行布局：ROI全域 + ROI近阈值 + Net Benefit
+    # 🔥 Sanity Check 3: 打印最终绘图数据摘要
+    print("\n  🔍 Final Plot Data Summary:")
+    for method in df_plot['method'].unique():
+        df_method = df_plot[df_plot['method'] == method].sort_values('budget')
+        print(f"\n  {method}:")
+        print(f"    Budgets: {df_method['budget'].tolist()}")
+        print(f"    Costs: {df_method['cost_mean'].tolist()}")
+        print(f"    Savings: {df_method['savings_mean'].tolist()}")
+        print(f"    ROI: {df_method['roi_mean'].tolist()}")
+        print(f"    Net Benefit: {df_method['net_benefit'].tolist()}")
+
+    # 创建三行布局：ROI全域 + ROI近阈值 + Net Benefit
     n_rows = 3 if has_near_data else 2
     fig, axes = plt.subplots(n_rows, 1, figsize=(10, 6 * n_rows))
+    if n_rows == 1:
+        axes = [axes]
 
     methods = df_plot['method'].unique()
     colors = sns.color_palette('Set2', n_colors=len(methods))
@@ -1923,10 +2193,11 @@ def plot_roi_curves_fixed(df_results: pd.DataFrame,
             color=method_colors[method]
         )
 
+        # 只保留标准误阴影
         ax1.fill_between(
             df_method['budget'],
-            df_method['roi_mean'] - df_method['roi_std'],
-            df_method['roi_mean'] + df_method['roi_std'],
+            df_method['roi_mean'] - df_method['roi_std'] / np.sqrt(df_method['n_folds']),
+            df_method['roi_mean'] + df_method['roi_std'] / np.sqrt(df_method['n_folds']),
             alpha=0.2,
             color=method_colors[method]
         )
@@ -1939,12 +2210,13 @@ def plot_roi_curves_fixed(df_results: pd.DataFrame,
     ax1.set_xlabel('Budget (k sensors)', fontsize=12, fontweight='bold')
     ax1.set_ylabel('ROI (Return on Investment)', fontsize=12, fontweight='bold')
     ax1.set_title('ROI vs Budget (Full Domain, Domain-Scaled)\n'
-                  'ROI = (Savings - Cost) / Cost',
+                  'ROI = (Savings - Cost) / Cost\n'
+                  'Note: expected_loss_gbp is domain-scaled',
                   fontsize=13, fontweight='bold')
     ax1.legend(loc='best', fontsize=10)
     ax1.grid(True, alpha=0.3)
 
-    # ========== 图2: ROI（Near-Threshold，如果有数据）==========
+    # ========== 图2: ROI（Near-Threshold）==========
     if has_near_data:
         ax2 = axes[1]
         for method in methods:
@@ -1953,7 +2225,6 @@ def plot_roi_curves_fixed(df_results: pd.DataFrame,
             if df_method.empty or 'roi_near_mean' not in df_method.columns:
                 continue
 
-            # 过滤掉NaN
             df_method_clean = df_method.dropna(subset=['roi_near_mean'])
 
             if df_method_clean.empty:
