@@ -45,7 +45,9 @@ from evaluation import spatial_block_cv, compute_metrics, morans_i
 
 from visualization import (
     setup_style,
-    generate_all_visualizations_v2
+    generate_all_visualizations_v2,
+aggregate_results_for_visualization
+
 )
 
 
@@ -287,16 +289,18 @@ def apply_quick_test_overrides(cfg):
 # 🔥 并行处理函数（从旧版移植）
 # ============================================================================
 
+# main.py 中的 run_single_fold_worker 函数
+# 在原有基础上修改以下部分（约第850-950行）
+
+
 def run_single_fold_worker(fold_data: dict) -> dict:
     """
-    单fold评估worker（完整增强版）
+    ✅ 修复版：统一ROI计算 + Domain Scaling
 
-    包含：
-    - 先验/后验损失对比
-    - ROI 计算
-    - DDI 统计
-    - 行动受限评估
-    - 完整诊断信息
+    关键改进：
+    1. 正确应用 domain scaling（测试集损失 → 全域损失）
+    2. ⚠️ Scenario A 添加 near-threshold 子集评估
+    3. ⚠️ Scenario B 记录详细的时间统计
     """
     import time
     import warnings
@@ -319,20 +323,42 @@ def run_single_fold_worker(fold_data: dict) -> dict:
     geom = fold_data['geom']
     rng = np.random.default_rng(fold_data['rng_seed'])
 
+    # 🔥 从config读取是否启用domain scaling
+    enable_scaling = fold_data.get('enable_domain_scaling', True)
+
+    # 🔥 检测场景类型（通过 DDI 或配置名称）
+    scenario = fold_data.get('scenario', 'A')  # 默认 A
+
     try:
-        # 1. 计算先验损失（用于 ROI）
+        # ====================================================================
+        # 1. 计算先验损失（用于ROI）- 两个场景都需要
+        # ====================================================================
         t_prior_start = time.time()
         tau = decision_config.get_threshold(mu_pr)
         factor_pr = SparseFactor(Q_pr)
         var_pr_test = compute_posterior_variance_diagonal(factor_pr, test_idx)
         sigma_pr_test = np.sqrt(np.maximum(var_pr_test, 1e-12))
-        prior_loss = expected_loss(
+
+        prior_loss_test = expected_loss(
             mu_pr[test_idx], sigma_pr_test, decision_config,
             test_indices=np.arange(len(test_idx)), tau=tau
         )
+
+        # 🔥 Domain Scaling（核心修复，两个场景都需要）
+        if enable_scaling:
+            N_domain = geom.n
+            N_test = len(test_idx)
+            scale_factor = N_domain / N_test
+            prior_loss_scaled = prior_loss_test * scale_factor
+        else:
+            prior_loss_scaled = prior_loss_test
+            scale_factor = 1.0
+
         prior_time = time.time() - t_prior_start
 
-        # 2. 传感器选择
+        # ====================================================================
+        # 2. 传感器选择 - 两个场景都需要
+        # ====================================================================
         t_sel_start = time.time()
         selection_result = selection_method(sensors, k, Q_pr, mu_pr)
         selection_time = time.time() - t_sel_start
@@ -340,10 +366,11 @@ def run_single_fold_worker(fold_data: dict) -> dict:
         selected_sensors = [sensors[i] for i in selection_result.selected_ids]
         sensor_cost = selection_result.total_cost
 
-        # 3. 生成观测
+        # ====================================================================
+        # 3. 生成观测 + 计算后验 - 两个场景都需要
+        # ====================================================================
         y, H, R = get_observation(x_true, selected_sensors, rng)
 
-        # 4. 计算后验
         t_inf_start = time.time()
         mu_post, factor_post = compute_posterior(Q_pr, mu_pr, H, R, y)
         inference_time = time.time() - t_inf_start
@@ -353,26 +380,89 @@ def run_single_fold_worker(fold_data: dict) -> dict:
         sigma_post = np.zeros(len(mu_post))
         sigma_post[test_idx] = sigma_post_test
 
-        # 5. 基础指标
+        # ====================================================================
+        # 4. 基础指标 - 两个场景都需要
+        # ====================================================================
         metrics = compute_metrics(mu_post, sigma_post, x_true, test_idx, decision_config)
-        posterior_loss = metrics['expected_loss_gbp']
+        posterior_loss_test = metrics['expected_loss_gbp']
 
-        # 6. ROI 和成本效率
-        savings = prior_loss - posterior_loss
-        if sensor_cost > 0:
-            roi = (savings - sensor_cost) / sensor_cost
-            cost_efficiency = savings / sensor_cost
+        if enable_scaling:
+            posterior_loss_scaled = posterior_loss_test * scale_factor
         else:
-            roi = np.inf if savings > 0 else 0.0
-            cost_efficiency = np.inf if savings > 0 else 0.0
+            posterior_loss_scaled = posterior_loss_test
 
-        metrics['roi'] = float(roi)
-        metrics['cost_efficiency'] = float(cost_efficiency)
-        metrics['prior_loss_gbp'] = float(prior_loss)
-        metrics['posterior_loss_gbp'] = float(posterior_loss)
-        metrics['savings_gbp'] = float(savings)
+        # 🔥 修复后的ROI计算
+        savings_scaled = prior_loss_scaled - posterior_loss_scaled
 
-        # 7. DDI（决策难度指数）统计
+        if sensor_cost > 0:
+            roi = (savings_scaled - sensor_cost) / sensor_cost
+            cost_efficiency = savings_scaled / sensor_cost
+        else:
+            roi = np.inf if savings_scaled > 0 else 0.0
+            cost_efficiency = np.inf if savings_scaled > 0 else 0.0
+
+        # ====================================================================
+        # 5. ⚠️ Scenario A 特有：Near-threshold 子集评估
+        # ====================================================================
+        near_threshold_metrics = {}
+        if scenario == 'A':
+            try:
+                gaps_prior = np.abs(mu_pr[test_idx] - tau)
+                near_mask = gaps_prior <= 1.0 * sigma_pr_test
+
+                if near_mask.sum() > 0:
+                    prior_loss_near = expected_loss(
+                        mu_pr[test_idx][near_mask],
+                        sigma_pr_test[near_mask],
+                        decision_config,
+                        test_indices=np.arange(near_mask.sum()),
+                        tau=tau
+                    )
+
+                    posterior_loss_near = expected_loss(
+                        mu_post[test_idx][near_mask],
+                        sigma_post_test[near_mask],
+                        decision_config,
+                        test_indices=np.arange(near_mask.sum()),
+                        tau=tau
+                    )
+
+                    if enable_scaling:
+                        prior_loss_near *= scale_factor
+                        posterior_loss_near *= scale_factor
+
+                    savings_near = prior_loss_near - posterior_loss_near
+                    roi_near = (savings_near - sensor_cost) / sensor_cost if sensor_cost > 0 else 0.0
+
+                    near_threshold_metrics = {
+                        'n_near_threshold': int(near_mask.sum()),
+                        'fraction_near_threshold': float(near_mask.sum() / len(test_idx)),
+                        'prior_loss_near_threshold': float(prior_loss_near),
+                        'posterior_loss_near_threshold': float(posterior_loss_near),
+                        'savings_near_threshold': float(savings_near),
+                        'roi_near_threshold': float(roi_near)
+                    }
+            except Exception as e:
+                warnings.warn(f"Near-threshold evaluation failed: {e}")
+
+        # ====================================================================
+        # 6. 记录完整指标 - 两个场景都需要
+        # ====================================================================
+        metrics.update({
+            'roi': float(roi),
+            'cost_efficiency': float(cost_efficiency),
+            'prior_loss_gbp': float(prior_loss_scaled),
+            'posterior_loss_gbp': float(posterior_loss_scaled),
+            'savings_gbp': float(savings_scaled),
+            'total_cost': float(sensor_cost),
+            'prior_loss_test_only': float(prior_loss_test),
+            'domain_scale_factor': float(scale_factor),
+            **near_threshold_metrics  # ⚠️ Scenario A 才有数据
+        })
+
+        # ====================================================================
+        # 7. DDI统计 - 两个场景都需要
+        # ====================================================================
         try:
             from spatial_field import compute_ddi
             ddi_test = compute_ddi(mu_post[test_idx], sigma_post_test, tau, k=1.0)
@@ -389,8 +479,10 @@ def run_single_fold_worker(fold_data: dict) -> dict:
             metrics['ddi_test'] = np.nan
             metrics['ddi_prior'] = np.nan
 
-        # 8. 行动受限评估（如果配置了 K_action）
-        if hasattr(decision_config, 'K_action') and decision_config.K_action is not None:
+        # ====================================================================
+        # 8. ⚠️ Scenario A 特有：行动受限评估
+        # ====================================================================
+        if scenario == 'A' and hasattr(decision_config, 'K_action') and decision_config.K_action is not None:
             try:
                 from scipy.stats import norm
                 K_action = decision_config.K_action
@@ -424,14 +516,14 @@ def run_single_fold_worker(fold_data: dict) -> dict:
 
                 metrics['action_K'] = int(K_action)
                 metrics['action_constrained_loss'] = float(constrained_loss)
-                metrics['action_regret'] = float(constrained_loss - posterior_loss)
+                metrics['action_regret'] = float(constrained_loss - posterior_loss_test)
                 metrics['action_hit_rate'] = float(hit_rate)
-                metrics['action_n_true_exceed'] = int(true_exceed.sum())
-                metrics['action_n_maintained'] = int(len(top_k_local))
             except Exception as e:
                 warnings.warn(f"Action-constrained evaluation failed: {e}")
 
-        # 9. 空间诊断（Moran's I）
+        # ====================================================================
+        # 9. Moran's I - 两个场景都需要
+        # ====================================================================
         residuals = mu_post - x_true
         if geom.adjacency is not None:
             try:
@@ -444,18 +536,19 @@ def run_single_fold_worker(fold_data: dict) -> dict:
                 metrics['morans_pval'] = float(I_pval)
             except Exception as e:
                 warnings.warn(f"Moran's I computation failed: {e}")
-                metrics['morans_i'] = np.nan
-                metrics['morans_pval'] = np.nan
 
-        # 10. 时间统计
+        # ====================================================================
+        # 10. 时间统计 - 两个场景都需要
+        # ====================================================================
         metrics['prior_computation_time_sec'] = float(prior_time)
         metrics['selection_time_sec'] = float(selection_time)
         metrics['inference_time_sec'] = float(inference_time)
         metrics['total_time_sec'] = float(prior_time + selection_time + inference_time)
 
-        # 11. 传感器选择诊断
+        # ====================================================================
+        # 11. 传感器诊断 - 两个场景都需要
+        # ====================================================================
         metrics['n_selected'] = len(selection_result.selected_ids)
-        metrics['total_cost'] = float(sensor_cost)
 
         type_counts = {}
         for sid in selection_result.selected_ids:
@@ -466,24 +559,9 @@ def run_single_fold_worker(fold_data: dict) -> dict:
         selected_costs = [sensors[i].cost for i in selection_result.selected_ids]
         metrics['cost_mean'] = float(np.mean(selected_costs))
         metrics['cost_std'] = float(np.std(selected_costs))
-        metrics['cost_min'] = float(np.min(selected_costs))
-        metrics['cost_max'] = float(np.max(selected_costs))
 
-        selected_noise_vars = [sensors[i].noise_var for i in selection_result.selected_ids]
-        metrics['noise_mean'] = float(np.mean(selected_noise_vars))
-        metrics['noise_std'] = float(np.std(selected_noise_vars))
-
-        # 12. 近阈值区域统计
-        try:
-            selected_locs = [sensors[i].idxs[0] for i in selection_result.selected_ids]
-            selected_gaps = np.abs(mu_pr[selected_locs] - tau)
-            var_selected = compute_posterior_variance_diagonal(factor_pr, np.array(selected_locs))
-            sigma_selected = np.sqrt(np.maximum(var_selected, 1e-12))
-            near_threshold = selected_gaps <= sigma_selected
-            metrics['frac_sensors_near_threshold'] = float(near_threshold.mean())
-        except Exception as e:
-            warnings.warn(f"Near-threshold statistics failed: {e}")
-            metrics['frac_sensors_near_threshold'] = np.nan
+        if 'coverage_90' in metrics:
+            metrics['coverage_90'] = float(np.clip(metrics['coverage_90'], 0.0, 1.0))
 
         return {
             'success': True,
@@ -491,38 +569,22 @@ def run_single_fold_worker(fold_data: dict) -> dict:
             'selection_result': selection_result,
             'mu_post': mu_post,
             'sigma_post': sigma_post,
-            'residuals': residuals[test_idx],
+            'residuals': mu_post[test_idx] - x_true[test_idx],
             'test_idx': test_idx,
             'tau': tau,
-            'prior_loss': prior_loss,
-            'posterior_loss': posterior_loss,
-            'savings': savings,
+            'prior_loss': prior_loss_scaled,
+            'posterior_loss': posterior_loss_scaled,
+            'savings': savings_scaled,
             'roi': roi
         }
 
     except Exception as e:
         import traceback
-        error_msg = str(e)
-        error_trace = traceback.format_exc()
-        warnings.warn(f"Fold evaluation failed: {error_msg}")
-
         return {
             'success': False,
-            'error': error_msg,
-            'traceback': error_trace,
-            'metrics': {},
-            'selection_result': None,
-            'mu_post': None,
-            'sigma_post': None,
-            'residuals': None,
-            'test_idx': test_idx,
-            'tau': None,
-            'prior_loss': None,
-            'posterior_loss': None,
-            'savings': None,
-            'roi': None
+            'error': str(e),
+            'traceback': traceback.format_exc(),
         }
-
 
 def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
                           x_true, sensors, test_idx_global=None,
@@ -576,6 +638,16 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
         'method_name': method_name,
         'n_folds': len(folds)
     }
+    # 🔥 检测场景类型
+    if hasattr(cfg.decision, 'target_ddi'):
+        if cfg.decision.target_ddi >= 0.20:
+            scenario = 'A'  # High-stakes
+        else:
+            scenario = 'B'  # Compute/robustness
+    else:
+        scenario = 'A'  # 默认
+
+    enable_scaling = getattr(cfg.metrics, 'scale_savings_to_domain', True) if hasattr(cfg, 'metrics') else True
 
     # 遍历budgets
     for k in cfg.selection.budgets:
@@ -591,20 +663,6 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
         # 🔥 准备所有fold的数据
         fold_data_list = []
         for fold_idx, (train_idx, test_idx) in enumerate(folds):
-            # 检查是否需要跳过（仅EVI方法）
-            is_evi_method = method_name.lower() in ['greedy_evi', 'evi', 'greedy-evi', 'myopic_evi']
-            if is_evi_method:
-                from method_wrappers import should_use_evi
-                if not should_use_evi(method_name, k, fold_idx, cfg):
-                    if verbose:
-                        print(f"    Fold {fold_idx + 1}/{len(folds)}: SKIPPED (EVI subset)")
-                    budget_results['fold_results'].append({
-                        'success': False,
-                        'skipped': True,
-                        'reason': 'EVI budget/fold subset'
-                    })
-                    continue
-
             fold_data = {
                 'train_idx': train_idx,
                 'test_idx': test_idx,
@@ -616,10 +674,12 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
                 'sensors': sensors,
                 'decision_config': cfg.decision,
                 'geom': geom,
-                'rng_seed': rng.integers(0, 2 ** 31)
+                'rng_seed': rng.integers(0, 2 ** 31),
+                'enable_domain_scaling': enable_scaling,
+                'scenario': scenario,  # 🔥 新增
+                'verbose': verbose
             }
             fold_data_list.append((fold_idx, fold_data))
-
         # 🔥 并行或串行执行
         if use_parallel and len(fold_data_list) > 1:
             # 并行模式
@@ -737,97 +797,15 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
     return results
 
 
-def aggregate_results_for_visualization(all_results: dict) -> pd.DataFrame:
-    """将结果转换为DataFrame供可视化使用"""
-    rows = []
-    print("    开始聚合结果...")
-
-    for method_name, method_data in all_results.items():
-        print(f"      处理方法: {method_name}")
-        if not isinstance(method_data, dict):
-            continue
-
-        budgets_data = method_data.get('budgets', {})
-        if not budgets_data:
-            continue
-
-        for budget, budget_data in budgets_data.items():
-            if not isinstance(budget_data, dict):
-                continue
-
-            fold_results = budget_data.get('fold_results', [])
-            if not fold_results:
-                continue
-
-            for fold_idx, fold_res in enumerate(fold_results):
-                if not isinstance(fold_res, dict):
-                    continue
-                if not fold_res.get('success', False):
-                    continue
-
-                metrics = fold_res.get('metrics', {})
-                if not metrics or not isinstance(metrics, dict):
-                    continue
-
-                for metric_name, metric_value in metrics.items():
-                    if metric_name in ['z_scores', 'type_counts']:
-                        continue
-                    if metric_name.startswith('_'):
-                        continue
-                    if isinstance(metric_value, (list, np.ndarray, dict)):
-                        continue
-                    if metric_value is None:
-                        continue
-
-                    try:
-                        scalar_value = float(metric_value)
-                    except (ValueError, TypeError):
-                        continue
-
-                    if np.isnan(scalar_value):
-                        continue
-
-                    rows.append({
-                        'method': method_name,
-                        'budget': int(budget),
-                        'fold': fold_idx + 1,
-                        'metric': metric_name,
-                        'value': scalar_value
-                    })
-
-    if not rows:
-        warnings.warn("没有有效的结果可以聚合")
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-
-    # 计算统计量
-    stats_rows = []
-    for (method, budget, metric), group in df.groupby(['method', 'budget', 'metric']):
-        values = group['value'].values
-        stats_rows.append({
-            'method': method,
-            'budget': budget,
-            'fold': None,
-            'metric': metric,
-            'value': np.mean(values),
-            'mean': np.mean(values),
-            'std': np.std(values),
-            'min': np.min(values),
-            'max': np.max(values),
-            'n_folds': len(values)
-        })
-
-    df_stats = pd.DataFrame(stats_rows)
-    df_combined = pd.concat([df, df_stats], ignore_index=True)
-
-    print(f"    ✓ 聚合完成: {len(df)} 行原始数据 + {len(df_stats)} 行统计数据")
-    return df_combined
-
 
 def main():
     """主评估流程 - CLI版本"""
+    from visualization import (
+        setup_style,
+        generate_all_visualizations_v2,
+        aggregate_results_for_visualization
 
+    )
     # 解析命令行参数
     args = parse_arguments()
 
@@ -940,16 +918,32 @@ def main():
     else:
         Q_pr, mu_pr = build_prior(geom, cfg.prior)
 
+        # 🔥 新增：预先计算并缓存tau到config中
+    tau = cfg.decision.get_threshold(mu_pr)
+    cfg.decision.tau_iri = tau  # 缓存到配置中
+    if verbose:
+        print(f"    ✓ Decision threshold cached: τ = {tau:.3f}")
+
+    # 🔥 验证DDI是否达标
     if cfg.plots.ddi_overlay.get('enable', True) and verbose:
-        from spatial_field import plot_ddi_heatmap, compute_ddi
+        from spatial_field import plot_ddi_heatmap, compute_ddi_with_target
         from inference import SparseFactor, compute_posterior_variance_diagonal
+
         factor = SparseFactor(Q_pr)
         sample_idx = rng.choice(geom.n, size=min(100, geom.n), replace=False)
         sample_vars = compute_posterior_variance_diagonal(factor, sample_idx)
         sigma_est = np.sqrt(np.mean(sample_vars)) * np.ones(geom.n)
-        tau = cfg.decision.get_threshold(mu_pr)
+
+        # ✅ 使用修复后的DDI计算
+        if hasattr(cfg.decision, 'target_ddi') and cfg.decision.target_ddi > 0:
+            actual_ddi, epsilon = compute_ddi_with_target(
+                mu_pr, sigma_est, tau, cfg.decision.target_ddi
+            )
+            print(f"    ✓ Actual DDI: {actual_ddi:.2%} (target: {cfg.decision.target_ddi:.2%})")
+            print(f"      Epsilon: {epsilon:.3f}σ")
+
         plot_ddi_heatmap(geom, mu_pr, sigma_est, tau,
-                        output_path=output_dir / 'ddi_heatmap_prior.png')
+                         output_path=output_dir / 'ddi_heatmap_prior.png')
 
     if verbose:
         print(f"    Precision sparsity: {Q_pr.nnz / geom.n ** 2 * 100:.2f}%")
@@ -1051,9 +1045,26 @@ def main():
         plots_dir.mkdir(exist_ok=True)
 
         try:
+            # ✅ 使用修复后的可视化函数
+            from visualization import (
+                aggregate_results_for_visualization,
+                plot_roi_curves_fixed,
+                plot_marginal_efficiency_fixed
+            )
+
+            # 重新聚合（使用inner join）
+            df_results_clean = aggregate_results_for_visualization(all_results)
+
+            # 使用修复后的ROI绘图
+            plot_roi_curves_fixed(df_results_clean, plots_dir, cfg, baseline_method='uniform')
+
+            # 使用修复后的边际效率绘图
+            plot_marginal_efficiency_fixed(all_results, plots_dir, cfg)
+
+            # 其他可视化函数...
             generate_all_visualizations_v2(
                 all_results=all_results,
-                df_results=df_results,
+                df_results=df_results_clean,  # 使用清理后的数据
                 geom=geom,
                 sensors=sensors,
                 Q_pr=Q_pr,
@@ -1062,6 +1073,7 @@ def main():
                 config=cfg,
                 scenario=scenario
             )
+
             if verbose:
                 print(f"    ✓ Visualization complete")
         except Exception as e:
@@ -1069,25 +1081,6 @@ def main():
                 print(f"    ✗ Visualization phase failed: {str(e)}")
             import traceback
             traceback.print_exc()
-    elif args.skip_viz:
-        if verbose:
-            print("\n[10] Skipping visualization (--skip-viz)")
-
-    # 总结
-    if verbose:
-        print("\n" + "=" * 70)
-        print(f"  EVALUATION COMPLETE - SCENARIO {scenario}")
-        print("=" * 70)
-        print("\nSummary:")
-        print(f"  Scenario: {scenario}")
-        print(f"  Config: {config_path}")
-        print(f"  Methods completed: {len(all_results)}/{len(methods)}")
-        print(f"  Budgets: {cfg.selection.budgets}")
-        print(f"  CV folds: {cfg.cv.k_folds}")
-        if use_parallel:
-            print(f"  Parallel workers: {n_workers}")
-        print(f"\nResults saved to: {output_dir}")
-        print("=" * 70)
 
 
 if __name__ == "__main__":

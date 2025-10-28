@@ -47,8 +47,9 @@ prior:
   mu_prior_mean: 2.2
   mu_prior_std: 0.3
 
-  beta_base: 5.0
-  beta_hot: 1.0e-4
+  # 热点配置（用于空间异质性）
+  beta_base: 5.0     # 非热点区域的nugget（低不确定性）
+  beta_hot: 1.0e-4   # 热点区域的nugget（高不确定性）
 
   hotspots:
     - center_m: [25, 75]
@@ -109,37 +110,42 @@ sensors:
 # Decision Model - 🔥 低风险/对称代价参数
 # ----------------------------------------------------------------------------
 decision:
-  tau_iri: null
-  tau_quantile: 0.65  # 🔥 低分位阈值，降低 DDI
+  # 推荐：只使用 tau_quantile（动态阈值）
+  tau_iri: null  # ✅ 设为null，让main()中自动计算并缓存
+  tau_quantile: 0.65  # Scenario A: 0.88-0.90 | Scenario B: 0.60-0.70
 
-  # 🔥 对称代价比 (1:1) - 也可改为 1.5:1
-  L_FP_gbp: 5000.0      # 误报成本
-  L_FN_gbp: 5000.0      # 🔥 漏检成本（对称）
-  L_TP_gbp: 800.0       # 正确维护成本
+  # 代价矩阵
+  L_FP_gbp: 5000.0       # 保持原值（或略微提高）
+  L_FN_gbp: 30000.0      # 🔥 120000 → 30000（降低不对称性）
+  L_TP_gbp: 800.0
   L_TN_gbp: 0.0
 
-  target_ddi: 0.10      # 🎯 目标 DDI: 10%（低决策敏感度）
-  K_action: null        # 🔥 无行动限制
+  # 🔥 DDI控制（使用compute_ddi_with_target自标定）
+  target_ddi: 0.10  # Scenario A: 0.25-0.35 | Scenario B: 0.10-0.15
+  K_action: 10      # Scenario A: 10 | Scenario B: null
 
+metrics:
+  scale_savings_to_domain: true  # ✅ 启用域缩放（让测试集损失可比于全域成本）
+  coverage_clip: [0.0, 1.0]      # Coverage 裁剪范围
 # ----------------------------------------------------------------------------
 # Sensor Selection Methods - 🔥 宽预算范围
 # ----------------------------------------------------------------------------
 selection:
   methods:
-    - greedy_mi
     - greedy_evi
+    - greedy_mi
     - greedy_aopt
     - maxmin
     - uniform
     - random
 
   budget_type: "count"
-  budgets: [5, 10, 20, 40]  # 🔥 加大预算段，测试规模效应
+  budgets: [3, 5, 10, 15, 20]
 
   greedy_mi:
     batch_size: 1
     adaptive_pruning: true
-    prune_threshold: 0.20  # 🔥 更激进裁剪，提高单位时间收益
+    prune_threshold: 0.10
     use_cost: true
 
   greedy_aopt:
@@ -147,10 +153,16 @@ selection:
     use_cost: true
 
   greedy_evi:
-    n_y_samples: 0        # 🔥 解析法
+    n_y_samples: 0
     use_cost: true
-    mi_prescreen: true
-    keep_fraction: 0.25   # 🔥 统一较小预筛（公平对比）
+    mi_prescreen: true  # 主实验保持true；相关性实验时设false
+    keep_fraction: 0.50  # Scenario A: 0.5 | Scenario B: 0.5
+
+    # 🔥 关键修复：禁用fold跳过机制
+    every_n_folds: 1       # ✅ 1=运行所有fold（不跳过）
+    budgets_subset: []     # ✅ 空列表=运行所有budget
+    max_folds: null        # ✅ null=不限制fold数量
+    must_budgets: []       # ✅ 不需要特殊处理的budget
 
   maxmin:
     use_cost: true
@@ -168,11 +180,12 @@ evi:
 # ----------------------------------------------------------------------------
 cv:
   scheme: "spatial_block"
-  k_folds: 3
+  k_folds: 5  # 🔥 建议至少5折，以获得足够实例数（5×5 budgets = 25）
   buffer_width_multiplier: 1.5
   block_strategy: "kmeans"
   ensure_connected: true
   morans_permutations: 999
+
 
 # ----------------------------------------------------------------------------
 # Uncertainty Quantification
@@ -221,10 +234,10 @@ plots:
 
   business_metrics:
     enable: true
-    baseline_method: "uniform"
-    show_savings: false     # 场景 B 不强调省钱
+    baseline_method: "uniform"  # 🔥 固定baseline
+    show_savings: true     # Scenario A: true | Scenario B: false
     show_roi: true
-    show_cost_efficiency: true  # 🔥 强调单位时间的效率
+    show_cost_efficiency: true
 
   effect_size:
     enable: true
@@ -233,15 +246,43 @@ plots:
     top_k_comparisons: 20
 
   critical_region:
-    enable: false  # 低 DDI 场景不强调临界区
+    enable: true   # Scenario A: true | Scenario B: false
+    epsilon: 0.2
+    plot_heatmap: true
 
   expert_plots:
     enable_all: true
+
+    # 🔥 核心差异点：时间-损失效率（Scenario B 特有）
+    # 需要在 main.py 中记录墙钟时间
+    time_loss_curves:
+      enable: true   # ✅ Scenario B 特有
+      wallclock_limits: [5, 30, 120]  # 统一时间预算
+
+    # 🔥 鲁棒性热图（先验错配测试）
+    robustness_heatmap:
+      enable: true   # ✅ Scenario B 特有
+      kappa_multipliers: [0.5, 0.7, 1.0, 1.3, 1.5]  # 先验错配
+      loss_ratios: [1, 3, 5, 10, 25]  # L_FN/L_FP 比率
+
+    # 🔥 不启用 near-threshold 分析（低 DDI 下不是重点）
+    critical_region:
+      enable: false  # Scenario B 不需要
+
+    ddi_overlay:
+      enable: false  # Scenario B 不需要
+
+    roi_curves:
+      enable: true
+      baseline_method: "uniform"
+      show_near_threshold: false  # 🔥 Scenario B 不展示
 
     marginal_efficiency:
       enable: true
       normalize_by_cost: true
       unit: "gbp_per_test_point"
+      # 🔥 新增：分图显示不同单位
+      split_by_unit: true
 
     type_composition:
       enable: true
@@ -250,9 +291,11 @@ plots:
     mi_voi_correlation:
       enable: true
       methods: ["greedy_mi", "greedy_evi"]
+      # 🔥 相关性实验：暂时禁用MI预筛选
+      correlation_mode_disable_prescreen: false
 
     calibration_plots:
-      enable: true
+      enable: true  # 可移到附录
 
     spatial_diagnostics:
       enable: true
@@ -260,18 +303,8 @@ plots:
 
     sensor_placement_map:
       enable: true
-      budgets_to_show: [5, 10, 20, 40]
+      budgets_to_show: [5, 10, 15, 20]
 
-    roi_curves:
-      enable: true  # 🔥 ROI 曲线：对比时间效率
-
-    robustness_heatmap:
-      enable: true  # 🔥 鲁棒性热图：测试先验错配
-      ddi_range: [0.1, 0.2, 0.3, 0.4]
-      loss_ratios: [1, 2, 5, 10]
-
-    ddi_overlay:
-      enable: false  # 低 DDI 场景不需要
 
 # ----------------------------------------------------------------------------
 # Acceptance Criteria

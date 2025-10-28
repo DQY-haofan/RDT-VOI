@@ -20,6 +20,7 @@ class SparseFactor:
     """
 
     _cholmod_initialized = False  # 类变量，只打印一次
+    _cholmod_warning_shown = False  # 🔥 新增：是否已显示过警告
 
     def __init__(self, Q: sp.spmatrix, method: str = "cholmod"):
         """
@@ -43,26 +44,14 @@ class SparseFactor:
                     print("  Using CHOLMOD (fast)")
                     SparseFactor._cholmod_initialized = True
             except ImportError:
-                warnings.warn("cholmod not available, falling back to splu")
+                # 🔥 修改：只在第一次显示警告
+                if not SparseFactor._cholmod_warning_shown:
+                    warnings.warn("cholmod not available, falling back to splu",
+                                  category=ImportWarning, stacklevel=2)
+                    SparseFactor._cholmod_warning_shown = True
                 self.factor = spla.splu(self.Q)
                 self._has_cholmod = False
                 self.method = "splu"
-
-        elif method == "splu":
-            self.factor = spla.splu(self.Q)
-            self._has_cholmod = False
-
-        elif method == "pcg":
-            self._has_cholmod = False
-            self.factor = None
-            try:
-                from scipy.sparse.linalg import spilu
-                self.ilu = spilu(self.Q)
-            except:
-                self.ilu = None
-
-        else:
-            raise ValueError(f"Unknown factorization method: {method}")
 
     def solve(self, b: Union[np.ndarray, sp.spmatrix], tol: float = 1e-8) -> np.ndarray:
         """

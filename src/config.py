@@ -5,7 +5,7 @@ Configuration management for RDT-VoI simulation (Enhanced version)
 
 import yaml
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 from dataclasses import dataclass
 import numpy as np
 import sys
@@ -254,6 +254,29 @@ class AcceptanceConfig:
     m4_coverage_tolerance: float
     m4_msse_tolerance: float
 
+@dataclass
+class AcceptanceConfig:
+    """Milestone acceptance criteria."""
+    m1_grid_size: int
+    m1_budgets: List[int]
+    m1_check_monotonic: bool
+    m1_check_diminishing: bool
+    m2_min_improvement_vs_random: float
+    m2_confidence_level: float
+    m3_small_instance_n: int
+    m3_small_instance_k: int
+    m3_max_suboptimality: float
+    m4_morans_alpha: float
+    m4_coverage_tolerance: float
+    m4_msse_tolerance: float
+
+
+# 🔥 在这里添加新的 MetricsConfig 类：
+@dataclass
+class MetricsConfig:
+    """Metrics computation settings."""
+    scale_savings_to_domain: bool = True
+    coverage_clip: Tuple[float, float] = (0.0, 1.0)
 
 class Config:
     """Master configuration container (Enhanced)."""
@@ -290,6 +313,12 @@ class Config:
         self.diagnostics = DiagnosticsConfig(**self._raw['diagnostics'])
         self.plots = PlotsConfig(**self._raw['plots'])
         self.acceptance = AcceptanceConfig(**self._raw['acceptance'])
+
+        # 🔥 在这里添加 metrics 配置解析（就在 acceptance 之后）：
+        if 'metrics' in self._raw:
+            self.metrics = MetricsConfig(**self._raw['metrics'])
+        else:
+            self.metrics = MetricsConfig()  # 使用默认值
 
         self.validate()
 

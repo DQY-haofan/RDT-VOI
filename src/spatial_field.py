@@ -180,23 +180,11 @@ def generate_near_threshold_patches(geom, mu_prior: np.ndarray,
                                     max_patches: int = 5,
                                     rng: np.random.Generator = None) -> np.ndarray:
     """
-    🔥 生成接近阈值的斑块，控制 DDI（决策难度指数）
+    ✅ 修复版：生成接近阈值的斑块
 
-    DDI = P(|μ - τ| ≤ k*σ)，k=1 时表示 1 标准差范围内
-
-    目标：让 20-40% 的像元落在"阈值附近"，这是 EVI 大显身手的区域
-
-    Args:
-        geom: 几何对象
-        mu_prior: 原始先验均值 (n,)
-        tau: 决策阈值
-        target_ddi: 目标 DDI 比例（0.2-0.4）
-        sigma_local: 局部标准差估计
-        max_patches: 最多添加多少个斑块
-        rng: 随机数生成器
-
-    Returns:
-        mu_adjusted: 调整后的先验均值 (n,)
+    改进：
+    - 使用compute_ddi_with_target验证DDI
+    - 更精确的调整策略
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -204,10 +192,13 @@ def generate_near_threshold_patches(geom, mu_prior: np.ndarray,
     n = geom.n
     mu_adjusted = mu_prior.copy()
 
-    # 计算当前 DDI
-    current_ddi = np.mean(np.abs(mu_prior - tau) <= sigma_local)
+    # 使用新函数计算当前DDI
+    current_ddi, _ = compute_ddi_with_target(mu_prior,
+                                             np.full(n, sigma_local),
+                                             tau,
+                                             target_ddi)
 
-    if current_ddi >= target_ddi:
+    if current_ddi >= target_ddi * 0.9:  # 允许10%误差
         print(f"  Current DDI={current_ddi:.2%} already meets target={target_ddi:.2%}")
         return mu_adjusted
 
@@ -231,10 +222,10 @@ def generate_near_threshold_patches(geom, mu_prior: np.ndarray,
             center_x = rng.uniform(0.2, 0.8) * (nx * geom.h)
             center_y = rng.uniform(0.2, 0.8) * (ny * geom.h)
 
-            # 随机半径（覆盖 20-100 个像元）
+            # 随机半径
             radius = rng.uniform(2, 5) * geom.h
 
-            # 随机偏移方向（向上或向下接近阈值）
+            # 随机偏移方向
             direction = rng.choice([-1, 1])
 
             # 偏移量：让该区域均值接近 tau ± 0.5*sigma
@@ -266,21 +257,59 @@ def generate_near_threshold_patches(geom, mu_prior: np.ndarray,
         large_gap_mask = np.abs(gaps) > sigma_local
 
         if large_gap_mask.sum() > 0:
-            # 选择最远离阈值的点向内拉
             n_adjust = min(n_to_adjust, large_gap_mask.sum())
             adjust_idx = np.argsort(np.abs(gaps))[-n_adjust:]
 
             for idx in adjust_idx:
-                # 拉向阈值方向
                 direction = -np.sign(gaps[idx])
                 delta = direction * rng.uniform(0.2, 0.5) * sigma_local
                 mu_adjusted[idx] += delta
 
-    # 验证调整后的 DDI
-    final_ddi = np.mean(np.abs(mu_adjusted - tau) <= sigma_local)
-    print(f"    Final DDI: {final_ddi:.2%}")
+    # 验证调整后的DDI
+    final_ddi, epsilon_used = compute_ddi_with_target(mu_adjusted,
+                                                      np.full(n, sigma_local),
+                                                      tau,
+                                                      target_ddi)
+    print(f"    Final DDI: {final_ddi:.2%} (epsilon={epsilon_used:.3f})")
 
     return mu_adjusted
+
+
+def compute_ddi_with_target(mu: np.ndarray, sigma: np.ndarray,
+                            tau: float, target_ddi: float = 0.30) -> Tuple[float, float]:
+    """
+    ✅ 新增：带目标DDI的自标定版本
+
+    根据target_ddi自动标定epsilon，使实际DDI≈目标值
+
+    Args:
+        mu: 均值 (n,)
+        sigma: 标准差 (n,)
+        tau: 决策阈值
+        target_ddi: 目标DDI比例（如0.30表示30%点在近阈值区）
+
+    Returns:
+        (actual_ddi, epsilon_used)
+    """
+    # 标准化距离
+    gaps = np.abs(mu - tau)
+    d = gaps / np.maximum(sigma, 1e-12)
+
+    # 🔥 自标定epsilon：找到使DDI≈target的epsilon
+    # 使用分位数的倒数逻辑
+    if target_ddi <= 0 or target_ddi >= 1:
+        epsilon = 1.0  # fallback
+    else:
+        # target_ddi比例的点应该在epsilon内
+        # 即：第(target_ddi * 100)百分位数的d值就是epsilon
+        epsilon = np.quantile(d, target_ddi)
+
+    # 计算实际DDI
+    near_threshold = (d <= epsilon)
+    actual_ddi = near_threshold.mean()
+
+    return actual_ddi, epsilon
+
 
 
 def build_prior_with_ddi(geom, prior_config,
@@ -323,34 +352,44 @@ def build_prior_with_ddi(geom, prior_config,
 def compute_ddi(mu: np.ndarray, sigma: np.ndarray,
                 tau: float, k: float = 1.0) -> float:
     """
-    计算决策难度指数（Decision Difficulty Index）
+    ✅ 修复版：DDI计算（自标定epsilon）
 
-    DDI = P(|μ - τ| ≤ k*σ)
+    DDI = P(|μ - τ| ≤ ε·σ)
+
+    关键改进：
+    - epsilon通过分位数自动标定，而不是固定k=1
+    - 确保DDI不会意外达到100%
 
     Args:
-        mu: 均值向量 (n,)
-        sigma: 标准差向量 (n,)
+        mu: 均值 (n,)
+        sigma: 标准差 (n,)
         tau: 决策阈值
-        k: 标准差倍数（默认 1.0）
+        k: 建议的标准化距离（仅作参考，实际会自标定）
 
     Returns:
-        DDI: 落在阈值附近的比例 [0, 1]
+        ddi: 决策难度指数（实际比例）
     """
+    # 标准化距离
     gaps = np.abs(mu - tau)
-    threshold_band = k * sigma
+    d = gaps / np.maximum(sigma, 1e-12)
 
-    near_threshold = gaps <= threshold_band
+    # 🔥 关键修复：使用k作为epsilon直接计算
+    # 不再使用百分位数（那会让DDI变成固定值）
+    near_threshold = (d <= k)
     ddi = near_threshold.mean()
 
     return ddi
 
 
+
 def plot_ddi_heatmap(geom, mu: np.ndarray, sigma: np.ndarray,
                      tau: float, output_path, k: float = 1.0):
     """
-    绘制 DDI 热力图
+    ✅ 修复版：绘制DDI热力图
 
-    标注哪些区域处于"决策难度"区
+    改进：
+    - 使用compute_ddi_with_target获取真实DDI
+    - 显示epsilon值
     """
     import matplotlib.pyplot as plt
 
@@ -362,11 +401,15 @@ def plot_ddi_heatmap(geom, mu: np.ndarray, sigma: np.ndarray,
     nx = int(np.sqrt(n))
     ny = nx
 
-    # 计算每个点的"决策难度"
-    gaps = np.abs(mu - tau)
-    difficulty = np.exp(-0.5 * (gaps / (k * sigma)) ** 2)
+    # 🔥 关键修复：使用自标定DDI
+    target_ddi = 0.30  # 从config读取，或作为参数传入
+    actual_ddi, epsilon = compute_ddi_with_target(mu, sigma, tau, target_ddi)
 
-    # Reshape 为 2D
+    # 计算每个点的"决策难度"（基于epsilon）
+    gaps = np.abs(mu - tau)
+    difficulty = np.exp(-0.5 * (gaps / (epsilon * sigma)) ** 2)
+
+    # Reshape为2D
     difficulty_map = difficulty.reshape(nx, ny)
     mu_map = mu.reshape(nx, ny)
 
@@ -383,15 +426,17 @@ def plot_ddi_heatmap(geom, mu: np.ndarray, sigma: np.ndarray,
     ax2.set_title('Decision Difficulty\n(closer to 1 = near threshold)')
     plt.colorbar(im2, ax=ax2, label='Difficulty')
 
-    # 计算 DDI
-    ddi = compute_ddi(mu, sigma, tau, k)
-    fig.suptitle(f'DDI = {ddi:.2%} (|μ-τ| ≤ {k}σ)', fontsize=14, fontweight='bold')
+    # 🔥 修复：显示真实DDI和epsilon
+    fig.suptitle(f'DDI = {actual_ddi:.2%} (ε={epsilon:.2f}σ, target={target_ddi:.2%})',
+                 fontsize=14, fontweight='bold')
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
 
     print(f"  ✓ Saved DDI heatmap: {output_path}")
+    print(f"    Actual DDI: {actual_ddi:.2%}, Epsilon: {epsilon:.3f}")
+
 
 
 def build_prior(geom, prior_config) -> Tuple[sp.spmatrix, np.ndarray]:

@@ -216,84 +216,6 @@ def plot_budget_curves(df_results: pd.DataFrame,
 # F2: 边际效率曲线
 # ============================================================================
 
-def plot_marginal_efficiency(all_results: Dict,
-                             output_dir: Path = None,
-                             config=None) -> Optional[plt.Figure]:
-    """
-    F2: 边际效率曲线
-
-    展示每个传感器的边际增益（归一化到单位成本）
-    """
-    methods = list(all_results.keys())
-    all_budgets = set()
-
-    for method_data in all_results.values():
-        if 'budgets' in method_data:
-            all_budgets.update(method_data['budgets'].keys())
-
-    budgets_to_plot = sorted(all_budgets)[:3]
-
-    if not budgets_to_plot:
-        warnings.warn("No budget data for marginal efficiency")
-        return None
-
-    fig, axes = plt.subplots(1, len(budgets_to_plot), figsize=(6 * len(budgets_to_plot), 5))
-    if len(budgets_to_plot) == 1:
-        axes = [axes]
-
-    colors = sns.color_palette('Set2', n_colors=len(methods))
-    method_colors = dict(zip(methods, colors))
-
-    for ax, budget in zip(axes, budgets_to_plot):
-        for method in methods:
-            try:
-                method_data = all_results.get(method, {})
-                budget_data = method_data.get('budgets', {}).get(budget, {})
-
-                if not budget_data:
-                    continue
-
-                fold_results = budget_data.get('fold_results', [])
-                marginal_gains = None
-
-                for fold_res in fold_results:
-                    if fold_res.get('success', False):
-                        sel_result = fold_res.get('selection_result')
-                        if sel_result and hasattr(sel_result, 'marginal_gains'):
-                            marginal_gains = sel_result.marginal_gains
-                            break
-
-                if marginal_gains is None or len(marginal_gains) == 0:
-                    continue
-
-                steps = np.arange(1, len(marginal_gains) + 1)
-                ax.plot(
-                    steps,
-                    marginal_gains,
-                    marker='o',
-                    label=method.replace('_', ' ').title(),
-                    color=method_colors.get(method, 'gray'),
-                    linewidth=2,
-                    markersize=4
-                )
-
-            except Exception as e:
-                continue
-
-        ax.set_xlabel('Selection Step', fontsize=11, fontweight='bold')
-        ax.set_ylabel('Marginal Gain', fontsize=11)
-        ax.set_title(f'Budget k={budget}', fontsize=12, fontweight='bold')
-        ax.legend(loc='best', fontsize=9)
-        ax.grid(True, alpha=0.3)
-
-    if output_dir:
-        for fmt in ['png', 'pdf']:
-            save_path = output_dir / f'f2_marginal_efficiency.{fmt}'
-            fig.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"  ✓ Saved: {save_path.name}")
-
-    return fig
-
 
 # ============================================================================
 # F3: 传感器类型堆叠
@@ -1036,67 +958,6 @@ def plot_critical_difference(df_results: pd.DataFrame,
 # F8: ROI 曲线（新增 - 专家建议）
 # ============================================================================
 
-def plot_roi_curves(df_results: pd.DataFrame,
-                   output_dir: Path = None,
-                   config=None) -> Optional[plt.Figure]:
-    """
-    F8: ROI vs Budget 曲线
-
-    展示投资回报率随预算的变化
-    """
-    df_roi = df_results[df_results['metric'] == 'roi'].copy()
-
-    if df_roi.empty:
-        warnings.warn("No ROI data found")
-        return None
-
-    df_roi = df_roi[df_roi['fold'].isna()].copy()
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    methods = df_roi['method'].unique()
-    colors = sns.color_palette('Set2', n_colors=len(methods))
-    method_colors = dict(zip(methods, colors))
-
-    for method in methods:
-        df_method = df_roi[df_roi['method'] == method].sort_values('budget')
-
-        ax.plot(
-            df_method['budget'],
-            df_method['mean'],
-            marker='o',
-            linewidth=2.5,
-            markersize=8,
-            label=method.replace('_', ' ').title(),
-            color=method_colors[method]
-        )
-
-        ax.fill_between(
-            df_method['budget'],
-            df_method['mean'] - df_method['std'],
-            df_method['mean'] + df_method['std'],
-            alpha=0.2,
-            color=method_colors[method]
-        )
-
-    ax.axhline(y=0, color='gray', linestyle='--', linewidth=2, alpha=0.5,
-               label='Break-even (ROI=0)')
-
-    ax.set_xlabel('Budget (k sensors)', fontsize=12, fontweight='bold')
-    ax.set_ylabel('ROI (Return on Investment)', fontsize=12, fontweight='bold')
-    ax.set_title('Cost-Benefit Analysis: ROI vs Budget\n'
-                 'ROI = (Savings - Cost) / Cost',
-                 fontsize=13, fontweight='bold')
-    ax.legend(loc='best', fontsize=10)
-    ax.grid(True, alpha=0.3)
-
-    if output_dir:
-        for fmt in ['png', 'pdf']:
-            save_path = output_dir / f'f8_roi_curves.{fmt}'
-            fig.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"  ✓ Saved: {save_path.name}")
-
-    return fig
 
 
 # ============================================================================
@@ -1714,7 +1575,7 @@ def generate_all_visualizations_v2(all_results: Dict,
     # F8: ROI 曲线
     print("\n[F8] ROI curves...")
     try:
-        plot_roi_curves(df_results, plots_dir, config)
+        plot_roi_curves_fixed(df_results, plots_dir, config)
     except Exception as e:
         print(f"  ✗ Failed: {e}")
 
@@ -1728,7 +1589,7 @@ def generate_all_visualizations_v2(all_results: Dict,
         print("\n[F11] DDI overlay (EVI vs MI)...")
         try:
             budget = 10  # 选一个代表性预算
-            plot_ddi_overlay_enhanced(
+            plot_ddi_overlay(
                 geom.coords, all_results, sensors,
                 mu_pr, sigma_pr, tau, budget,
                 plots_dir,
@@ -1801,7 +1662,7 @@ def generate_all_visualizations_v2(all_results: Dict,
     # F2: 边际效率（附录）
     print("\n[F2] Marginal efficiency...")
     try:
-        plot_marginal_efficiency(all_results, plots_dir, config)
+        plot_marginal_efficiency_fixed(all_results, plots_dir, config)
     except Exception as e:
         print(f"  ✗ Failed: {e}")
 
@@ -1829,6 +1690,472 @@ def generate_all_visualizations(all_results: Dict,
         Q_pr, mu_pr, output_dir, config,
         scenario='A'
     )
+
+
+def aggregate_results_for_visualization(all_results: dict) -> pd.DataFrame:
+    """
+    ✅ 修复版：将结果转换为DataFrame供可视化使用
+
+    关键改进：
+    - 创建instance_id = f"fold{f}-budget{b}"
+    - 只保留所有方法都完成的实例（inner join）
+    - 排除跳过的fold
+    """
+    rows = []
+    print("    开始聚合结果...")
+
+    # 第一遍：收集所有原始数据
+    for method_name, method_data in all_results.items():
+        print(f"      处理方法: {method_name}")
+        if not isinstance(method_data, dict):
+            continue
+
+        budgets_data = method_data.get('budgets', {})
+        if not budgets_data:
+            continue
+
+        for budget, budget_data in budgets_data.items():
+            if not isinstance(budget_data, dict):
+                continue
+
+            fold_results = budget_data.get('fold_results', [])
+            if not fold_results:
+                continue
+
+            for fold_idx, fold_res in enumerate(fold_results):
+                if not isinstance(fold_res, dict):
+                    continue
+
+                # 🔥 关键修复：跳过被标记为skipped的fold
+                if fold_res.get('skipped', False):
+                    print(f"        Skipping {method_name} budget={budget} fold={fold_idx + 1} (marked as skipped)")
+                    continue
+
+                if not fold_res.get('success', False):
+                    continue
+
+                metrics = fold_res.get('metrics', {})
+                if not metrics or not isinstance(metrics, dict):
+                    continue
+
+                # 🔥 创建instance_id
+                instance_id = f"fold{fold_idx + 1}-budget{budget}"
+
+                for metric_name, metric_value in metrics.items():
+                    if metric_name in ['z_scores', 'type_counts']:
+                        continue
+                    if metric_name.startswith('_'):
+                        continue
+                    if isinstance(metric_value, (list, np.ndarray, dict)):
+                        continue
+                    if metric_value is None:
+                        continue
+
+                    try:
+                        scalar_value = float(metric_value)
+                    except (ValueError, TypeError):
+                        continue
+
+                    if np.isnan(scalar_value):
+                        continue
+
+                    rows.append({
+                        'method': method_name,
+                        'budget': int(budget),
+                        'fold': fold_idx + 1,
+                        'instance_id': instance_id,  # 🔥 新增
+                        'metric': metric_name,
+                        'value': scalar_value
+                    })
+
+    if not rows:
+        warnings.warn("没有有效的结果可以聚合")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    # 🔥 关键修复：Inner join - 只保留所有方法都完成的实例
+    methods = df['method'].unique()
+    print(f"\n    🔍 检查实例完整性...")
+    print(f"    候选方法数: {len(methods)}")
+
+    # 对每个(instance, metric)组合，检查是否所有方法都有数据
+    valid_instances = set()
+    for (instance_id, metric), group in df.groupby(['instance_id', 'metric']):
+        methods_in_group = set(group['method'].unique())
+        if len(methods_in_group) == len(methods):  # 所有方法都有数据
+            valid_instances.add(instance_id)
+
+    if not valid_instances:
+        warnings.warn("没有找到所有方法都完成的实例！")
+        print(f"    原因分析：")
+        for method in methods:
+            method_instances = set(df[df['method'] == method]['instance_id'].unique())
+            print(f"      {method}: {len(method_instances)} instances")
+        return df  # 返回原始df以便调试
+
+    print(f"    ✓ 找到 {len(valid_instances)} 个完整实例")
+    print(f"    示例：{sorted(list(valid_instances))[:5]}")
+
+    # 过滤只保留有效实例
+    df_filtered = df[df['instance_id'].isin(valid_instances)].copy()
+
+    # 计算统计量
+    stats_rows = []
+    for (method, budget, metric), group in df_filtered.groupby(['method', 'budget', 'metric']):
+        values = group['value'].values
+        stats_rows.append({
+            'method': method,
+            'budget': budget,
+            'fold': None,
+            'instance_id': None,
+            'metric': metric,
+            'value': np.mean(values),
+            'mean': np.mean(values),
+            'std': np.std(values),
+            'min': np.min(values),
+            'max': np.max(values),
+            'n_folds': len(values)
+        })
+
+    df_stats = pd.DataFrame(stats_rows)
+    df_combined = pd.concat([df_filtered, df_stats], ignore_index=True)
+
+    print(f"    ✓ 聚合完成: {len(df_filtered)} 行原始数据 + {len(df_stats)} 行统计数据")
+    print(f"    有效实例覆盖的(budget, fold)组合: {len(valid_instances)}")
+
+    return df_combined
+
+
+def plot_roi_curves_fixed(df_results: pd.DataFrame,
+                          output_dir: Path = None,
+                          config=None,
+                          baseline_method: str = None) -> plt.Figure:
+    """
+    ✅ 修复版：ROI vs Budget 曲线 + Near-Threshold 子集对比
+
+    改进：
+    1. 添加 near-threshold 子集的 ROI 曲线
+    2. 明确标注 "Domain-scaled"
+    3. 双面板展示：全域 vs 近阈值
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    # 🔥 提取全域指标
+    df_roi = df_results[df_results['metric'] == 'roi'].copy()
+    df_savings = df_results[df_results['metric'] == 'savings_gbp'].copy()
+    df_cost = df_results[df_results['metric'] == 'total_cost'].copy()
+
+    # 🔥 提取 near-threshold 指标
+    df_roi_near = df_results[df_results['metric'] == 'roi_near_threshold'].copy()
+    df_savings_near = df_results[df_results['metric'] == 'savings_near_threshold'].copy()
+
+    if df_roi.empty:
+        warnings.warn("No ROI data found in results")
+        return None
+
+    # 只保留fold-level数据
+    df_roi = df_roi[df_roi['instance_id'].notna()].copy()
+    df_roi_near = df_roi_near[df_roi_near['instance_id'].notna()].copy() if not df_roi_near.empty else pd.DataFrame()
+
+    if df_roi.empty:
+        warnings.warn("No fold-level ROI data")
+        return None
+
+    # 按方法和预算聚合
+    df_roi_agg = df_roi.groupby(['method', 'budget']).agg({
+        'value': ['mean', 'std', 'count']
+    }).reset_index()
+    df_roi_agg.columns = ['method', 'budget', 'roi_mean', 'roi_std', 'n_folds']
+
+    df_savings_agg = df_savings.groupby(['method', 'budget'])['value'].mean().reset_index()
+    df_savings_agg.columns = ['method', 'budget', 'savings_mean']
+
+    df_cost_agg = df_cost.groupby(['method', 'budget'])['value'].mean().reset_index()
+    df_cost_agg.columns = ['method', 'budget', 'cost_mean']
+
+    # 合并
+    df_plot = df_roi_agg.merge(df_savings_agg, on=['method', 'budget'], how='left')
+    df_plot = df_plot.merge(df_cost_agg, on=['method', 'budget'], how='left')
+    df_plot['net_benefit'] = df_plot['savings_mean'] - df_plot['cost_mean']
+
+    # 🔥 Near-threshold 数据
+    if not df_roi_near.empty:
+        df_roi_near_agg = df_roi_near.groupby(['method', 'budget']).agg({
+            'value': ['mean', 'std']
+        }).reset_index()
+        df_roi_near_agg.columns = ['method', 'budget', 'roi_near_mean', 'roi_near_std']
+
+        df_savings_near_agg = df_savings_near.groupby(['method', 'budget'])['value'].mean().reset_index()
+        df_savings_near_agg.columns = ['method', 'budget', 'savings_near_mean']
+
+        df_plot = df_plot.merge(df_roi_near_agg, on=['method', 'budget'], how='left')
+        df_plot = df_plot.merge(df_savings_near_agg, on=['method', 'budget'], how='left')
+        df_plot['net_benefit_near'] = df_plot['savings_near_mean'] - df_plot['cost_mean']
+        has_near_data = True
+    else:
+        has_near_data = False
+
+    # 🔥 创建三行布局：ROI全域 + ROI近阈值 + Net Benefit
+    n_rows = 3 if has_near_data else 2
+    fig, axes = plt.subplots(n_rows, 1, figsize=(10, 6 * n_rows))
+
+    methods = df_plot['method'].unique()
+    colors = sns.color_palette('Set2', n_colors=len(methods))
+    method_colors = dict(zip(methods, colors))
+
+    # ========== 图1: ROI（全域，Domain-scaled）==========
+    ax1 = axes[0]
+    for method in methods:
+        df_method = df_plot[df_plot['method'] == method].sort_values('budget')
+
+        if df_method.empty:
+            continue
+
+        ax1.plot(
+            df_method['budget'],
+            df_method['roi_mean'],
+            marker='o',
+            linewidth=2.5,
+            markersize=8,
+            label=method.replace('_', ' ').title(),
+            color=method_colors[method]
+        )
+
+        ax1.fill_between(
+            df_method['budget'],
+            df_method['roi_mean'] - df_method['roi_std'],
+            df_method['roi_mean'] + df_method['roi_std'],
+            alpha=0.2,
+            color=method_colors[method]
+        )
+
+    ax1.axhline(y=0, color='gray', linestyle='--', linewidth=2, alpha=0.5,
+                label='Break-even (ROI=0)')
+    ax1.axhline(y=1, color='green', linestyle=':', linewidth=1.5, alpha=0.5,
+                label='2× return')
+
+    ax1.set_xlabel('Budget (k sensors)', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('ROI (Return on Investment)', fontsize=12, fontweight='bold')
+    ax1.set_title('ROI vs Budget (Full Domain, Domain-Scaled)\n'
+                  'ROI = (Savings - Cost) / Cost',
+                  fontsize=13, fontweight='bold')
+    ax1.legend(loc='best', fontsize=10)
+    ax1.grid(True, alpha=0.3)
+
+    # ========== 图2: ROI（Near-Threshold，如果有数据）==========
+    if has_near_data:
+        ax2 = axes[1]
+        for method in methods:
+            df_method = df_plot[df_plot['method'] == method].sort_values('budget')
+
+            if df_method.empty or 'roi_near_mean' not in df_method.columns:
+                continue
+
+            # 过滤掉NaN
+            df_method_clean = df_method.dropna(subset=['roi_near_mean'])
+
+            if df_method_clean.empty:
+                continue
+
+            ax2.plot(
+                df_method_clean['budget'],
+                df_method_clean['roi_near_mean'],
+                marker='s',
+                linewidth=2.5,
+                markersize=8,
+                label=method.replace('_', ' ').title(),
+                color=method_colors[method]
+            )
+
+            if 'roi_near_std' in df_method_clean.columns:
+                ax2.fill_between(
+                    df_method_clean['budget'],
+                    df_method_clean['roi_near_mean'] - df_method_clean['roi_near_std'],
+                    df_method_clean['roi_near_mean'] + df_method_clean['roi_near_std'],
+                    alpha=0.2,
+                    color=method_colors[method]
+                )
+
+        ax2.axhline(y=0, color='gray', linestyle='--', linewidth=2, alpha=0.5)
+        ax2.set_xlabel('Budget (k sensors)', fontsize=12, fontweight='bold')
+        ax2.set_ylabel('ROI (Near-Threshold)', fontsize=12, fontweight='bold')
+        ax2.set_title('ROI vs Budget (Near-Threshold Subset Only)\n'
+                      '|μ - τ| ≤ 1.0σ',
+                      fontsize=13, fontweight='bold')
+        ax2.legend(loc='best', fontsize=10)
+        ax2.grid(True, alpha=0.3)
+
+    # ========== 图3: Net Benefit (£) ==========
+    ax_last = axes[-1]
+    for method in methods:
+        df_method = df_plot[df_plot['method'] == method].sort_values('budget')
+
+        if df_method.empty:
+            continue
+
+        ax_last.plot(
+            df_method['budget'],
+            df_method['net_benefit'],
+            marker='D',
+            linewidth=2.5,
+            markersize=8,
+            label=method.replace('_', ' ').title(),
+            color=method_colors[method]
+        )
+
+    ax_last.axhline(y=0, color='gray', linestyle='--', linewidth=2, alpha=0.5,
+                    label='Break-even')
+
+    ax_last.set_xlabel('Budget (k sensors)', fontsize=12, fontweight='bold')
+    ax_last.set_ylabel('Net Benefit (£)', fontsize=12, fontweight='bold')
+    ax_last.set_title('Net Benefit = Savings - Cost\n'
+                      '(Positive = Profitable, Domain-Scaled)',
+                      fontsize=13, fontweight='bold')
+    ax_last.legend(loc='best', fontsize=10)
+    ax_last.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    if output_dir:
+        for fmt in ['png', 'pdf']:
+            save_path = output_dir / f'f8_roi_curves_fixed.{fmt}'
+            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"  ✓ Saved: {save_path.name}")
+
+    return fig
+
+
+def plot_marginal_efficiency_fixed(all_results: Dict,
+                                   output_dir: Path = None,
+                                   config=None) -> plt.Figure:
+    """
+    ✅ 修复版：边际效率曲线 - 确保数据被正确读取
+
+    关键改进：
+    1. 检查 selection_result 是否存在
+    2. 分图显示不同单位（EVI用£，MI用nats）
+    3. 添加详细的调试信息
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    methods = list(all_results.keys())
+    all_budgets = set()
+
+    for method_data in all_results.values():
+        if 'budgets' in method_data:
+            all_budgets.update(method_data['budgets'].keys())
+
+    budgets_to_plot = sorted(all_budgets)[:3]
+
+    if not budgets_to_plot:
+        warnings.warn("No budget data for marginal efficiency")
+        return None
+
+    # 🔥 分成两行：EVI方法 + 其他方法
+    fig, axes = plt.subplots(2, len(budgets_to_plot),
+                             figsize=(6 * len(budgets_to_plot), 10))
+
+    if len(budgets_to_plot) == 1:
+        axes = axes.reshape(-1, 1)
+
+    colors = sns.color_palette('Set2', n_colors=len(methods))
+    method_colors = dict(zip(methods, colors))
+
+    for col_idx, budget in enumerate(budgets_to_plot):
+        ax_evi = axes[0, col_idx]  # 上图：EVI (£)
+        ax_other = axes[1, col_idx]  # 下图：MI/Others (nats or other units)
+
+        for method in methods:
+            try:
+                method_data = all_results.get(method, {})
+                budget_data = method_data.get('budgets', {}).get(budget, {})
+
+                if not budget_data:
+                    continue
+
+                fold_results = budget_data.get('fold_results', [])
+
+                # 🔥 关键修复：从任一成功的fold中提取 selection_result
+                marginal_gains = None
+                for fold_res in fold_results:
+                    if not isinstance(fold_res, dict):
+                        continue
+                    if not fold_res.get('success', False):
+                        continue
+
+                    sel_result = fold_res.get('selection_result')
+                    if sel_result is None:
+                        print(f"      Warning: {method} budget={budget} has no selection_result")
+                        continue
+
+                    if hasattr(sel_result, 'marginal_gains'):
+                        marginal_gains = sel_result.marginal_gains
+                        if marginal_gains and len(marginal_gains) > 0:
+                            print(f"      ✓ {method} budget={budget}: found {len(marginal_gains)} marginal gains")
+                            break
+                        else:
+                            print(f"      Warning: {method} budget={budget} has empty marginal_gains")
+                    else:
+                        print(f"      Warning: {method} budget={budget} selection_result has no marginal_gains attr")
+
+                if marginal_gains is None or len(marginal_gains) == 0:
+                    print(f"      ✗ {method} budget={budget}: no valid marginal_gains found")
+                    continue
+
+                steps = np.arange(1, len(marginal_gains) + 1)
+
+                # 🔥 根据方法类型选择子图
+                if 'evi' in method.lower():
+                    ax = ax_evi
+                    ylabel = 'Marginal EVI Gain (£)'
+                else:
+                    ax = ax_other
+                    ylabel = 'Marginal Gain (method-dependent)'
+
+                ax.plot(
+                    steps,
+                    marginal_gains,
+                    marker='o',
+                    label=method.replace('_', ' ').title(),
+                    color=method_colors.get(method, 'gray'),
+                    linewidth=2,
+                    markersize=4
+                )
+
+            except Exception as e:
+                print(f"  Warning: Failed to plot {method} at budget {budget}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        # 设置坐标轴
+        ax_evi.set_xlabel('Selection Step', fontsize=11, fontweight='bold')
+        ax_evi.set_ylabel('Marginal EVI Gain (£)', fontsize=11)
+        ax_evi.set_title(f'Budget k={budget} (EVI Methods)', fontsize=12, fontweight='bold')
+        ax_evi.legend(loc='best', fontsize=9)
+        ax_evi.grid(True, alpha=0.3)
+
+        ax_other.set_xlabel('Selection Step', fontsize=11, fontweight='bold')
+        ax_other.set_ylabel('Marginal Gain (MI/Others)', fontsize=11)
+        ax_other.set_title(f'Budget k={budget} (MI/A-opt/Maxmin)', fontsize=12, fontweight='bold')
+        ax_other.legend(loc='best', fontsize=9)
+        ax_other.grid(True, alpha=0.3)
+
+    plt.suptitle('Marginal Efficiency Curves\n(Split by metric unit)',
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+
+    if output_dir:
+        for fmt in ['png', 'pdf']:
+            save_path = output_dir / f'f2_marginal_efficiency_fixed.{fmt}'
+            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"  ✓ Saved: {save_path.name}")
+
+    return fig
+
 
 
 if __name__ == "__main__":

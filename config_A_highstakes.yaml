@@ -46,8 +46,9 @@ prior:
   mu_prior_mean: 2.2
   mu_prior_std: 0.3
 
-  beta_base: 5.0
-  beta_hot: 1.0e-4
+  # 热点配置（用于空间异质性）
+  beta_base: 5.0     # 非热点区域的nugget（低不确定性）
+  beta_hot: 1.0e-4   # 热点区域的nugget（高不确定性）
 
   hotspots:
     - center_m: [25, 75]
@@ -93,7 +94,7 @@ sensors:
       footprint: avg3x3
 
   pool_strategy: "grid_subsample"
-  pool_fraction: 0.20  # 🔥 稀疏池：仅 80 个候选位置（400×0.2）
+  pool_fraction: 0.10  # 🔥 稀疏池：仅 80 个候选位置（400×0.2）
   type_mix: [0.15, 0.20, 0.10, 0.20, 0.15, 0.20]
 
   use_heterogeneous: true
@@ -109,17 +110,28 @@ sensors:
 # ----------------------------------------------------------------------------
 decision:
   tau_iri: null
-  tau_quantile: 0.85  # 🔥 高分位阈值，提升 DDI 但避免 100%
+  tau_quantile: 0.88  # 🔥 高分位阈值，提升 DDI 但避免 100%
 
-  # 🔥 强不对称代价比 (25:1)
-  L_FP_gbp: 5000.0      # 误报：浪费维护资源
-  L_FN_gbp: 125000.0    # 🔥 漏检：路段失修导致事故/诉讼
-  L_TP_gbp: 800.0       # 正确维护的成本
+  # 代价矩阵
+  # 🔥 方案1（推荐）：提高 L_FP，p_T ≈ 0.25
+  L_FP_gbp: 30000.0      # 5000 → 30000
+  L_FN_gbp: 120000.0     # 保持不变
+  L_TP_gbp: 800.0
   L_TN_gbp: 0.0
+  # p_T = 30000 / (30000 + 120000 - 800) ≈ 0.20 (20%)
 
-  target_ddi: 0.25      # 🎯 目标 DDI: 25%（配合逐点 σ 计算）
-  K_action: 10          # 🔥 行动受限：最多维护 10 个位置
+  # 🔥 或方案2：降低 L_FN，p_T ≈ 0.30
+  # L_FP_gbp: 25000.0
+  # L_FN_gbp: 60000.0
+  # L_TP_gbp: 800.0
+  # p_T = 25000 / (25000 + 60000 - 800) ≈ 0.30 (30%)
 
+  target_ddi: 0.30  # Scenario A: 0.25-0.35 | Scenario B: 0.10-0.15
+  K_action: 10      # Scenario A: 10 | Scenario B: null
+
+metrics:
+  scale_savings_to_domain: true  # ✅ 启用域缩放（让测试集损失可比于全域成本）
+  coverage_clip: [0.0, 1.0]      # Coverage 裁剪范围
 # ----------------------------------------------------------------------------
 # Sensor Selection Methods - 🔥 前段预算密集
 # ----------------------------------------------------------------------------
@@ -133,7 +145,8 @@ selection:
     - random
 
   budget_type: "count"
-  budgets: [3, 5, 10, 15, 20]  # 🔥 前段密集，差距更明显
+  budgets: [1, 3, 5, 8, 10]  # 🔥 从 [3,5,10,15,20] 改为 [1,3,5,8,10]
+
 
   greedy_mi:
     batch_size: 1
@@ -146,28 +159,34 @@ selection:
     use_cost: true
 
   greedy_evi:
-    n_y_samples: 0        # 🔥 解析法（更快）
+    n_y_samples: 0
     use_cost: true
-    mi_prescreen: true
-    keep_fraction: 0.50   # 🔥 预筛 50%，平衡精度与速度
+    mi_prescreen: true  # 主实验保持true；相关性实验时设false
+    keep_fraction: 0.50  # Scenario A: 0.5 | Scenario B: 0.5
+
+    # 🔥 关键修复：禁用fold跳过机制
+    every_n_folds: 1       # ✅ 1=运行所有fold（不跳过）
+    budgets_subset: []     # ✅ 空列表=运行所有budget
+    max_folds: null        # ✅ null=不限制fold数量
+    must_budgets: []       # ✅ 不需要特殊处理的budget
 
   maxmin:
     use_cost: true
-
 # ----------------------------------------------------------------------------
 # Expected Value of Information - 🔥 足够样本确保稳定
 # ----------------------------------------------------------------------------
 evi:
-  compute_for: ["greedy_mi", "greedy_aopt", "greedy_evi"]
+  compute_for: ["greedy_mi", "greedy_evi"]
   method: "monte_carlo"
-  monte_carlo_samples: 32  # 🔥 32 样本：够稳又不过慢
+  monte_carlo_samples: 32  # Scenario A: 32 | Scenario B: 16
+
 
 # ----------------------------------------------------------------------------
 # Cross-Validation
 # ----------------------------------------------------------------------------
 cv:
   scheme: "spatial_block"
-  k_folds: 3
+  k_folds: 5  # 🔥 建议至少5折，以获得足够实例数（5×5 budgets = 25）
   buffer_width_multiplier: 1.5
   block_strategy: "kmeans"
   ensure_connected: true
@@ -220,9 +239,9 @@ plots:
 
   business_metrics:
     enable: true
-    baseline_method: "uniform"
-    show_savings: true      # 🔥 显示 EVI 相对 MI 的省钱幅度
-    show_roi: true          # 🔥 显示投资回报率
+    baseline_method: "uniform"  # 🔥 固定baseline
+    show_savings: true     # Scenario A: true | Scenario B: false
+    show_roi: true
     show_cost_efficiency: true
 
   effect_size:
@@ -232,7 +251,7 @@ plots:
     top_k_comparisons: 20
 
   critical_region:
-    enable: true
+    enable: true   # Scenario A: true | Scenario B: false
     epsilon: 0.2
     plot_heatmap: true
 
@@ -243,6 +262,8 @@ plots:
       enable: true
       normalize_by_cost: true
       unit: "gbp_per_test_point"
+      # 🔥 新增：分图显示不同单位
+      split_by_unit: true
 
     type_composition:
       enable: true
@@ -251,9 +272,11 @@ plots:
     mi_voi_correlation:
       enable: true
       methods: ["greedy_mi", "greedy_evi"]
+      # 🔥 相关性实验：暂时禁用MI预筛选
+      correlation_mode_disable_prescreen: false
 
     calibration_plots:
-      enable: true
+      enable: true  # 可移到附录
 
     spatial_diagnostics:
       enable: true
@@ -264,13 +287,17 @@ plots:
       budgets_to_show: [5, 10, 15, 20]
 
     roi_curves:
-      enable: true  # 🔥 ROI 曲线：EVI 应更陡峭
+      enable: true
+      baseline_method: "uniform"  # 🔥 明确指定baseline
+      show_near_threshold: true  # 🔥 新增开关
+
 
     robustness_heatmap:
-      enable: false  # 场景 A 不强调鲁棒性
+      enable: false  # Scenario A: false | Scenario B: true
 
     ddi_overlay:
-      enable: true  # 🔥 叠加 EVI vs MI 的选点分布
+      enable: true   # Scenario A: true | Scenario B: false
+      methods_to_compare: ['greedy_evi', 'greedy_mi']
 
 # ----------------------------------------------------------------------------
 # Acceptance Criteria

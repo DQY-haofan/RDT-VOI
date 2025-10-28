@@ -41,7 +41,6 @@ class GreedyMIWrapper:
             batch_size=self.batch_size
         )
 
-
 class GreedyAoptWrapper:
     """Greedy A-optimal wrapper (pickle-safe)"""
 
@@ -206,6 +205,7 @@ class RandomWrapper:
         )
 
 
+
 # ============================================================================
 # 🔥 修复后的工厂函数
 # ============================================================================
@@ -213,11 +213,7 @@ class RandomWrapper:
 def get_selection_method(method_name: str, config, geom,
                          x_true: np.ndarray = None,
                          test_idx: np.ndarray = None) -> Callable:
-    """
-    Get a selection method wrapper (pickle-safe version)
-
-    返回可序列化的类实例而非嵌套函数
-    """
+    """Get a selection method wrapper (pickle-safe version)"""
     method_lower = method_name.lower().replace('-', '_').replace(' ', '_')
 
     if method_lower in ['greedy_mi', 'mi']:
@@ -255,33 +251,55 @@ def get_available_methods(config) -> List[str]:
         return ['greedy_mi', 'greedy_aopt', 'uniform', 'random']
 
 
+
 def should_use_evi(method_name: str, budget: int, fold_idx: int,
-                   config) -> bool:
-    """决定是否运行 EVI 的跳过策略"""
+                   config, strict_mode: bool = True) -> bool:
+    """
+    ✅ 修复版：决定是否运行EVI的跳过策略
+
+    关键改进：
+    - 默认strict_mode=True：所有fold/budget都运行（确保评测公平）
+    - 只在显式设置strict_mode=False时才应用跳过逻辑
+
+    Args:
+        method_name: 方法名称
+        budget: 预算
+        fold_idx: fold索引
+        config: 配置对象
+        strict_mode: 🔥 严格模式（默认True，禁用跳过）
+
+    Returns:
+        是否运行该fold/budget组合
+    """
     method_lower = method_name.lower()
     if method_lower not in ['greedy_evi', 'evi', 'greedy-evi', 'myopic_evi']:
         return True
 
+    # 🔥 关键修复：默认运行所有fold/budget
+    if strict_mode:
+        return True
+
+    # 以下是旧的跳过逻辑（仅在strict_mode=False时启用）
     if hasattr(config.selection, 'greedy_evi'):
         evi_cfg = config.selection.greedy_evi
 
         # must_budgets - 这些预算必须运行所有折
-        must_budgets = set(evi_cfg.get('must_budgets', [10, 30]))
+        must_budgets = set(evi_cfg.get('must_budgets', []))
         if budget in must_budgets:
             return True
 
-        # 检查 budget 约束
+        # 检查budget约束
         if 'budgets_subset' in evi_cfg:
             budgets_subset = evi_cfg.get('budgets_subset', [])
             if budgets_subset and budget not in budgets_subset:
                 return False
 
-        # fold 约束 - 至少保留第1折
+        # fold约束 - 至少保留第1折
         if fold_idx == 0:
             return True
 
         # 每N折运行一次
-        every_n = evi_cfg.get('every_n_folds', 2)
+        every_n = evi_cfg.get('every_n_folds', 1)  # 默认1=运行所有
         if every_n and every_n > 1:
             if (fold_idx % every_n) != 0:
                 return False
@@ -342,3 +360,4 @@ def compute_Q_pr(geom, config):
     from spatial_field import build_prior
     Q_pr, _ = build_prior(geom, config.prior)
     return Q_pr
+

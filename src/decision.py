@@ -68,16 +68,6 @@ def expected_loss(mu_post: np.ndarray,
                  tau: float = None) -> float:
     """
     Compute expected economic loss averaged over test set.
-
-    Args:
-        mu_post: Posterior means (n,)
-        sigma_post: Posterior std deviations (n,)
-        decision_config: DecisionConfig object
-        test_indices: Subset to evaluate (if None, use all)
-        tau: Decision threshold (if None, get from decision_config)
-
-    Returns:
-        expected_loss: Mean conditional risk over test set (GBP)
     """
     if test_indices is None:
         test_indices = np.arange(len(mu_post))
@@ -87,13 +77,15 @@ def expected_loss(mu_post: np.ndarray,
         if decision_config.tau_iri is not None:
             tau = decision_config.tau_iri
         elif decision_config.tau_quantile is not None:
-            # 🔥 自动计算动态阈值（使用后验均值）
             tau = float(np.quantile(mu_post, decision_config.tau_quantile))
-            warnings.warn(
-                f"tau_iri not set, using dynamic threshold from posterior: "
-                f"tau = quantile(mu_post, {decision_config.tau_quantile}) = {tau:.3f}. "
-                "For better performance, set tau_iri in main() before evaluation."
-            )
+            # 🔥 修改：只在 tau_iri 未预先缓存时警告
+            if not hasattr(decision_config, '_tau_warning_shown'):
+                warnings.warn(
+                    f"Computing dynamic threshold on-the-fly (tau={tau:.3f}). "
+                    f"Pre-compute tau_iri in main() for better performance.",
+                    category=UserWarning, stacklevel=2
+                )
+                decision_config._tau_warning_shown = True
         else:
             raise ValueError(
                 "Decision threshold not configured. "
