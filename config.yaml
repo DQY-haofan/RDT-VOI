@@ -153,7 +153,7 @@ selection:
   budget_type: "count"     # "count" 或 "monetary"
 
   # 台数预算（稀缺段加密）
-  budgets: [5, 10, 20]
+  budgets: [3, 5, 10, 20, 40]
 
   # 货币预算（可选，当 budget_type="monetary" 时启用）
   # budgets_gbp: [500, 1000, 2000, 3000, 5000, 8000, 12000, 20000]
