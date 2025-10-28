@@ -280,7 +280,8 @@ def _get_zone_properties(coords: np.ndarray,
         cost_zones: 区域定义列表
 
     Returns:
-        属性字典
+        属性字典 {'cost_multiplier': 1.5, 'noise_multiplier': 0.8,
+                 'allowed_types': [...]}
     """
     if cost_zones is None or len(cost_zones) == 0:
         return {}
@@ -292,8 +293,8 @@ def _get_zone_properties(coords: np.ndarray,
     best_zone = {}
 
     for zone in cost_zones:
-        center = np.array(zone['center'])
-        radius = zone['radius']
+        center = np.array(zone['center_m'])
+        radius = zone['radius_m']
 
         dist = np.sqrt((x - center[0]) ** 2 + (y - center[1]) ** 2)
 
@@ -312,6 +313,9 @@ def create_cost_zones_example(geom) -> List[Dict]:
     - 高风险区（桥面）：昂贵高精度传感器
     - 中等区域：中等成本
     - 远程区域：传感器运输成本高
+
+    Returns:
+        区域配置列表
     """
     if geom.mode != "grid2d":
         return []
@@ -325,8 +329,8 @@ def create_cost_zones_example(geom) -> List[Dict]:
     zones = [
         # 高风险区（中心）：只允许高精度，成本 1.5倍
         {
-            'center': [center_x, center_y],
-            'radius': nx * geom.h * 0.2,
+            'center_m': [center_x, center_y],
+            'radius_m': nx * geom.h * 0.2,
             'cost_multiplier': 1.5,
             'noise_multiplier': 0.7,
             'allowed_types': ['inertial_profiler', 'photogrammetry']
@@ -334,8 +338,8 @@ def create_cost_zones_example(geom) -> List[Dict]:
 
         # 远程区域（左下角）：运输成本高，噪声大
         {
-            'center': [center_x * 0.3, center_y * 0.3],
-            'radius': nx * geom.h * 0.15,
+            'center_m': [center_x * 0.3, center_y * 0.3],
+            'radius_m': nx * geom.h * 0.15,
             'cost_multiplier': 2.0,
             'noise_multiplier': 1.3,
             'allowed_types': ['smartphone']  # 只有便宜但噪声大的
@@ -345,6 +349,118 @@ def create_cost_zones_example(geom) -> List[Dict]:
     return zones
 
 
+def generate_heterogeneous_sensor_pool(geom, sensors_config,
+                                       cost_zones: List[Dict] = None,
+                                       rng: np.random.Generator = None) -> List[Sensor]:
+    """
+    生成异质化传感器池（带空间分区的成本/噪声调整）
+
+    这是 generate_sensor_pool() 的增强版，支持：
+    - 不同区域使用不同传感器类型
+    - 区域化成本倍增
+    - 区域化噪声调整
+
+    Args:
+        geom: 几何对象
+        sensors_config: 传感器配置
+        cost_zones: 成本区域定义列表，格式：
+            [{'center_m': [x, y], 'radius_m': r,
+              'cost_multiplier': 1.5, 'noise_multiplier': 0.8,
+              'allowed_types': ['type1', 'type2']}]
+        rng: 随机数生成器
+
+    Returns:
+        sensors: 异质化传感器列表
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    n_total = geom.n
+    pool_size = int(n_total * sensors_config.pool_fraction)
+
+    # 选择候选位置
+    if sensors_config.pool_strategy == "grid_subsample":
+        step = max(1, n_total // pool_size)
+        candidate_locs = np.arange(0, n_total, step)[:pool_size]
+    elif sensors_config.pool_strategy == "random":
+        candidate_locs = rng.choice(n_total, size=pool_size, replace=False)
+    else:
+        candidate_locs = rng.choice(n_total, size=pool_size, replace=False)
+
+    # 如果没有提供cost_zones，使用默认行为
+    if cost_zones is None:
+        print("  No cost zones provided, using uniform sensor generation")
+        return generate_sensor_pool(geom, sensors_config, rng)
+
+    # 构建类型映射
+    type_map = {st.name: st for st in sensors_config.types}
+
+    sensors = []
+
+    for sensor_id, loc in enumerate(candidate_locs):
+        loc_coords = geom.coords[loc]
+
+        # 确定该位置的区域属性
+        zone_props = _get_zone_properties(loc_coords, cost_zones)
+
+        # 从允许的类型中选择
+        allowed_types = zone_props.get('allowed_types',
+                                       [st.name for st in sensors_config.types])
+
+        # 筛选可用类型
+        available_types = [st for st in sensors_config.types
+                           if st.name in allowed_types]
+
+        if not available_types:
+            # 如果区域限制导致没有可用类型，使用所有类型
+            available_types = sensors_config.types
+
+        # 加权选择类型
+        type_weights = np.array([sensors_config.type_mix[sensors_config.types.index(st)]
+                                 for st in available_types])
+        type_weights = type_weights / type_weights.sum()
+
+        stype = rng.choice(available_types, p=type_weights)
+
+        # 应用区域调整
+        cost_mult = zone_props.get('cost_multiplier', 1.0)
+        noise_mult = zone_props.get('noise_multiplier', 1.0)
+
+        adjusted_cost = stype.cost_gbp * cost_mult
+        adjusted_noise_std = stype.noise_std * noise_mult
+
+        # 获取足迹
+        idxs, weights = get_footprint_indices(geom, loc, stype.footprint)
+
+        sensor = Sensor(
+            id=sensor_id,
+            idxs=idxs,
+            weights=weights,
+            noise_var=adjusted_noise_std ** 2,
+            cost=adjusted_cost,
+            type_name=stype.name
+        )
+        sensors.append(sensor)
+
+    # 统计分布
+    print(f"  Generated {len(sensors)} heterogeneous sensors:")
+    type_counts = {}
+    cost_stats = []
+    noise_stats = []
+
+    for s in sensors:
+        type_counts[s.type_name] = type_counts.get(s.type_name, 0) + 1
+        cost_stats.append(s.cost)
+        noise_stats.append(np.sqrt(s.noise_var))
+
+    print("    Type distribution:")
+    for tname, count in type_counts.items():
+        print(f"      {tname}: {count} ({count / len(sensors) * 100:.1f}%)")
+
+    print(f"    Cost range: £{np.min(cost_stats):.0f} - £{np.max(cost_stats):.0f}")
+    print(f"    Noise std range: {np.min(noise_stats):.3f} - {np.max(noise_stats):.3f}")
+
+    return sensors
 
 def assemble_H_R(sensors: List[Sensor], n: int) -> Tuple[sp.spmatrix, np.ndarray]:
     """
