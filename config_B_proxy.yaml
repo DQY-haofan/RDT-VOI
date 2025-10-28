@@ -95,7 +95,7 @@ sensors:
 
   pool_strategy: "grid_subsample"
   pool_fraction: 0.60  # 🔥 密集池：240 个候选位置（400×0.6）
-  type_mix: [0.3, 0.4, 0.3]
+  type_mix: [0.15, 0.20, 0.10, 0.20, 0.15, 0.20]  
 
   use_heterogeneous: true
   cost_zones:
