@@ -350,27 +350,10 @@ def create_cost_zones_example(geom) -> List[Dict]:
 
 
 def generate_heterogeneous_sensor_pool(geom, sensors_config,
-                                       cost_zones: List[Dict] = None,
-                                       rng: np.random.Generator = None) -> List[Sensor]:
+                                      cost_zones: List[Dict] = None,
+                                      rng: np.random.Generator = None) -> List[Sensor]:
     """
-    生成异质化传感器池（带空间分区的成本/噪声调整）
-
-    这是 generate_sensor_pool() 的增强版，支持：
-    - 不同区域使用不同传感器类型
-    - 区域化成本倍增
-    - 区域化噪声调整
-
-    Args:
-        geom: 几何对象
-        sensors_config: 传感器配置
-        cost_zones: 成本区域定义列表，格式：
-            [{'center_m': [x, y], 'radius_m': r,
-              'cost_multiplier': 1.5, 'noise_multiplier': 0.8,
-              'allowed_types': ['type1', 'type2']}]
-        rng: 随机数生成器
-
-    Returns:
-        sensors: 异质化传感器列表
+    生成异质化传感器池（修复版）
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -387,13 +370,18 @@ def generate_heterogeneous_sensor_pool(geom, sensors_config,
     else:
         candidate_locs = rng.choice(n_total, size=pool_size, replace=False)
 
-    # 如果没有提供cost_zones，使用默认行为
+    # 如果没有提供cost_zones，回退到标准方法
     if cost_zones is None:
         print("  No cost zones provided, using uniform sensor generation")
         return generate_sensor_pool(geom, sensors_config, rng)
 
-    # 构建类型映射
-    type_map = {st.name: st for st in sensors_config.types}
+    # ✅ 验证 type_mix 长度
+    if len(sensors_config.type_mix) != len(sensors_config.types):
+        print(f"  Warning: type_mix length ({len(sensors_config.type_mix)}) "
+              f"!= types length ({len(sensors_config.types)})")
+        print(f"  Using uniform weights")
+        # 使用均匀权重
+        sensors_config.type_mix = [1.0 / len(sensors_config.types)] * len(sensors_config.types)
 
     sensors = []
 
@@ -405,20 +393,33 @@ def generate_heterogeneous_sensor_pool(geom, sensors_config,
 
         # 从允许的类型中选择
         allowed_types = zone_props.get('allowed_types',
-                                       [st.name for st in sensors_config.types])
+                                      [st.name for st in sensors_config.types])
 
         # 筛选可用类型
         available_types = [st for st in sensors_config.types
-                           if st.name in allowed_types]
+                          if st.name in allowed_types]
 
         if not available_types:
             # 如果区域限制导致没有可用类型，使用所有类型
             available_types = sensors_config.types
 
-        # 加权选择类型
-        type_weights = np.array([sensors_config.type_mix[sensors_config.types.index(st)]
-                                 for st in available_types])
-        type_weights = type_weights / type_weights.sum()
+        # ✅ 安全地获取类型权重
+        type_weights = []
+        for st in available_types:
+            try:
+                idx = sensors_config.types.index(st)
+                if idx < len(sensors_config.type_mix):
+                    type_weights.append(sensors_config.type_mix[idx])
+                else:
+                    type_weights.append(1.0)
+            except (ValueError, IndexError):
+                type_weights.append(1.0)
+
+        type_weights = np.array(type_weights)
+        if type_weights.sum() > 0:
+            type_weights = type_weights / type_weights.sum()
+        else:
+            type_weights = np.ones(len(available_types)) / len(available_types)
 
         stype = rng.choice(available_types, p=type_weights)
 
@@ -454,13 +455,14 @@ def generate_heterogeneous_sensor_pool(geom, sensors_config,
         noise_stats.append(np.sqrt(s.noise_var))
 
     print("    Type distribution:")
-    for tname, count in type_counts.items():
+    for tname, count in sorted(type_counts.items()):
         print(f"      {tname}: {count} ({count / len(sensors) * 100:.1f}%)")
 
     print(f"    Cost range: £{np.min(cost_stats):.0f} - £{np.max(cost_stats):.0f}")
     print(f"    Noise std range: {np.min(noise_stats):.3f} - {np.max(noise_stats):.3f}")
 
     return sensors
+
 
 def assemble_H_R(sensors: List[Sensor], n: int) -> Tuple[sp.spmatrix, np.ndarray]:
     """
