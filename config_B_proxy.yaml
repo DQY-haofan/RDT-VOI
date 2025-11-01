@@ -143,10 +143,13 @@ selection:
   budgets: [3, 5, 10, 15, 20]
 
   greedy_mi:
-    batch_size: 1
+    batch_size: 64
     adaptive_pruning: true
     prune_threshold: 0.10
     use_cost: true
+    keep_fraction: null  # 🔥 新增: 动态计算
+    adaptive_keep: true  # 🔥 新增: 启用动态预筛
+
 
   greedy_aopt:
     n_probes: 32
@@ -156,7 +159,7 @@ selection:
     n_y_samples: 0
     use_cost: true
     mi_prescreen: true  # 主实验保持true；相关性实验时设false
-    keep_fraction: 0.50  # Scenario A: 0.5 | Scenario B: 0.5
+    keep_fraction: null  # 🔥 改为动态计算
 
     # 🔥 关键修复：禁用fold跳过机制
     every_n_folds: 1       # ✅ 1=运行所有fold（不跳过）

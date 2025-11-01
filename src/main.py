@@ -295,16 +295,12 @@ def apply_quick_test_overrides(cfg):
 
 def run_single_fold_worker(fold_data: dict) -> dict:
     """
-    ✅ 修复版：统一ROI计算 + Domain Scaling
-
-    关键改进：
-    1. 正确应用 domain scaling（测试集损失 → 全域损失）
-    2. ⚠️ Scenario A 添加 near-threshold 子集评估
-    3. ⚠️ Scenario B 记录详细的时间统计
+    ✅ 完全修复版：避免geom对象序列化，直接使用原始数据
     """
     import time
     import warnings
     import numpy as np
+    import scipy.sparse as sp
     from inference import compute_posterior, compute_posterior_variance_diagonal, SparseFactor
     from sensors import get_observation
     from evaluation import compute_metrics, morans_i
@@ -320,18 +316,25 @@ def run_single_fold_worker(fold_data: dict) -> dict:
     x_true = fold_data['x_true']
     sensors = fold_data['sensors']
     decision_config = fold_data['decision_config']
-    geom = fold_data['geom']
+
+    # 🔥 关键修复：直接使用标量，不构建geom对象
+    n_domain = fold_data['n_domain']  # 直接获取域大小
+    coords = fold_data['coords']
+    adjacency_test_data = fold_data.get('adjacency_test')
+
     rng = np.random.default_rng(fold_data['rng_seed'])
 
-    # 🔥 从config读取是否启用domain scaling
+    # 从config读取是否启用domain scaling
     enable_scaling = fold_data.get('enable_domain_scaling', True)
 
-    # 🔥 检测场景类型（通过 DDI 或配置名称）
-    scenario = fold_data.get('scenario', 'A')  # 默认 A
+    # 检测场景类型
+    scenario = fold_data.get('scenario', 'A')
+
+    morans_permutations = fold_data.get('morans_permutations', 999)
 
     try:
         # ====================================================================
-        # 1. 计算先验损失（用于ROI）- 两个场景都需要
+        # 1. 计算先验损失（用于ROI）
         # ====================================================================
         t_prior_start = time.time()
         tau = decision_config.get_threshold(mu_pr)
@@ -344,11 +347,10 @@ def run_single_fold_worker(fold_data: dict) -> dict:
             test_indices=np.arange(len(test_idx)), tau=tau
         )
 
-        # 🔥 Domain Scaling（核心修复，两个场景都需要）
+        # 🔥 Domain Scaling（使用直接传递的n_domain）
         if enable_scaling:
-            N_domain = geom.n
             N_test = len(test_idx)
-            scale_factor = N_domain / N_test
+            scale_factor = n_domain / N_test  # ✅ 不再依赖geom对象
             prior_loss_scaled = prior_loss_test * scale_factor
         else:
             prior_loss_scaled = prior_loss_test
@@ -357,7 +359,7 @@ def run_single_fold_worker(fold_data: dict) -> dict:
         prior_time = time.time() - t_prior_start
 
         # ====================================================================
-        # 2. 传感器选择 - 两个场景都需要
+        # 2. 传感器选择
         # ====================================================================
         t_sel_start = time.time()
         selection_result = selection_method(sensors, k, Q_pr, mu_pr)
@@ -367,7 +369,7 @@ def run_single_fold_worker(fold_data: dict) -> dict:
         sensor_cost = selection_result.total_cost
 
         # ====================================================================
-        # 3. 生成观测 + 计算后验 - 两个场景都需要
+        # 3. 生成观测 + 计算后验
         # ====================================================================
         y, H, R = get_observation(x_true, selected_sensors, rng)
 
@@ -381,7 +383,7 @@ def run_single_fold_worker(fold_data: dict) -> dict:
         sigma_post[test_idx] = sigma_post_test
 
         # ====================================================================
-        # 4. 基础指标 - 两个场景都需要
+        # 4. 基础指标
         # ====================================================================
         metrics = compute_metrics(mu_post, sigma_post, x_true, test_idx, decision_config)
         posterior_loss_test = metrics['expected_loss_gbp']
@@ -391,7 +393,7 @@ def run_single_fold_worker(fold_data: dict) -> dict:
         else:
             posterior_loss_scaled = posterior_loss_test
 
-        # 🔥 修复后的ROI计算
+        # ROI计算
         savings_scaled = prior_loss_scaled - posterior_loss_scaled
 
         if sensor_cost > 0:
@@ -402,7 +404,7 @@ def run_single_fold_worker(fold_data: dict) -> dict:
             cost_efficiency = np.inf if savings_scaled > 0 else 0.0
 
         # ====================================================================
-        # 5. ⚠️ Scenario A 特有：Near-threshold 子集评估
+        # 5. Scenario A 特有：Near-threshold 子集评估
         # ====================================================================
         near_threshold_metrics = {}
         if scenario == 'A':
@@ -445,9 +447,7 @@ def run_single_fold_worker(fold_data: dict) -> dict:
             except Exception as e:
                 warnings.warn(f"Near-threshold evaluation failed: {e}")
 
-        # ====================================================================
-        # 6. 记录完整指标 - 两个场景都需要
-        # ====================================================================
+        # 记录完整指标
         metrics.update({
             'roi': float(roi),
             'cost_efficiency': float(cost_efficiency),
@@ -457,11 +457,11 @@ def run_single_fold_worker(fold_data: dict) -> dict:
             'total_cost': float(sensor_cost),
             'prior_loss_test_only': float(prior_loss_test),
             'domain_scale_factor': float(scale_factor),
-            **near_threshold_metrics  # ⚠️ Scenario A 才有数据
+            **near_threshold_metrics
         })
 
         # ====================================================================
-        # 7. DDI统计 - 两个场景都需要
+        # 6. DDI统计
         # ====================================================================
         try:
             from spatial_field import compute_ddi
@@ -480,7 +480,7 @@ def run_single_fold_worker(fold_data: dict) -> dict:
             metrics['ddi_prior'] = np.nan
 
         # ====================================================================
-        # 8. ⚠️ Scenario A 特有：行动受限评估
+        # 7. Scenario A 特有：行动受限评估
         # ====================================================================
         if scenario == 'A' and hasattr(decision_config, 'K_action') and decision_config.K_action is not None:
             try:
@@ -522,15 +522,23 @@ def run_single_fold_worker(fold_data: dict) -> dict:
                 warnings.warn(f"Action-constrained evaluation failed: {e}")
 
         # ====================================================================
-        # 9. Moran's I - 两个场景都需要
+        # 8. Moran's I（使用传递的adjacency子矩阵）
         # ====================================================================
         residuals = mu_post - x_true
-        if geom.adjacency is not None:
+        if adjacency_test_data is not None:
             try:
+                # 重建稀疏矩阵
+                adj_test = sp.coo_matrix(
+                    (adjacency_test_data['data'],
+                     (adjacency_test_data['row'], adjacency_test_data['col'])),
+                    shape=adjacency_test_data['shape']
+                ).tocsr()
+
                 I_stat, I_pval = morans_i(
                     residuals[test_idx],
-                    geom.adjacency[test_idx][:, test_idx],
-                    n_permutations=999, rng=rng
+                    adj_test,
+                    n_permutations=morans_permutations,
+                    rng=rng
                 )
                 metrics['morans_i'] = float(I_stat)
                 metrics['morans_pval'] = float(I_pval)
@@ -538,7 +546,7 @@ def run_single_fold_worker(fold_data: dict) -> dict:
                 warnings.warn(f"Moran's I computation failed: {e}")
 
         # ====================================================================
-        # 10. 时间统计 - 两个场景都需要
+        # 9. 时间统计
         # ====================================================================
         metrics['prior_computation_time_sec'] = float(prior_time)
         metrics['selection_time_sec'] = float(selection_time)
@@ -546,7 +554,7 @@ def run_single_fold_worker(fold_data: dict) -> dict:
         metrics['total_time_sec'] = float(prior_time + selection_time + inference_time)
 
         # ====================================================================
-        # 11. 传感器诊断 - 两个场景都需要
+        # 10. 传感器诊断
         # ====================================================================
         metrics['n_selected'] = len(selection_result.selected_ids)
 
@@ -586,16 +594,12 @@ def run_single_fold_worker(fold_data: dict) -> dict:
             'traceback': traceback.format_exc(),
         }
 
+
 def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
                           x_true, sensors, test_idx_global=None,
                           use_parallel=False, n_workers=None, verbose=True) -> dict:
     """
     运行方法评估（支持并行处理）
-
-    Args:
-        use_parallel: 是否使用并行处理
-        n_workers: 并行worker数量（None=自动检测）
-        verbose: 是否输出详细信息
     """
     if verbose:
         print(f"\n{'=' * 70}")
@@ -638,16 +642,24 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
         'method_name': method_name,
         'n_folds': len(folds)
     }
-    # 🔥 检测场景类型
+
+    # 检测场景类型
     if hasattr(cfg.decision, 'target_ddi'):
         if cfg.decision.target_ddi >= 0.20:
-            scenario = 'A'  # High-stakes
+            scenario = 'A'
         else:
-            scenario = 'B'  # Compute/robustness
+            scenario = 'B'
     else:
-        scenario = 'A'  # 默认
+        scenario = 'A'
 
     enable_scaling = getattr(cfg.metrics, 'scale_savings_to_domain', True) if hasattr(cfg, 'metrics') else True
+
+    # 🔥 关键修复：提取必要的标量和可序列化数据
+    n_domain = geom.n  # 提取域大小
+    coords = geom.coords  # numpy数组，可序列化
+
+    # 🔥 提取adjacency的测试集子矩阵（避免传递整个稀疏矩阵）
+    # 我们稍后在需要Moran's I时再处理
 
     # 遍历budgets
     for k in cfg.selection.budgets:
@@ -663,6 +675,23 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
         # 🔥 准备所有fold的数据
         fold_data_list = []
         for fold_idx, (train_idx, test_idx) in enumerate(folds):
+            # 🔥 关键：提取test_idx对应的adjacency子矩阵
+            try:
+                # 只提取test集内部的邻接关系
+                adj_test_submatrix = geom.adjacency[test_idx][:, test_idx]
+                # 转换为可序列化的格式（COO格式更安全）
+                adj_test_coo = adj_test_submatrix.tocoo()
+                adjacency_data = {
+                    'data': adj_test_coo.data,
+                    'row': adj_test_coo.row,
+                    'col': adj_test_coo.col,
+                    'shape': adj_test_coo.shape
+                }
+            except Exception as e:
+                if verbose:
+                    print(f"    Warning: Failed to extract adjacency submatrix: {e}")
+                adjacency_data = None
+
             fold_data = {
                 'train_idx': train_idx,
                 'test_idx': test_idx,
@@ -673,14 +702,21 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
                 'x_true': x_true,
                 'sensors': sensors,
                 'decision_config': cfg.decision,
-                'geom': geom,
+
+                # 🔥 传递简化的几何数据
+                'n_domain': n_domain,  # 直接传递标量
+                'coords': coords,  # numpy数组
+                'adjacency_test': adjacency_data,  # test集的邻接关系
+
                 'rng_seed': rng.integers(0, 2 ** 31),
                 'enable_domain_scaling': enable_scaling,
-                'scenario': scenario,  # 🔥 新增
+                'scenario': scenario,
+                'morans_permutations': cfg.cv.morans_permutations if hasattr(cfg.cv, 'morans_permutations') else 999,
                 'verbose': verbose
             }
             fold_data_list.append((fold_idx, fold_data))
-        # 🔥 并行或串行执行
+
+        # 并行或串行执行
         if use_parallel and len(fold_data_list) > 1:
             # 并行模式
             if n_workers is None:
@@ -795,8 +831,6 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
         results['budgets'][k] = budget_results
 
     return results
-
-
 
 def main():
     """主评估流程 - CLI版本"""
@@ -952,6 +986,14 @@ def main():
     if verbose:
         print("\n[5] Sampling true deterioration state...")
     x_true = sample_gmrf(Q_pr, mu_pr, rng)
+
+    # 🔥 新增：预先计算并缓存tau到config中
+    tau = cfg.decision.get_threshold(mu_pr)
+    cfg.decision.tau_iri = tau  # 缓存到配置中
+    if verbose:
+        print(f"    ✓ Decision threshold cached: τ = {tau:.3f}")
+
+
     if verbose:
         print(f"    State range: [{x_true.min():.2f}, {x_true.max():.2f}]")
         print(f"    Mean: {x_true.mean():.2f}, Std: {x_true.std():.2f}")

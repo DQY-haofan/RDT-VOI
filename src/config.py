@@ -314,7 +314,7 @@ class Config:
         self.plots = PlotsConfig(**self._raw['plots'])
         self.acceptance = AcceptanceConfig(**self._raw['acceptance'])
 
-        # 🔥 在这里添加 metrics 配置解析（就在 acceptance 之后）：
+        # 🔥 新增：metrics配置解析
         if 'metrics' in self._raw:
             self.metrics = MetricsConfig(**self._raw['metrics'])
         else:

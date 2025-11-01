@@ -32,8 +32,11 @@ class SelectionResult:
 # =====================================================================
 # 1. Greedy MI（互信息）
 # =====================================================================
+
 def greedy_mi(sensors, k: int, Q_pr, costs: np.ndarray = None,
-              lazy: bool = True, batch_size: int = 1) -> 'SelectionResult':
+              lazy: bool = True, batch_size: int = 1,
+              use_cost: bool = True,  # 🔥 新增参数
+              keep_fraction: float = None) -> 'SelectionResult':  # 🔥 新增参数
     """
     Greedy mutual information maximization (批量优化版本)
 
@@ -41,9 +44,11 @@ def greedy_mi(sensors, k: int, Q_pr, costs: np.ndarray = None,
         sensors: 候选传感器列表
         k: 要选择的传感器数量
         Q_pr: 先验精度矩阵
-        costs: 传感器成本数组（长度必须等于len(sensors)）
+        costs: 传感器成本数组(长度必须等于len(sensors))
         lazy: 是否使用lazy evaluation
         batch_size: 批量大小
+        use_cost: 🔥 是否按成本归一化(新增)
+        keep_fraction: 🔥 MI预筛保留比例(None=自动计算, 新增)
     """
     import numpy as np
     import scipy.sparse as sp
@@ -51,6 +56,17 @@ def greedy_mi(sensors, k: int, Q_pr, costs: np.ndarray = None,
 
     n = Q_pr.shape[0]
     C = len(sensors)
+
+    # 🔥 动态计算keep_fraction(专家建议)
+    if keep_fraction is None:
+        # keep = max(4k, ceil(0.25C))
+        n_keep_budget = 4 * k
+        n_keep_pool = int(np.ceil(0.25 * C))
+        n_keep = max(n_keep_budget, n_keep_pool, k + 10)  # 至少k+10
+        actual_keep_fraction = n_keep / C
+    else:
+        actual_keep_fraction = keep_fraction
+        n_keep = int(C * actual_keep_fraction)
 
     # ✅ 确保costs维度正确
     if costs is None:
@@ -66,11 +82,10 @@ def greedy_mi(sensors, k: int, Q_pr, costs: np.ndarray = None,
     objective_values = []
     total_cost = 0.0
 
-    # 预计算所有候选的h向量（稠密）
+    # 预计算所有候选的h向量(稠密)
     H_rows = []
     R_list = []
     for s in sensors:
-        # 构造h向量（n维）
         h = np.zeros(n)
         h[s.idxs] = s.weights
         H_rows.append(h)
@@ -82,30 +97,20 @@ def greedy_mi(sensors, k: int, Q_pr, costs: np.ndarray = None,
     # 初始因子
     factor = SparseFactor(Q_pr)
 
-    # 批量计算初始MI（如果需要预筛选）
+    # 批量计算初始MI(如果需要预筛选)
     if lazy and C > 100:
-        # 一次性求解 Z = Σ H^T
         Z = factor.solve_multi(H_rows.T)  # (n, C)
-
-        # ✅ 关键修复：计算 h^T Σ h = sum over n (H[c,n] * Z[n,c])
-        # H_rows: (C, n)
-        # Z.T: (C, n)
-        # quad[c] = sum_n H_rows[c,n] * Z.T[c,n] = sum_n H_rows[c,n] * Z[n,c]
-        quad = np.sum(H_rows * Z.T, axis=1)  # (C,) ✅ 正确！
-
+        quad = np.sum(H_rows * Z.T, axis=1)  # (C,)
         mi_values = 0.5 * np.log1p(quad / R_list)
     else:
         mi_values = None
 
-    # 🔥 启用 Top-p 预筛选（加速大候选池）
-    keep_fraction = 0.25  # 保留前 25% 候选
+    # 🔥 动态预筛选(使用计算出的n_keep)
     if mi_values is not None and C > 100:
-        # 使用 argpartition 快速找到 Top-K
-        n_keep = max(int(C * keep_fraction), k + 10)  # 至少保留 k+10 个
         top_indices = np.argpartition(mi_values, -n_keep)[-n_keep:]
         alive = np.zeros(C, dtype=bool)
         alive[top_indices] = True
-        print(f"  MI prescreen: kept {n_keep}/{C} candidates ({100*keep_fraction:.0f}%)")
+        print(f"  MI prescreen: kept {n_keep}/{C} candidates ({100*actual_keep_fraction:.0f}%)")
     else:
         alive = np.ones(C, dtype=bool)
 
@@ -114,20 +119,21 @@ def greedy_mi(sensors, k: int, Q_pr, costs: np.ndarray = None,
         best_gain = -np.inf
         best_mi = 0.0
 
-        # 候选评估
         candidates = np.where(alive)[0]
 
         for idx in candidates:
-            h = H_rows[idx]  # (n,)
+            h = H_rows[idx]
             r = R_list[idx]
 
-            # 计算边际MI
-            z = factor.solve(h)  # (n,)
+            z = factor.solve(h)
             quad = np.dot(h, z)
             mi = 0.5 * np.log1p(quad / r)
 
-            # 成本归一化得分
-            gain = mi / costs[idx]
+            # 🔥 可配置的成本归一化
+            if use_cost:
+                gain = mi / costs[idx]
+            else:
+                gain = mi
 
             if gain > best_gain:
                 best_gain = gain
@@ -137,7 +143,6 @@ def greedy_mi(sensors, k: int, Q_pr, costs: np.ndarray = None,
         if best_idx < 0 or best_gain <= 0:
             break
 
-        # 记录选择
         selected.append(int(best_idx))
         marginal_gains.append(float(best_mi))
         total_cost += float(costs[best_idx])
@@ -145,14 +150,11 @@ def greedy_mi(sensors, k: int, Q_pr, costs: np.ndarray = None,
             objective_values[-1] + best_mi if objective_values else best_mi
         )
 
-        # 更新：rank-1增量
+        # Rank-1 update
         h_star = H_rows[best_idx]
         r_star = R_list[best_idx]
-
-        # Rank-1 update: Q_new = Q + (1/r) * h h^T
         factor.rank1_update(h_star, weight=1.0 / r_star)
 
-        # 标记已选
         alive[best_idx] = False
 
     return SelectionResult(
@@ -162,6 +164,7 @@ def greedy_mi(sensors, k: int, Q_pr, costs: np.ndarray = None,
         total_cost=total_cost,
         method_name="Greedy-MI"
     )
+
 # =====================================================================
 # 2. Greedy A-optimal（迹最小化）
 # =====================================================================
@@ -285,18 +288,12 @@ def greedy_evi_myopic_fast(
         n_y_samples: int = 0,
         use_cost: bool = True,
         mi_prescreen: bool = True,
-        keep_fraction: float = 0.25,
+        keep_fraction: float = None,  # 🔥 改为None,支持动态计算
         rng: np.random.Generator = None,
         verbose: bool = False
 ) -> 'SelectionResult':
     """
     🔥 快速版 Myopic EVI (决策感知) - 使用 MI 预筛 + rank-1 更新
-
-    关键优化：
-    1. 不为每个候选做因子化；每步仅一次稀疏解 + 纯向量代数
-    2. 后验协方差与 y 无关，用 rank-1 闭式更新
-    3. 只在 test_idx 上计算风险
-    4. MI预筛选减少候选数量
     """
     import numpy as np
     import scipy.sparse as sp
@@ -308,6 +305,22 @@ def greedy_evi_myopic_fast(
 
     n = Q_pr.shape[0]
     C = len(sensors)
+
+    # 🔥 动态计算keep_fraction(与MI保持一致)
+    if keep_fraction is None:
+        # 根据专家建议: max(4k, 0.25C)
+        n_keep_budget = 4 * k
+        n_keep_pool = int(np.ceil(0.25 * C))
+        n_keep = max(n_keep_budget, n_keep_pool, k + 10)
+        actual_keep_fraction = n_keep / C
+
+        if verbose:
+            print(f"    Auto keep_fraction: {actual_keep_fraction:.2%} "
+                  f"({n_keep}/{C}, budget={k})")
+    else:
+        # 使用传入的固定值
+        actual_keep_fraction = keep_fraction
+        n_keep = int(C * actual_keep_fraction)
 
     if costs is None:
         costs = np.array([s.cost for s in sensors], dtype=float)
@@ -379,7 +392,6 @@ def greedy_evi_myopic_fast(
 
         mi = 0.5 * np.log1p(quad / r_list)
 
-        n_keep = max(20, int(C * keep_fraction))
         keep_idx = np.argpartition(mi, -n_keep)[-n_keep:]
         keep_mask[:] = False
         keep_mask[keep_idx] = True

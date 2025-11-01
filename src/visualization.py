@@ -1746,17 +1746,18 @@ def generate_all_visualizations_v2(all_results: Dict,
     # 🔥 修复：计算逐像元先验标准差（不再使用均值常数）
     from inference import SparseFactor, compute_posterior_variance_diagonal
 
+
     factor_pr = SparseFactor(Q_pr)
 
-    # ✅ 关键修复：计算所有像元的方差（或大批量）
+    # ✅ 方案1：小域直接计算所有像元
     if geom.n <= 1000:
-        # 小域：直接计算所有像元
         sample_idx = np.arange(geom.n)
         sample_vars = compute_posterior_variance_diagonal(factor_pr, sample_idx)
         sigma_pr = np.sqrt(np.maximum(sample_vars, 1e-12))
         print(f"  ✓ Computed per-pixel prior std for all {geom.n} pixels")
+
+    # ✅ 方案2：大域分批计算
     else:
-        # 大域：分批计算
         print(f"  Computing per-pixel prior std (n={geom.n})...")
         batch_size = 200
         sigma_pr = np.zeros(geom.n)
@@ -1811,10 +1812,10 @@ def generate_all_visualizations_v2(all_results: Dict,
         # F11: DDI 叠加（核心！）- 🔥 使用修复后的 sigma_pr
         print("\n[F11] DDI overlay (EVI vs MI)...")
         try:
-            budget = 10  # 选一个代表性预算
+            budget = 10
             plot_ddi_overlay(
                 geom.coords, all_results, sensors,
-                mu_pr, sigma_pr, tau, budget,  # 🔥 传入逐像元 sigma_pr
+                mu_pr, sigma_pr, tau, budget,  # 🔥 传入逐像元sigma_pr
                 plots_dir,
                 methods_to_compare=['greedy_evi', 'greedy_mi']
             )

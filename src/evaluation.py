@@ -515,20 +515,21 @@ def run_cv_experiment(geom, Q_pr, mu_pr, x_true, sensors,
 
         fold_results.append(fold_result_dict)
 
-        fold_results.append(metrics)
-
         print(f"    RMSE={metrics['rmse']:.3f}, Loss=£{metrics['expected_loss_gbp']:.0f}, "
               f"I={I_stat:.3f} (p={I_pval:.3f})")
 
     # Aggregate across folds
     aggregated = {}
-    for key in fold_results[0].keys():
-        values = np.array([fr[key] for fr in fold_results])
-        aggregated[key] = {
-            'mean': values.mean(),
-            'std': values.std(),
-            'values': values
-        }
+    for key in fold_results[0]['metrics'].keys():  # 🔥 改为从metrics子字典提取
+        if key in ['z_scores', 'n_test', 'type_counts']:
+            continue
+        values = [fr['metrics'][key] for fr in fold_results if fr.get('success')]
+        if values:
+            aggregated[key] = {
+                'mean': np.mean(values),
+                'std': np.std(values),
+                'values': values
+            }
 
     return {
         'fold_results': fold_results,

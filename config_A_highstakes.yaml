@@ -94,7 +94,7 @@ sensors:
       footprint: avg3x3
 
   pool_strategy: "grid_subsample"
-  pool_fraction: 0.10  # 🔥 稀疏池：仅 80 个候选位置（400×0.2）
+  pool_fraction: 0.40  # 🔥 稀疏池：仅 80 个候选位置（400×0.2）
   type_mix: [0.15, 0.20, 0.10, 0.20, 0.15, 0.20]
 
   use_heterogeneous: true
@@ -110,7 +110,7 @@ sensors:
 # ----------------------------------------------------------------------------
 decision:
   tau_iri: null
-  tau_quantile: 0.88  # 🔥 高分位阈值，提升 DDI 但避免 100%
+  tau_quantile: 0.75  # 🔥 高分位阈值，提升 DDI 但避免 100%
 
   # 代价矩阵
   # 🔥 方案1（推荐）：提高 L_FP，p_T ≈ 0.25
@@ -126,7 +126,7 @@ decision:
   # L_TP_gbp: 800.0
   # p_T = 25000 / (25000 + 60000 - 800) ≈ 0.30 (30%)
 
-  target_ddi: 0.30  # Scenario A: 0.25-0.35 | Scenario B: 0.10-0.15
+  target_ddi: 0.25  # Scenario A: 0.25-0.35 | Scenario B: 0.10-0.15
   K_action: 10      # Scenario A: 10 | Scenario B: null
 
 metrics:
@@ -149,10 +149,12 @@ selection:
 
 
   greedy_mi:
-    batch_size: 1
+    batch_size: 64
     adaptive_pruning: true
     prune_threshold: 0.10
     use_cost: true
+    keep_fraction: null  # 🔥 新增: null=自动计算 max(4k, 0.25C)
+
 
   greedy_aopt:
     n_probes: 32
@@ -162,7 +164,7 @@ selection:
     n_y_samples: 0
     use_cost: true
     mi_prescreen: true  # 主实验保持true；相关性实验时设false
-    keep_fraction: 0.50  # Scenario A: 0.5 | Scenario B: 0.5
+    keep_fraction: null  # Scenario A: 0.5 | Scenario B: 0.5
 
     # 🔥 关键修复：禁用fold跳过机制
     every_n_folds: 1       # ✅ 1=运行所有fold（不跳过）
