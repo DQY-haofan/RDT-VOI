@@ -64,11 +64,11 @@ def compute_roi(prior_loss: float,
 
 
 def compute_action_constrained_loss(mu_post: np.ndarray,
-                                          sigma_post: np.ndarray,
-                                          x_true: np.ndarray,
-                                          decision_config,
-                                          K: int = None,
-                                          tau: float = None) -> Dict:
+                                         sigma_post: np.ndarray,
+                                         x_true: np.ndarray,
+                                         decision_config,
+                                         K: int = None,
+                                         tau: float = None) -> Dict:
     """
     🔥 修复版：Action-limited 指标 - Top-K ∩ {p_f > p_T} 策略
 
@@ -88,19 +88,25 @@ def compute_action_constrained_loss(mu_post: np.ndarray,
     Returns:
         完整的action-limited指标字典
     """
-    from decision import conditional_risk
+    from decision import conditional_risk, get_unified_prob_threshold
 
     if tau is None:
-        tau = decision_config.get_threshold()
+        if hasattr(decision_config, 'tau_iri') and decision_config.tau_iri is not None:
+            tau = decision_config.tau_iri
+        else:
+            tau = decision_config.get_threshold()
 
     n = len(mu_post)
 
     # 计算每个位置的后验故障概率
     p_failure = 1.0 - norm.cdf((tau - mu_post) / np.maximum(sigma_post, 1e-12))
 
-    # Bayes最优概率阈值
-    p_T = decision_config.L_FP_gbp / (
-            decision_config.L_FP_gbp + decision_config.L_FN_gbp - decision_config.L_TP_gbp
+    # 🔥 使用统一的 Bayes最优概率阈值
+    p_T = get_unified_prob_threshold(
+        decision_config.L_FP_gbp,
+        decision_config.L_FN_gbp,
+        decision_config.L_TP_gbp,
+        getattr(decision_config, 'L_TN_gbp', 0.0)
     )
 
     # 无限制情况：Bayes最优决策
@@ -110,7 +116,7 @@ def compute_action_constrained_loss(mu_post: np.ndarray,
             decision_config.L_FP_gbp,
             decision_config.L_FN_gbp,
             decision_config.L_TP_gbp,
-            decision_config.L_TN_gbp
+            getattr(decision_config, 'L_TN_gbp', 0.0)
         )
         for i in range(n)
     ])
@@ -149,7 +155,7 @@ def compute_action_constrained_loss(mu_post: np.ndarray,
 
     n_actual_actions = len(actual_actions)
 
-    print(f"    Action-limited analysis:")
+    print(f"    🔍 Action-limited analysis:")
     print(f"      K (limit): {K}")
     print(f"      p_T (threshold): {p_T:.3f}")
     print(f"      Candidates exceeding p_T: {exceed_threshold.sum()}")
@@ -169,7 +175,7 @@ def compute_action_constrained_loss(mu_post: np.ndarray,
             if x_true[i] > tau:
                 constrained_risks[i] = decision_config.L_FN_gbp
             else:
-                constrained_risks[i] = decision_config.L_TN_gbp
+                constrained_risks[i] = getattr(decision_config, 'L_TN_gbp', 0.0)
 
     constrained_loss = constrained_risks.mean()
     regret = constrained_loss - unrestricted_loss
@@ -243,6 +249,8 @@ def compute_enhanced_metrics(mu_post: np.ndarray,
     """
     🔥 增强的性能指标计算（使用修复后的action-limited）
     """
+    from evaluation import compute_metrics  # 保持基础指标函数不变
+
     # 基础指标
     base_metrics = compute_metrics(
         mu_post, sigma_post, x_true, test_idx, decision_config
@@ -250,13 +258,10 @@ def compute_enhanced_metrics(mu_post: np.ndarray,
 
     # ROI计算
     if prior_loss is not None and sensor_cost > 0:
-        roi = compute_roi(
-            prior_loss,
-            base_metrics['expected_loss_gbp'],
-            sensor_cost
-        )
+        roi = (prior_loss - base_metrics['expected_loss_gbp'] - sensor_cost) / sensor_cost
         base_metrics['roi'] = roi
 
+        # 成本效率：每英镑传感成本节省的损失
         savings = prior_loss - base_metrics['expected_loss_gbp']
         base_metrics['cost_efficiency'] = savings / sensor_cost
         base_metrics['savings_gbp'] = savings
@@ -275,6 +280,7 @@ def compute_enhanced_metrics(mu_post: np.ndarray,
                 print(f"    Near-threshold evaluation: {near_mask.sum()}/{len(test_idx)} points")
 
                 # 计算near-threshold的先验损失（需要传入）
+                # 这里简化：假设near-threshold区域的损失比例更高
                 near_fraction = near_mask.sum() / len(test_idx)
 
                 # 计算near-threshold后验损失
@@ -288,7 +294,8 @@ def compute_enhanced_metrics(mu_post: np.ndarray,
 
                 # 假设先验损失中near-threshold贡献更大
                 prior_loss_near = prior_loss * near_fraction * 1.5  # 假设1.5倍权重
-                roi_near = compute_roi(prior_loss_near, near_posterior_loss, sensor_cost)
+                roi_near = (
+                                       prior_loss_near - near_posterior_loss - sensor_cost) / sensor_cost if sensor_cost > 0 else 0.0
 
                 base_metrics.update({
                     'n_near_threshold': int(near_mask.sum()),
@@ -690,7 +697,7 @@ if __name__ == "__main__":
     from sensors import generate_sensor_pool
     from selection import greedy_mi
 
-    cfg = load_scenario_config('A')  # ✅ 明确指定场景
+    cfg = load_config("baseline_config.yaml")  # ✅ 新方式
     rng = cfg.get_rng()
 
     # Setup

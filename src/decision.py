@@ -1,6 +1,6 @@
 """
 Decision-theoretic value mapping and Expected Value of Information.
-Implements conditional risk for threshold-based policies and EVI approximation.
+🔥 修复版本 - 统一 Bayes 最优阈值公式，避免不同函数里版本不一
 """
 
 import numpy as np
@@ -42,8 +42,8 @@ def get_unified_prob_threshold(L_FP: float, L_FN: float, L_TP: float, L_TN: floa
 
 
 def conditional_risk(mu: float, sigma: float,
-                     tau: float, L_FP: float, L_FN: float, L_TP: float,
-                     L_TN: float = 0.0) -> float:
+                          tau: float, L_FP: float, L_FN: float, L_TP: float,
+                          L_TN: float = 0.0) -> float:
     """
     🔥 紧急修复版：确保永远不返回None
 
@@ -71,18 +71,8 @@ def conditional_risk(mu: float, sigma: float,
         warnings.warn(f"norm.cdf failed: {e}, using p_f=0.5")
         p_f = 0.5
 
-    # Bayes-optimal probability threshold
-    numerator = L_FP - (L_TN if L_TN is not None else 0.0)
-    denominator = (L_FP - (L_TN if L_TN is not None else 0.0)) + (L_FN - L_TP)
-
-    if abs(denominator) < 1e-10:
-        warnings.warn("Near-singular decision cost matrix, using p_T=0.5")
-        p_T = 0.5
-    else:
-        p_T = numerator / denominator
-
-    # 🔥 确保p_T有效
-    p_T = np.clip(p_T, 0.0, 1.0)
+    # 🔥 使用统一的 Bayes 最优概率阈值
+    p_T = get_unified_prob_threshold(L_FP, L_FN, L_TP, L_TN)
 
     # Conditional risk for each action
     risk_no_action = p_f * L_FN + (1 - p_f) * (L_TN if L_TN is not None else 0.0)
@@ -100,10 +90,10 @@ def conditional_risk(mu: float, sigma: float,
 
 
 def expected_loss(mu_post: np.ndarray,
-                  sigma_post: np.ndarray,
-                  decision_config,
-                  test_indices: np.ndarray = None,
-                  tau: float = None) -> float:
+                       sigma_post: np.ndarray,
+                       decision_config,
+                       test_indices: np.ndarray = None,
+                       tau: float = None) -> float:
     """
     🔥 紧急修复版：确保永远不返回None
 
@@ -252,16 +242,6 @@ def expected_loss_batch(mu_post_batch: np.ndarray,
         return optimal_risk.mean()  # 标量
 
 
-"""
-修复后的 evi_monte_carlo 函数 - 严谨的先验/后验风险计算
-
-主要改动：
-1. 完整走 prior→观测→posterior→风险差 的流程
-2. 正确计算先验和后验的对角方差
-3. 避免用单点μ_pr[0]代表全局
-"""
-
-
 def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
                          n_samples: int = 500,
                          rng: np.random.Generator = None) -> float:
@@ -350,8 +330,8 @@ def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
 
 
 def evi_unscented(Q_pr, mu_pr, H, R_diag, decision_config,
-                  alpha: float = 1.0, beta: float = 2.0,
-                  kappa: float = 0.0) -> float:
+                       alpha: float = 1.0, beta: float = 2.0,
+                       kappa: float = 0.0) -> float:
     """
     使用Unscented Transform的EVI近似（在测量空间）
 
@@ -432,6 +412,14 @@ def evi_unscented(Q_pr, mu_pr, H, R_diag, decision_config,
     return float(evi)
 
 
+# 向后兼容的别名
+conditional_risk = conditional_risk
+expected_loss = expected_loss
+expected_loss_batch = expected_loss_batch
+evi_monte_carlo = evi_monte_carlo
+evi_unscented = evi_unscented
+
+
 if __name__ == "__main__":
 
     from geometry import build_grid2d_geometry
@@ -444,7 +432,7 @@ if __name__ == "__main__":
     print("=" * 70)
 
     from config import load_scenario_config
-    cfg = load_scenario_config('A')
+    cfg = load_scenario_config('baseline_config.yaml')
     rng = cfg.get_rng()
 
     # Setup
@@ -456,9 +444,36 @@ if __name__ == "__main__":
     selected = rng.choice(sensors, size=10, replace=False)
     H, R = assemble_H_R(selected, geom.n)
 
-    print("\n[1] Testing corrected Monte Carlo sampling...")
+    print("\n[1] Testing unified probability threshold...")
 
-    # 🔥 关键测试：检查采样方差是否正确
+    # 🔥 测试统一阈值公式
+    test_cases = [
+        {'L_FP': 30000, 'L_FN': 120000, 'L_TP': 800, 'L_TN': 0},
+        {'L_FP': 5000, 'L_FN': 30000, 'L_TP': 800, 'L_TN': 0},
+        {'L_FP': 500, 'L_FN': 10000, 'L_TP': 800, 'L_TN': 100},
+    ]
+
+    for i, tc in enumerate(test_cases):
+        p_T = get_unified_prob_threshold(tc['L_FP'], tc['L_FN'], tc['L_TP'], tc['L_TN'])
+        
+        risk = conditional_risk(
+            mu=2.0, sigma=0.5, tau=2.2,
+            L_FP=tc['L_FP'], L_FN=tc['L_FN'],
+            L_TP=tc['L_TP'], L_TN=tc['L_TN']
+        )
+
+        print(f"  Case {i+1}: L_FP={tc['L_FP']}, L_FN={tc['L_FN']}")
+        print(f"           → p_T={p_T:.3f}, risk=£{risk:.2f}")
+
+        # ✅ 验证阈值在合理范围内
+        assert 0 <= p_T <= 1, f"Invalid p_T: {p_T}"
+        assert 0 <= risk <= max(tc.values()), f"Invalid risk: {risk}"
+
+    print("  ✅ Unified probability threshold correct!")
+
+    print("\n[2] Testing corrected Monte Carlo sampling...")
+
+    # ✅ 关键测试：检查采样方差是否正确
     from inference import SparseFactor, compute_posterior_variance_diagonal
 
     factor = SparseFactor(Q_pr)
@@ -477,46 +492,18 @@ if __name__ == "__main__":
 
     # ✅ 如果相对误差 < 10%，说明采样正确
     assert np.all(np.abs(var_empirical - var_theory) / var_theory < 0.15), \
-        "❌ Sampling variance incorrect!"
+        "✗ Sampling variance incorrect!"
     print("  ✅ Sampling variance correct!")
 
-    print("\n[2] Testing EVI computation...")
+    print("\n[3] Testing EVI computation...")
 
     # Monte Carlo (small sample for speed)
     evi_mc = evi_monte_carlo(Q_pr, mu_pr, H, R, cfg.decision, n_samples=100, rng=rng)
     print(f"  EVI (Monte Carlo, n=100) = £{evi_mc:.2f}")
 
     # ✅ EVI 应该为正（信息总是有价值的）
-    assert evi_mc > 0, f"❌ Negative EVI: {evi_mc:.2f}"
+    assert evi_mc > 0, f"✗ Negative EVI: {evi_mc:.2f}"
     print(f"  ✅ EVI is positive!")
-
-    print("\n[3] Testing probability threshold formula...")
-
-    # 测试不同 L_TN 值
-    test_cases = [
-        {'L_FP': 500, 'L_FN': 10000, 'L_TP': 800, 'L_TN': 0},
-        {'L_FP': 500, 'L_FN': 10000, 'L_TP': 800, 'L_TN': 100},
-        {'L_FP': 500, 'L_FN': 10000, 'L_TP': 800, 'L_TN': -100},
-    ]
-
-    for tc in test_cases:
-        risk = conditional_risk(
-            mu=2.0, sigma=0.5, tau=2.2,
-            L_FP=tc['L_FP'], L_FN=tc['L_FN'],
-            L_TP=tc['L_TP'], L_TN=tc['L_TN']
-        )
-
-        # 计算概率阈值（用于验证）
-        numerator = tc['L_FP'] - tc['L_TN']
-        denom = (tc['L_FP'] - tc['L_TN']) + (tc['L_FN'] - tc['L_TP'])
-        p_T = numerator / denom if abs(denom) > 1e-10 else 0.5
-
-        print(f"  L_TN={tc['L_TN']:6.0f} → p_T={p_T:.3f}, risk=£{risk:.2f}")
-
-        # ✅ 风险应该在合理范围内
-        assert 0 <= risk <= max(tc.values()), f"❌ Invalid risk: {risk}"
-
-    print("  ✅ Probability threshold formula correct!")
 
     print("\n" + "=" * 70)
     print("  ALL TESTS PASSED ✅")

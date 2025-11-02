@@ -1,19 +1,30 @@
 """
-Main experimental script for RDT-VoI simulation (CLI version with parallel support)
-支持命令行参数指定配置文件和输出目录，集成并行处理
+主实验脚本 - 完整版（支持参数扫描和灵活配置）
 
-# 场景A（串行）
-python main.py --scenario A
+🔥 主要改进：
+1. 统一配置文件 + 参数覆盖
+2. 支持参数扫描（单参数或多参数组合）
+3. 保持向后兼容
+4. 包含所有必要的核心函数
 
-# 场景B（并行，5 workers）
-python main.py -s B --parallel --workers 5
+使用示例：
+# 基础使用
+python main.py                                    # 使用默认配置
+python main.py --preset high_stakes               # 使用高风险预设
+python main.py --preset low_stakes                # 使用低风险预设
 
-# 快速测试（并行）
-python main.py -s A --quick-test --parallel
+# 单参数调整
+python main.py --ddi 0.30 --fn-cost 120000        # 快速调整关键参数
+python main.py --grid-size 25 --budgets 5,10,15   # 调整实验规模
 
-# 自定义配置
-python main.py --config my_config.yaml --parallel
+# 参数扫描
+python main.py --scan ddi=0.1,0.2,0.3             # DDI扫描
+python main.py --scan fn_cost=30000,60000,120000   # 成本扫描
+python main.py --scan ddi=0.2,0.3 fn_cost=60000,120000  # 组合扫描
 
+# 控制选项
+python main.py --parallel --workers 6             # 并行处理
+python main.py --quick-test                       # 快速测试
 """
 
 from pathlib import Path
@@ -29,15 +40,17 @@ from matplotlib import pyplot as plt
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 import time
+import itertools
+import scipy.sparse as sp
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import load_config, load_scenario_config
+from config import load_config, generate_parameter_combinations, parse_scan_parameter
 from geometry import build_grid2d_geometry
 from spatial_field import build_prior, sample_gmrf, build_prior_with_ddi
 from sensors import generate_sensor_pool
-from inference import compute_posterior, compute_posterior_variance_diagonal
+from inference import compute_posterior, compute_posterior_variance_diagonal, SparseFactor
 from sensors import get_observation
 
 from method_wrappers import get_selection_method, get_available_methods
@@ -46,8 +59,7 @@ from evaluation import spatial_block_cv, compute_metrics, morans_i
 from visualization import (
     setup_style,
     generate_all_visualizations_v2,
-aggregate_results_for_visualization
-
+    aggregate_results_for_visualization
 )
 
 
@@ -65,141 +77,270 @@ class NumpyEncoder(json.JSONEncoder):
         return super(NumpyEncoder, self).default(obj)
 
 
+# ============================================================================
+# 命令行参数解析
+# ============================================================================
+
 def parse_arguments():
     """
-    解析命令行参数
+    🔥 增强的命令行参数解析 - 支持参数扫描
     """
     parser = argparse.ArgumentParser(
-        description='RDT-VoI Simulation Framework',
+        description='RDT-VoI 参数化实验框架',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # 使用场景A配置
-  python main.py --scenario A
-  
-  # 使用场景B配置，指定输出目录
-  python main.py --scenario B --output results/scenario_B
-  
-  # 快速测试运行
-  python main.py -s A --quick-test
-  
-  # 自定义配置文件
-  python main.py --config path/to/custom.yaml
-  
-  # 并行处理（5个worker）
-  python main.py -s A --parallel --workers 5
+使用示例：
+
+# 基础使用
+  python main.py                               # 使用默认配置
+  python main.py --preset high_stakes          # 高风险场景
+  python main.py --preset low_stakes           # 低风险场景
+
+# 单参数调整  
+  python main.py --ddi 0.30                    # 调整DDI
+  python main.py --fn-cost 120000              # 调整误检成本
+  python main.py --grid-size 25                # 调整网格大小
+  python main.py --budgets 5,10,15,20          # 调整预算列表
+
+# 参数扫描
+  python main.py --scan ddi=0.1,0.2,0.3                    # DDI扫描
+  python main.py --scan fn_cost=30000,60000,120000         # 成本扫描  
+  python main.py --scan ddi=0.2,0.3 fn_cost=60000,120000  # 组合扫描
+
+# 高级选项
+  python main.py --parallel --workers 6        # 并行处理
+  python main.py --quick-test                  # 快速测试
+  python main.py --dry-run                     # 预览参数组合
         """
     )
 
-    # 主要参数
-    parser.add_argument(
-        '-s', '--scenario',
-        type=str,
-        choices=['A', 'B', 'a', 'b'],
-        default=None,
-        help='场景类型 (A=高风险, B=算力/鲁棒性) - 优先级高于 --config'
+    # 核心配置选项
+    config_group = parser.add_argument_group('配置选项')
+    config_group.add_argument(
+        '--config', '-c', type=str, default='baseline_config.yaml',
+        help='配置文件路径 (默认: baseline_config.yaml)'
+    )
+    config_group.add_argument(
+        '--preset', '-p', type=str, choices=['high_stakes', 'low_stakes'],
+        help='预设场景 (high_stakes=高风险, low_stakes=低风险)'
     )
 
-    parser.add_argument(
-        '-c', '--config',
-        type=str,
-        default=None,
-        help='自定义配置文件路径（仅在未指定 --scenario 时使用）'
+    # 🔥 关键参数快速调整
+    param_group = parser.add_argument_group('关键参数调整')
+    param_group.add_argument(
+        '--ddi', type=float,
+        help='决策难度指数 (0.0-1.0, 典型值: 0.10-0.30)'
+    )
+    param_group.add_argument(
+        '--fn-cost', '--fn_cost', type=float,
+        help='误检成本 (£, 典型值: 30000-120000)'
+    )
+    param_group.add_argument(
+        '--fp-cost', '--fp_cost', type=float,
+        help='误报成本 (£, 典型值: 5000-30000)'
+    )
+    param_group.add_argument(
+        '--tau-quantile', '--tau_quantile', type=float,
+        help='阈值分位数 (0.0-1.0, 典型值: 0.65-0.88)'
+    )
+    param_group.add_argument(
+        '--action-limit', '--K_action', type=int,
+        help='行动限制 (整数, null=无限制)'
     )
 
-    parser.add_argument(
-        '-o', '--output',
-        type=str,
-        default=None,
-        help='输出根目录 (默认: 从配置文件读取)'
+    # 实验规模调整
+    scale_group = parser.add_argument_group('实验规模')
+    scale_group.add_argument(
+        '--grid-size', '--grid_size', type=int,
+        help='网格大小 (nx=ny, 典型值: 15-25)'
+    )
+    scale_group.add_argument(
+        '--budgets', type=str,
+        help='预算列表 (逗号分隔, 如: 5,10,15,20)'
+    )
+    scale_group.add_argument(
+        '--methods', type=str,
+        help='方法列表 (逗号分隔, 如: greedy_mi,greedy_evi,uniform)'
+    )
+    scale_group.add_argument(
+        '--folds', '--k_folds', type=int,
+        help='交叉验证折数 (典型值: 3-10)'
     )
 
-    # 可选覆盖参数
-    parser.add_argument(
-        '--seed',
-        type=int,
-        default=None,
-        help='随机种子 (覆盖配置文件)'
+    # 🔥 参数扫描功能
+    scan_group = parser.add_argument_group('参数扫描')
+    scan_group.add_argument(
+        '--scan', type=str, nargs='+',
+        help='参数扫描 (格式: param=val1,val2,val3). 例如: --scan ddi=0.1,0.2,0.3 fn_cost=30000,60000'
+    )
+    scan_group.add_argument(
+        '--scan-presets', type=str, nargs='+',
+        help='预设扫描 (如: --scan-presets high_stakes low_stakes)'
+    )
+    scan_group.add_argument(
+        '--dry-run', action='store_true',
+        help='仅显示参数组合，不执行实验'
     )
 
-    parser.add_argument(
-        '--budgets',
-        type=int,
-        nargs='+',
-        default=None,
-        help='预算列表 (覆盖配置文件), 例如: --budgets 5 10 20'
+    # 执行控制
+    exec_group = parser.add_argument_group('执行控制')
+    exec_group.add_argument(
+        '--parallel', action='store_true',
+        help='启用并行处理'
+    )
+    exec_group.add_argument(
+        '--workers', type=int, default=None,
+        help='并行worker数量 (默认: CPU核心数-1)'
+    )
+    exec_group.add_argument(
+        '--output', '-o', type=str, default=None,
+        help='输出目录 (默认: 从配置读取)'
     )
 
-    parser.add_argument(
-        '--methods',
-        type=str,
-        nargs='+',
-        default=None,
-        help='要运行的方法 (覆盖配置文件), 例如: --methods greedy_mi greedy_evi'
+    # 调试和测试
+    debug_group = parser.add_argument_group('调试和测试')
+    debug_group.add_argument(
+        '--quick-test', action='store_true',
+        help='快速测试模式 (小网格，少预算，少fold)'
     )
-
-    # 🔥 并行处理选项
-    parser.add_argument(
-        '--parallel',
-        action='store_true',
-        help='启用并行处理（显著加速CV折叠）'
+    debug_group.add_argument(
+        '--skip-viz', action='store_true',
+        help='跳过可视化生成'
     )
-
-    parser.add_argument(
-        '--workers',
-        type=int,
-        default=None,
-        help='并行worker数量（默认：CPU核心数-1）'
+    debug_group.add_argument(
+        '--seed', type=int, default=None,
+        help='随机种子覆盖'
     )
-
-    # 测试和调试选项
-    parser.add_argument(
-        '--quick-test',
-        action='store_true',
-        help='快速测试模式 (小网格, 少预算, 少fold)'
+    debug_group.add_argument(
+        '-v', '--verbose', action='store_true',
+        help='详细输出'
     )
-
-    parser.add_argument(
-        '--skip-viz',
-        action='store_true',
-        help='跳过可视化生成 (仅运行实验)'
-    )
-
-    parser.add_argument(
-        '--viz-only',
-        action='store_true',
-        help='仅生成可视化 (加载已有结果)'
-    )
-
-    parser.add_argument(
-        '--results-file',
-        type=str,
-        default=None,
-        help='已有结果文件路径 (用于 --viz-only)'
-    )
-
-    # 详细程度
-    parser.add_argument(
-        '-v', '--verbose',
-        action='store_true',
-        help='详细输出模式'
-    )
-
-    parser.add_argument(
-        '-q', '--quiet',
-        action='store_true',
-        help='静默模式（最少输出）'
+    debug_group.add_argument(
+        '-q', '--quiet', action='store_true',
+        help='安静模式'
     )
 
     return parser.parse_args()
 
 
+# ============================================================================
+# 配置处理函数
+# ============================================================================
+
+def apply_cli_overrides(cfg, args):
+    """
+    🔥 应用命令行参数覆盖到配置
+    """
+    overrides = {}
+
+    # 收集所有非空的CLI参数
+    cli_mappings = {
+        'ddi': 'target_ddi',
+        'fn_cost': 'L_FN_gbp',
+        'fp_cost': 'L_FP_gbp',
+        'tau_quantile': 'tau_quantile',
+        'action_limit': 'K_action',
+        'grid_size': 'grid_size',
+        'budgets': 'budgets',
+        'methods': 'methods',
+        'folds': 'k_folds',
+        'seed': 'seed'
+    }
+
+    for cli_arg, config_key in cli_mappings.items():
+        value = getattr(args, cli_arg, None)
+        if value is not None:
+            overrides[config_key] = value
+
+    # 应用覆盖
+    if overrides:
+        if not args.quiet:
+            print(f"\n📝 Applying CLI overrides: {overrides}")
+        cfg = cfg.apply_parameter_overrides(overrides, verbose=not args.quiet)
+
+    return cfg
+
+
+def parse_scan_parameters(scan_args):
+    """
+    🔥 解析扫描参数
+
+    Args:
+        scan_args: ['ddi=0.1,0.2,0.3', 'fn_cost=30000,60000']
+
+    Returns:
+        {'ddi': [0.1, 0.2, 0.3], 'fn_cost': [30000, 60000]}
+    """
+    scan_params = {}
+
+    for scan_spec in scan_args:
+        if '=' not in scan_spec:
+            raise ValueError(f"Invalid scan format: {scan_spec}. Use param=val1,val2,val3")
+
+        param_name, values_str = scan_spec.split('=', 1)
+        param_name = param_name.strip()
+
+        # 解析值列表
+        values = parse_scan_parameter(values_str)
+        if not values:
+            raise ValueError(f"No values found for parameter: {param_name}")
+
+        scan_params[param_name] = values
+
+    return scan_params
+
+
+def create_experiment_configs(base_cfg, args):
+    """
+    🔥 创建实验配置列表（支持参数扫描）
+    """
+    configs = []
+
+    # 情况1: 预设扫描
+    if args.scan_presets:
+        print(f"\n🔍 Preset scanning: {args.scan_presets}")
+        for preset_name in args.scan_presets:
+            try:
+                preset_cfg = base_cfg.apply_preset(preset_name, verbose=not args.quiet)
+                preset_cfg.experiment.name = f"{base_cfg.experiment.name}_{preset_name}"
+                configs.append(preset_cfg)
+            except Exception as e:
+                print(f"❌ Failed to apply preset {preset_name}: {e}")
+                continue
+
+    # 情况2: 参数扫描
+    elif args.scan:
+        print(f"\n🔍 Parameter scanning: {args.scan}")
+        scan_params = parse_scan_parameters(args.scan)
+        combinations = generate_parameter_combinations(scan_params)
+
+        print(f"📊 Generated {len(combinations)} parameter combinations")
+
+        for i, combo in enumerate(combinations):
+            combo_cfg = base_cfg.apply_parameter_overrides(combo, verbose=False)
+
+            # 生成描述性名称
+            combo_desc = "_".join(f"{k}{v}" for k, v in list(combo.items())[:3])  # 限制长度
+            combo_cfg.experiment.name = f"{base_cfg.experiment.name}_scan_{combo_desc}"
+
+            if not args.quiet:
+                print(f"  {i+1}: {combo}")
+
+            configs.append(combo_cfg)
+
+    # 情况3: 单一配置
+    else:
+        configs.append(base_cfg)
+
+    return configs
+
+
 def detect_scenario_from_config(cfg) -> str:
     """从配置自动检测场景类型"""
     exp_name = cfg.experiment.name.lower()
-    if 'highstakes' in exp_name or 'high_stakes' in exp_name or '_a_' in exp_name:
+    if 'high' in exp_name or 'stakes' in exp_name:
         return 'A'
-    elif 'proxy' in exp_name or 'compute' in exp_name or '_b_' in exp_name:
+    elif 'low' in exp_name or 'proxy' in exp_name:
         return 'B'
 
     ddi = getattr(cfg.decision, 'target_ddi', 0.0)
@@ -210,8 +351,7 @@ def detect_scenario_from_config(cfg) -> str:
     elif ddi < 0.15 or fn_fp_ratio < 5:
         return 'B'
 
-    print("  ⚠️  Cannot determine scenario, defaulting to A (high-stakes)")
-    return 'A'
+    return 'A'  # 默认
 
 
 def create_output_dir_from_config(cfg, config_path: str, custom_output: str = None) -> Path:
@@ -220,8 +360,6 @@ def create_output_dir_from_config(cfg, config_path: str, custom_output: str = No
 
     # 从配置文件名提取场景标识
     config_name = Path(config_path).stem
-
-    # 移除 "config_" 前缀（如果有）
     if config_name.startswith('config_'):
         scenario_name = config_name[7:]
     else:
@@ -234,25 +372,14 @@ def create_output_dir_from_config(cfg, config_path: str, custom_output: str = No
         base_dir = Path(cfg.experiment.output_dir)
 
     # 创建层级目录结构
-    output_dir = base_dir / f"scenario_{scenario_name}" / f"exp_{timestamp}"
+    output_dir = base_dir / f"exp_{cfg.experiment.name}" / f"run_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 创建子目录
-    (output_dir / "curves").mkdir(exist_ok=True)
-    (output_dir / "diagnostics").mkdir(exist_ok=True)
     (output_dir / "plots").mkdir(exist_ok=True)
 
     # 保存配置副本
     cfg.save_to(output_dir)
-
-    # 保存环境信息
-    import subprocess
-    try:
-        env_info = subprocess.check_output(['pip', 'freeze']).decode()
-        with open(output_dir / "environment.txt", 'w', encoding='utf-8') as f:
-            f.write(env_info)
-    except:
-        pass
 
     # 保存运行命令
     with open(output_dir / "run_command.txt", 'w', encoding='utf-8') as f:
@@ -263,7 +390,7 @@ def create_output_dir_from_config(cfg, config_path: str, custom_output: str = No
 
 def apply_quick_test_overrides(cfg):
     """应用快速测试模式的覆盖"""
-    print("\n  🚀 Quick test mode enabled:")
+    print(f"\n🚀 Quick test mode enabled:")
 
     # 小网格
     cfg.geometry.nx = 10
@@ -286,12 +413,8 @@ def apply_quick_test_overrides(cfg):
 
 
 # ============================================================================
-# 🔥 并行处理函数（从旧版移植）
+# 🔥 核心函数1: run_single_fold_worker (完整版)
 # ============================================================================
-
-# main.py 中的 run_single_fold_worker 函数
-# 在原有基础上修改以下部分（约第850-950行）
-
 
 def run_single_fold_worker(fold_data: dict) -> dict:
     """
@@ -318,7 +441,7 @@ def run_single_fold_worker(fold_data: dict) -> dict:
     decision_config = fold_data['decision_config']
 
     # 🔥 关键修复：直接使用标量，不构建geom对象
-    n_domain = fold_data['n_domain']  # 直接获取域大小
+    n_domain = fold_data['n_domain']
     coords = fold_data['coords']
     adjacency_test_data = fold_data.get('adjacency_test')
 
@@ -347,10 +470,10 @@ def run_single_fold_worker(fold_data: dict) -> dict:
             test_indices=np.arange(len(test_idx)), tau=tau
         )
 
-        # 🔥 Domain Scaling（使用直接传递的n_domain）
+        # 🔥 Domain Scaling
         if enable_scaling:
             N_test = len(test_idx)
-            scale_factor = n_domain / N_test  # ✅ 不再依赖geom对象
+            scale_factor = n_domain / N_test
             prior_loss_scaled = prior_loss_test * scale_factor
         else:
             prior_loss_scaled = prior_loss_test
@@ -522,12 +645,11 @@ def run_single_fold_worker(fold_data: dict) -> dict:
                 warnings.warn(f"Action-constrained evaluation failed: {e}")
 
         # ====================================================================
-        # 8. Moran's I（使用传递的adjacency子矩阵）
+        # 8. Moran's I
         # ====================================================================
         residuals = mu_post - x_true
         if adjacency_test_data is not None:
             try:
-                # 重建稀疏矩阵
                 adj_test = sp.coo_matrix(
                     (adjacency_test_data['data'],
                      (adjacency_test_data['row'], adjacency_test_data['col'])),
@@ -595,6 +717,10 @@ def run_single_fold_worker(fold_data: dict) -> dict:
         }
 
 
+# ============================================================================
+# 🔥 核心函数2: run_method_evaluation (完整版)
+# ============================================================================
+
 def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
                           x_true, sensors, test_idx_global=None,
                           use_parallel=False, n_workers=None, verbose=True) -> dict:
@@ -655,11 +781,8 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
     enable_scaling = getattr(cfg.metrics, 'scale_savings_to_domain', True) if hasattr(cfg, 'metrics') else True
 
     # 🔥 关键修复：提取必要的标量和可序列化数据
-    n_domain = geom.n  # 提取域大小
-    coords = geom.coords  # numpy数组，可序列化
-
-    # 🔥 提取adjacency的测试集子矩阵（避免传递整个稀疏矩阵）
-    # 我们稍后在需要Moran's I时再处理
+    n_domain = geom.n
+    coords = geom.coords
 
     # 遍历budgets
     for k in cfg.selection.budgets:
@@ -677,9 +800,7 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
         for fold_idx, (train_idx, test_idx) in enumerate(folds):
             # 🔥 关键：提取test_idx对应的adjacency子矩阵
             try:
-                # 只提取test集内部的邻接关系
                 adj_test_submatrix = geom.adjacency[test_idx][:, test_idx]
-                # 转换为可序列化的格式（COO格式更安全）
                 adj_test_coo = adj_test_submatrix.tocoo()
                 adjacency_data = {
                     'data': adj_test_coo.data,
@@ -702,12 +823,9 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
                 'x_true': x_true,
                 'sensors': sensors,
                 'decision_config': cfg.decision,
-
-                # 🔥 传递简化的几何数据
-                'n_domain': n_domain,  # 直接传递标量
-                'coords': coords,  # numpy数组
-                'adjacency_test': adjacency_data,  # test集的邻接关系
-
+                'n_domain': n_domain,
+                'coords': coords,
+                'adjacency_test': adjacency_data,
                 'rng_seed': rng.integers(0, 2 ** 31),
                 'enable_domain_scaling': enable_scaling,
                 'scenario': scenario,
@@ -718,7 +836,6 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
 
         # 并行或串行执行
         if use_parallel and len(fold_data_list) > 1:
-            # 并行模式
             if n_workers is None:
                 n_workers = max(1, mp.cpu_count() - 1)
 
@@ -727,13 +844,11 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
                       f"with {n_workers} workers...")
 
             with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                # 提交所有任务
                 future_to_fold = {
                     executor.submit(run_single_fold_worker, fold_data): fold_idx
                     for fold_idx, fold_data in fold_data_list
                 }
 
-                # 收集结果
                 for future in as_completed(future_to_fold):
                     fold_idx = future_to_fold[future]
                     try:
@@ -832,203 +947,79 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
 
     return results
 
-def main():
-    """主评估流程 - CLI版本"""
-    from visualization import (
-        setup_style,
-        generate_all_visualizations_v2,
-        aggregate_results_for_visualization
 
-    )
-    # 解析命令行参数
-    args = parse_arguments()
+# ============================================================================
+# 🔥 核心函数3: run_single_experiment
+# ============================================================================
 
-    # 设置输出详细程度
-    verbose = not args.quiet
+def run_single_experiment(cfg, args, exp_index=None, total_experiments=None):
+    """
+    🔥 运行单个实验配置
+    """
+    exp_prefix = f"[{exp_index+1}/{total_experiments}] " if exp_index is not None else ""
 
-    if verbose:
-        print("=" * 70)
-        print("  RDT-VoI EVALUATION FRAMEWORK (CLI VERSION)")
-        print("=" * 70)
+    if not args.quiet:
+        print(f"\n{'='*70}")
+        print(f"  {exp_prefix}EXPERIMENT: {cfg.experiment.name}")
+        print(f"{'='*70}")
 
-    # 1. 加载配置
-    if verbose:
-        print(f"\n[1] Loading configuration...")
+    t_start = datetime.now()
 
-    # 🔥 场景模式：优先级最高
-    if args.scenario:
-        scenario_upper = args.scenario.upper()
-        cfg = load_scenario_config(scenario_upper)
-        config_path = f"config_{scenario_upper}_{'highstakes' if scenario_upper == 'A' else 'proxy'}.yaml"
-        if verbose:
-            print(f"    ✓ Loaded scenario {scenario_upper} config")
-    elif args.config:
-        cfg = load_config(args.config)
-        config_path = args.config
-        if verbose:
-            print(f"    ✓ Loaded custom config: {args.config}")
-    else:
-        print("ERROR: Must specify either --scenario or --config")
-        print("Examples:")
-        print("  python main.py --scenario A")
-        print("  python main.py --config path/to/config.yaml")
-        sys.exit(1)
+    # 创建输出目录
+    output_dir = create_output_dir_from_config(cfg, args.config or "baseline_config.yaml", args.output)
+    if not args.quiet:
+        print(f"\n📁 Output: {output_dir}")
 
-    # 应用命令行覆盖
-    if args.seed:
-        cfg.experiment.seed = args.seed
-        if verbose:
-            print(f"    → Override seed: {args.seed}")
-
-    if args.budgets:
-        cfg.selection.budgets = args.budgets
-        if verbose:
-            print(f"    → Override budgets: {args.budgets}")
-
-    if args.methods:
-        cfg.selection.methods = args.methods
-        if verbose:
-            print(f"    → Override methods: {args.methods}")
-
-    # 快速测试模式
+    # 快速测试模式调整
     if args.quick_test:
         cfg = apply_quick_test_overrides(cfg)
 
     rng = cfg.get_rng()
 
-    # 检测场景类型
-    scenario = detect_scenario_from_config(cfg)
-    if verbose:
-        print(f"\n    🎯 Detected Scenario: {scenario}")
-        if scenario == 'A':
-            print("       → High-stakes / Near-threshold decision focus")
-        else:
-            print("       → Compute efficiency / Robustness focus")
-
-    # 🔥 并行处理设置
-    use_parallel = args.parallel
-    n_workers = args.workers
-    if use_parallel and verbose:
-        if n_workers is None:
-            n_workers = max(1, mp.cpu_count() - 1)
-        print(f"\n    ⚡ Parallel processing enabled: {n_workers} workers")
-
-    # 2. 创建输出目录
-    output_dir = create_output_dir_from_config(cfg, config_path, args.output)
-    if verbose:
-        print(f"\n[2] Output directory: {output_dir}")
-
-    # 仅可视化模式
-    if args.viz_only:
-        if not args.results_file:
-            print("  ✗ Error: --viz-only requires --results-file")
-            sys.exit(1)
-
-        print(f"\n[VIZ-ONLY] Loading results from: {args.results_file}")
-        with open(args.results_file, 'rb') as f:
-            all_results = pickle.load(f)
-
-        df_results = aggregate_results_for_visualization(all_results)
-        print("  ⚠️  Visualization-only mode: skipping full pipeline")
-        return
-
-    # 3-8. 完整实验流程
-    if verbose:
-        print("\n[3] Building spatial domain...")
+    # 构建域和先验
+    if not args.quiet:
+        print(f"\n🌐 Building domain: {cfg.geometry.nx}×{cfg.geometry.ny}")
     geom = build_grid2d_geometry(cfg.geometry.nx, cfg.geometry.ny, cfg.geometry.h)
 
-    if verbose:
-        print("\n[4] Constructing GMRF prior with DDI control...")
+    if not args.quiet:
+        print(f"🔧 Building prior...")
 
+    # DDI控制的先验构建
     if hasattr(cfg.decision, 'target_ddi') and cfg.decision.target_ddi > 0:
         Q_temp, mu_temp = build_prior(geom, cfg.prior)
         tau = cfg.decision.get_threshold(mu_temp)
-        if verbose:
-            print(f"    Target DDI: {cfg.decision.target_ddi:.2%}")
-            print(f"    Decision threshold: τ = {tau:.3f}")
         Q_pr, mu_pr = build_prior_with_ddi(
             geom, cfg.prior, tau=tau, target_ddi=cfg.decision.target_ddi
         )
     else:
         Q_pr, mu_pr = build_prior(geom, cfg.prior)
 
-        # 🔥 新增：预先计算并缓存tau到config中
+    # 缓存阈值
     tau = cfg.decision.get_threshold(mu_pr)
-    cfg.decision.tau_iri = tau  # 缓存到配置中
-    if verbose:
-        print(f"    ✓ Decision threshold cached: τ = {tau:.3f}")
+    cfg.decision.tau_iri = tau
 
-    # 🔥 验证DDI是否达标
-    if cfg.plots.ddi_overlay.get('enable', True) and verbose:
-        from spatial_field import plot_ddi_heatmap, compute_ddi_with_target
-        from inference import SparseFactor, compute_posterior_variance_diagonal
+    if not args.quiet:
+        print(f"✅ Prior setup complete (τ={tau:.3f})")
 
-        factor = SparseFactor(Q_pr)
-        sample_idx = rng.choice(geom.n, size=min(100, geom.n), replace=False)
-        sample_vars = compute_posterior_variance_diagonal(factor, sample_idx)
-        sigma_est = np.sqrt(np.mean(sample_vars)) * np.ones(geom.n)
-
-        # ✅ 使用修复后的DDI计算
-        if hasattr(cfg.decision, 'target_ddi') and cfg.decision.target_ddi > 0:
-            actual_ddi, epsilon = compute_ddi_with_target(
-                mu_pr, sigma_est, tau, cfg.decision.target_ddi
-            )
-            print(f"    ✓ Actual DDI: {actual_ddi:.2%} (target: {cfg.decision.target_ddi:.2%})")
-            print(f"      Epsilon: {epsilon:.3f}σ")
-
-        plot_ddi_heatmap(geom, mu_pr, sigma_est, tau,
-                         output_path=output_dir / 'ddi_heatmap_prior.png')
-
-    if verbose:
-        print(f"    Precision sparsity: {Q_pr.nnz / geom.n ** 2 * 100:.2f}%")
-        print(f"    Correlation length: {cfg.prior.correlation_length:.1f} m")
-
-    if verbose:
-        print("\n[5] Sampling true deterioration state...")
+    # 生成真实状态和传感器
     x_true = sample_gmrf(Q_pr, mu_pr, rng)
-
-    # 🔥 新增：预先计算并缓存tau到config中
-    tau = cfg.decision.get_threshold(mu_pr)
-    cfg.decision.tau_iri = tau  # 缓存到配置中
-    if verbose:
-        print(f"    ✓ Decision threshold cached: τ = {tau:.3f}")
-
-
-    if verbose:
-        print(f"    State range: [{x_true.min():.2f}, {x_true.max():.2f}]")
-        print(f"    Mean: {x_true.mean():.2f}, Std: {x_true.std():.2f}")
     np.save(output_dir / 'x_true.npy', x_true)
 
-    if verbose:
-        print("\n[6] Generating sensor pool...")
-    if cfg.sensors.use_heterogeneous:
-        from sensors import generate_heterogeneous_sensor_pool, create_cost_zones_example
-        if cfg.sensors.cost_zones:
-            cost_zones = cfg.sensors.cost_zones
-        else:
-            cost_zones = create_cost_zones_example(geom)
-        sensors = generate_heterogeneous_sensor_pool(
-            geom, cfg.sensors, cost_zones=cost_zones, rng=rng
-        )
-    else:
-        sensors = generate_sensor_pool(geom, cfg.sensors, rng)
+    sensors = generate_sensor_pool(geom, cfg.sensors, rng)
 
-    if verbose:
-        print("\n[7] Preparing global test set for EVI...")
+    # 全局测试集
     n_test = min(200, geom.n)
     test_idx_global = rng.choice(geom.n, size=n_test, replace=False)
-    if verbose:
-        print(f"    Test set size: {n_test}")
 
-    if verbose:
-        print("\n[8] Running method evaluations...")
-    methods = get_available_methods(cfg)
-    if verbose:
-        print(f"    Methods to evaluate: {', '.join(methods)}")
+    # 运行方法评估
+    if not args.quiet:
+        print(f"\n🚀 Running methods: {', '.join(cfg.selection.methods)}")
 
     all_results = {}
+    methods = get_available_methods(cfg)
+
     for method_name in methods:
-        t_method_start = datetime.now()
+        method_start = datetime.now()
         try:
             results = run_method_evaluation(
                 method_name=method_name,
@@ -1039,74 +1030,45 @@ def main():
                 x_true=x_true,
                 sensors=sensors,
                 test_idx_global=test_idx_global,
-                use_parallel=use_parallel,  # 🔥 传递并行参数
-                n_workers=n_workers,
-                verbose=verbose
+                use_parallel=args.parallel,
+                n_workers=args.workers,
+                verbose=not args.quiet
             )
             all_results[method_name] = results
-            t_method_elapsed = (datetime.now() - t_method_start).total_seconds()
-            if verbose:
-                print(f"\n  ✓ {method_name} completed in {t_method_elapsed:.1f}s")
+
+            method_elapsed = (datetime.now() - method_start).total_seconds()
+            if not args.quiet:
+                print(f"✅ {method_name} completed in {method_elapsed:.1f}s")
         except Exception as e:
-            if verbose:
-                print(f"\n  ✗ {method_name} FAILED: {str(e)}")
-            warnings.warn(f"Method {method_name} failed: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            if not args.quiet:
+                print(f"❌ {method_name} failed: {str(e)}")
             continue
 
-    # 9. 保存结果
-    if verbose:
-        print("\n[9] Saving results...")
+    # 保存结果
     with open(output_dir / 'results_raw.pkl', 'wb') as f:
         pickle.dump(all_results, f)
-    if verbose:
-        print(f"    Saved: results_raw.pkl")
 
-    if verbose:
-        print("    Converting results to DataFrame...")
+    # 转换为DataFrame
     try:
         df_results = aggregate_results_for_visualization(all_results)
-        if df_results.empty:
-            if verbose:
-                print("    ⚠️  Warning: No results to aggregate")
-        else:
+        if not df_results.empty:
             df_results.to_csv(output_dir / 'results_aggregated.csv', index=False)
-            if verbose:
-                print(f"    Saved: results_aggregated.csv ({len(df_results)} rows)")
+            if not args.quiet:
+                print(f"💾 Saved {len(df_results)} result rows")
     except Exception as e:
-        if verbose:
-            print(f"    ✗ Failed to create aggregated DataFrame: {e}")
+        if not args.quiet:
+            print(f"⚠️ DataFrame conversion failed: {e}")
         df_results = pd.DataFrame()
 
-    # 10. 可视化
+    # 可视化
     if not args.skip_viz and not df_results.empty:
-        if verbose:
-            print("\n[10] Generating visualizations...")
-        plots_dir = output_dir / 'plots'
-        plots_dir.mkdir(exist_ok=True)
-
+        if not args.quiet:
+            print(f"\n📊 Generating visualizations...")
         try:
-            # ✅ 使用修复后的可视化函数
-            from visualization import (
-                aggregate_results_for_visualization,
-                plot_roi_curves_fixed,
-                plot_marginal_efficiency_fixed
-            )
-
-            # 重新聚合（使用inner join）
-            df_results_clean = aggregate_results_for_visualization(all_results)
-
-            # 使用修复后的ROI绘图
-            plot_roi_curves_fixed(df_results_clean, plots_dir, cfg, baseline_method='uniform')
-
-            # 使用修复后的边际效率绘图
-            plot_marginal_efficiency_fixed(all_results, plots_dir, cfg)
-
-            # 其他可视化函数...
+            scenario = detect_scenario_from_config(cfg)
             generate_all_visualizations_v2(
                 all_results=all_results,
-                df_results=df_results_clean,  # 使用清理后的数据
+                df_results=df_results,
                 geom=geom,
                 sensors=sensors,
                 Q_pr=Q_pr,
@@ -1115,14 +1077,135 @@ def main():
                 config=cfg,
                 scenario=scenario
             )
+            if not args.quiet:
+                print(f"✅ Visualization complete")
+        except Exception as e:
+            if not args.quiet:
+                print(f"❌ Visualization failed: {str(e)}")
 
+    # 实验总结
+    total_elapsed = (datetime.now() - t_start).total_seconds()
+    if not args.quiet:
+        print(f"\n{exp_prefix}✅ Experiment completed in {total_elapsed:.1f}s")
+        print(f"📁 Results saved to: {output_dir}")
+
+    return {
+        'config': cfg,
+        'output_dir': output_dir,
+        'results': all_results,
+        'elapsed_time': total_elapsed,
+        'success': len(all_results) > 0
+    }
+
+
+# ============================================================================
+# 主函数
+# ============================================================================
+
+def main():
+    """
+    🔥 增强的主函数 - 支持参数扫描和灵活配置
+    """
+    args = parse_arguments()
+
+    verbose = not args.quiet
+
+    if verbose:
+        print("=" * 70)
+        print("  RDT-VoI 参数化实验框架")
+        print("=" * 70)
+
+    # 1. 加载基础配置
+    try:
+        base_cfg = load_config(args.config)
+        if verbose:
+            print(f"✅ Loaded config: {args.config}")
+    except Exception as e:
+        print(f"❌ Failed to load config: {e}")
+        sys.exit(1)
+
+    # 2. 应用预设
+    if args.preset:
+        try:
+            base_cfg = base_cfg.apply_preset(args.preset, verbose=verbose)
             if verbose:
-                print(f"    ✓ Visualization complete")
+                print(f"✅ Applied preset: {args.preset}")
+        except Exception as e:
+            print(f"❌ Failed to apply preset {args.preset}: {e}")
+            sys.exit(1)
+
+    # 3. 应用命令行覆盖
+    base_cfg = apply_cli_overrides(base_cfg, args)
+
+    # 4. 创建实验配置列表
+    try:
+        configs = create_experiment_configs(base_cfg, args)
+        if verbose:
+            print(f"📋 Created {len(configs)} experiment configuration(s)")
+    except Exception as e:
+        print(f"❌ Failed to create experiment configs: {e}")
+        sys.exit(1)
+
+    # 5. Dry run模式
+    if args.dry_run:
+        print(f"\n🔍 DRY RUN - Parameter combinations:")
+        for i, cfg in enumerate(configs):
+            print(f"\n  Experiment {i+1}: {cfg.experiment.name}")
+            print(f"    DDI: {getattr(cfg.decision, 'target_ddi', 'N/A')}")
+            print(f"    L_FN: £{cfg.decision.L_FN_gbp:,.0f}")
+            print(f"    L_FP: £{cfg.decision.L_FP_gbp:,.0f}")
+            print(f"    Budgets: {cfg.selection.budgets}")
+            print(f"    Methods: {cfg.selection.methods}")
+        print(f"\n✅ Dry run complete. Use without --dry-run to execute.")
+        return
+
+    # 6. 执行实验
+    successful_experiments = []
+    failed_experiments = []
+
+    total_start = datetime.now()
+
+    for i, cfg in enumerate(configs):
+        try:
+            result = run_single_experiment(cfg, args, exp_index=i, total_experiments=len(configs))
+            if result['success']:
+                successful_experiments.append(result)
+            else:
+                failed_experiments.append(result)
         except Exception as e:
             if verbose:
-                print(f"    ✗ Visualization phase failed: {str(e)}")
+                print(f"❌ Experiment {i+1} failed: {str(e)}")
+            failed_experiments.append({
+                'config': cfg,
+                'error': str(e),
+                'success': False
+            })
             import traceback
             traceback.print_exc()
+
+    # 7. 总结报告
+    total_elapsed = (datetime.now() - total_start).total_seconds()
+
+    if verbose:
+        print(f"\n" + "=" * 70)
+        print(f"  EXPERIMENT SUMMARY")
+        print(f"=" * 70)
+        print(f"✅ Successful: {len(successful_experiments)}")
+        print(f"❌ Failed: {len(failed_experiments)}")
+        print(f"⏱️  Total time: {total_elapsed:.1f}s")
+
+        if successful_experiments:
+            print(f"\n📁 Output directories:")
+            for result in successful_experiments:
+                print(f"  - {result['output_dir']}")
+
+    # 退出码
+    if failed_experiments and not successful_experiments:
+        sys.exit(1)
+    elif failed_experiments:
+        sys.exit(2)
+    else:
+        sys.exit(0)
 
 
 if __name__ == "__main__":
