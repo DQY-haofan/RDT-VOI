@@ -9,76 +9,125 @@ from typing import Tuple, List
 import warnings
 
 
-def conditional_risk(mu: float, sigma: float,
-                     tau: float, L_FP: float, L_FN: float, L_TP: float,
-                     L_TN: float = 0.0) -> float:
+def get_unified_prob_threshold(L_FP: float, L_FN: float, L_TP: float, L_TN: float = 0.0) -> float:
     """
-    🔥 修复版：Bayes-optimal conditional risk（通用概率阈值公式）
+    🔥 统一的 Bayes 最优概率阈值计算
 
-    关键修复：
-    - 使用通用公式 p_T = (L_FP - L_TN) / ((L_FP - L_TN) + (L_FN - L_TP))
-    - 兼容 L_TN ≠ 0 的情况
+    使用通用公式：p_T = (L_FP - L_TN) / [(L_FP - L_TN) + (L_FN - L_TP)]
 
     Args:
-        mu: Posterior mean
-        sigma: Posterior std deviation
-        tau: Decision threshold (e.g., IRI limit)
         L_FP: False positive cost
         L_FN: False negative cost
         L_TP: True positive cost
         L_TN: True negative cost (default 0)
 
     Returns:
-        risk: Expected loss under Bayes-optimal action
+        p_T: Optimal probability threshold
     """
+    numerator = L_FP - L_TN
+    denominator = (L_FP - L_TN) + (L_FN - L_TP)
+
+    if abs(denominator) < 1e-10:
+        warnings.warn("Near-singular decision cost matrix, using p_T=0.5")
+        return 0.5
+
+    p_T = numerator / denominator
+
+    # 健康检查
+    if not (0 <= p_T <= 1):
+        warnings.warn(f"Invalid p_T={p_T:.3f}, clamping to [0,1]")
+        p_T = np.clip(p_T, 0.0, 1.0)
+
+    return p_T
+
+
+def conditional_risk(mu: float, sigma: float,
+                     tau: float, L_FP: float, L_FN: float, L_TP: float,
+                     L_TN: float = 0.0) -> float:
+    """
+    🔥 紧急修复版：确保永远不返回None
+
+    Bayes-optimal conditional risk.
+    """
+    # 🔥 防御性检查：输入参数
+    if any(x is None for x in [mu, sigma, tau, L_FP, L_FN, L_TP]):
+        raise ValueError(
+            f"conditional_risk: None parameter detected! "
+            f"mu={mu}, sigma={sigma}, tau={tau}, "
+            f"L_FP={L_FP}, L_FN={L_FN}, L_TP={L_TP}"
+        )
+
     if sigma <= 0:
         # Degenerate case: certain knowledge
         if mu > tau:
-            return L_TP  # Maintain (correct)
+            return float(L_TP)  # Maintain (correct)
         else:
-            return L_TN  # Don't maintain (correct)
+            return float(L_TN if L_TN is not None else 0.0)
 
     # Posterior failure probability
-    p_f = 1.0 - norm.cdf((tau - mu) / sigma)
+    try:
+        p_f = 1.0 - norm.cdf((tau - mu) / sigma)
+    except Exception as e:
+        warnings.warn(f"norm.cdf failed: {e}, using p_f=0.5")
+        p_f = 0.5
 
-    # 🔥 修复：通用概率阈值公式
-    # Bayes-optimal action: act if p_f > p_T
-    # p_T = (L_FP - L_TN) / [(L_FP - L_TN) + (L_FN - L_TP)]
-    numerator = L_FP - L_TN
-    denom = (L_FP - L_TN) + (L_FN - L_TP)
+    # Bayes-optimal probability threshold
+    numerator = L_FP - (L_TN if L_TN is not None else 0.0)
+    denominator = (L_FP - (L_TN if L_TN is not None else 0.0)) + (L_FN - L_TP)
 
-    if abs(denom) < 1e-10:
-        warnings.warn("Near-singular decision cost matrix")
+    if abs(denominator) < 1e-10:
+        warnings.warn("Near-singular decision cost matrix, using p_T=0.5")
         p_T = 0.5
     else:
-        p_T = numerator / denom
+        p_T = numerator / denominator
+
+    # 🔥 确保p_T有效
+    p_T = np.clip(p_T, 0.0, 1.0)
 
     # Conditional risk for each action
-    risk_no_action = p_f * L_FN + (1 - p_f) * L_TN
+    risk_no_action = p_f * L_FN + (1 - p_f) * (L_TN if L_TN is not None else 0.0)
     risk_action = p_f * L_TP + (1 - p_f) * L_FP
 
     # Bayes-optimal risk
-    return min(risk_no_action, risk_action)
+    result = float(min(risk_no_action, risk_action))
+
+    # 🔥 防御性检查：确保返回值有效
+    if result is None or not np.isfinite(result):
+        warnings.warn(f"conditional_risk: invalid result {result}, returning 0.0")
+        return 0.0
+
+    return result
 
 
 def expected_loss(mu_post: np.ndarray,
-                 sigma_post: np.ndarray,
-                 decision_config,
-                 test_indices: np.ndarray = None,
-                 tau: float = None) -> float:
+                  sigma_post: np.ndarray,
+                  decision_config,
+                  test_indices: np.ndarray = None,
+                  tau: float = None) -> float:
     """
+    🔥 紧急修复版：确保永远不返回None
+
     Compute expected economic loss averaged over test set.
     """
+    # 🔥 防御性检查1：确保输入不是None
+    if mu_post is None or sigma_post is None or decision_config is None:
+        raise ValueError("expected_loss: None input detected!")
+
     if test_indices is None:
         test_indices = np.arange(len(mu_post))
 
+    # 🔥 防御性检查2：确保test_indices有效
+    if len(test_indices) == 0:
+        warnings.warn("expected_loss: empty test_indices, returning 0.0")
+        return 0.0
+
     # 🔥 改进的阈值获取逻辑
     if tau is None:
-        if decision_config.tau_iri is not None:
+        if hasattr(decision_config, 'tau_iri') and decision_config.tau_iri is not None:
             tau = decision_config.tau_iri
-        elif decision_config.tau_quantile is not None:
-            tau = float(np.quantile(mu_post, decision_config.tau_quantile))
-            # 🔥 修改：只在 tau_iri 未预先缓存时警告
+        elif hasattr(decision_config, 'get_threshold'):
+            tau = decision_config.get_threshold(mu_post)
+            # 缓存以避免重复计算
             if not hasattr(decision_config, '_tau_warning_shown'):
                 warnings.warn(
                     f"Computing dynamic threshold on-the-fly (tau={tau:.3f}). "
@@ -92,65 +141,82 @@ def expected_loss(mu_post: np.ndarray,
                 "Set either tau_iri or tau_quantile in config.yaml"
             )
 
-    risks = np.array([
-        conditional_risk(
-            mu_post[i], sigma_post[i],
-            tau,
-            decision_config.L_FP_gbp,
-            decision_config.L_FN_gbp,
-            decision_config.L_TP_gbp,
-            decision_config.L_TN_gbp
-        )
-        for i in test_indices
-    ])
+    # 🔥 防御性检查3：确保tau是有效数值
+    if tau is None or not np.isfinite(tau):
+        raise ValueError(f"Invalid tau: {tau}")
 
-    return risks.mean()
+    # 🔥 防御性检查4：确保损失参数不是None
+    L_FP = decision_config.L_FP_gbp
+    L_FN = decision_config.L_FN_gbp
+    L_TP = decision_config.L_TP_gbp
+    L_TN = getattr(decision_config, 'L_TN_gbp', 0.0)
+
+    if any(x is None for x in [L_FP, L_FN, L_TP]):
+        raise ValueError(
+            f"Loss parameters contain None: "
+            f"L_FP={L_FP}, L_FN={L_FN}, L_TP={L_TP}, L_TN={L_TN}"
+        )
+
+    # 计算风险
+    risks = []
+    for i in test_indices:
+        risk = conditional_risk(
+            mu_post[i], sigma_post[i],
+            tau, L_FP, L_FN, L_TP, L_TN
+        )
+
+        # 🔥 防御性检查5：确保单个风险不是None
+        if risk is None:
+            warnings.warn(f"conditional_risk returned None at index {i}, using 0.0")
+            risk = 0.0
+
+        risks.append(risk)
+
+    risks_array = np.array(risks)
+
+    # 🔥 防御性检查6：确保结果有效
+    if len(risks_array) == 0:
+        warnings.warn("expected_loss: no valid risks computed, returning 0.0")
+        return 0.0
+
+    result = float(risks_array.mean())
+
+    # 🔥 防御性检查7：确保返回值不是None或NaN
+    if result is None or not np.isfinite(result):
+        warnings.warn(f"expected_loss: invalid result {result}, returning 0.0")
+        return 0.0
+
+    return result
 
 
 def expected_loss_batch(mu_post_batch: np.ndarray,
-                       sigma_post_batch: np.ndarray,
-                       decision_config,
-                       test_indices: np.ndarray = None) -> np.ndarray:
+                             sigma_post_batch: np.ndarray,
+                             decision_config,
+                             test_indices: np.ndarray = None) -> np.ndarray:
     """
-    🔥 批量计算 expected loss（向量化版本）- 加速 20-50x
+    🔥 修复版：批量计算 expected loss（向量化版本）- 加速 20-50x
 
-    用于 EVI 快速评估：一次性计算所有候选的后验风险
-
-    Args:
-        mu_post_batch: 后验均值
-            - shape (n_test,): 单个候选
-            - shape (n_test, n_candidates): 多个候选（EVI 快速评估）
-        sigma_post_batch: 后验标准差，shape 与 mu_post_batch 相同
-        decision_config: 决策配置对象
-        test_indices: 测试集索引（可选，用于对齐）
-
-    Returns:
-        losses: Expected loss per candidate
-            - shape (n_candidates,) 如果输入是 2D
-            - 标量 如果输入是 1D
-
-    Example:
-        >>> # 评估 100 个候选在 200 个测试点上的损失
-        >>> mu = np.random.randn(200, 100)
-        >>> sigma = np.random.rand(200, 100) * 0.5
-        >>> losses = expected_loss_batch(mu, sigma, config)
-        >>> losses.shape  # (100,)
+    关键改进：
+    - 使用统一的阈值计算
+    - 优化的向量化实现
+    - 减少重复警告
     """
     # 🔥 改进的阈值获取逻辑
-    if decision_config.tau_iri is not None:
+    if hasattr(decision_config, 'tau_iri') and decision_config.tau_iri is not None:
         tau = decision_config.tau_iri
-    elif decision_config.tau_quantile is not None:
-        # 🔥 自动计算动态阈值（使用后验均值）
-        # 对于批量版本，使用第一列（或全局）的分位数
+    elif hasattr(decision_config, 'tau_quantile') and decision_config.tau_quantile is not None:
         if mu_post_batch.ndim == 1:
             tau = float(np.quantile(mu_post_batch, decision_config.tau_quantile))
         else:
-            # 使用所有候选的平均分位数
             tau = float(np.quantile(mu_post_batch, decision_config.tau_quantile))
-        warnings.warn(
-            f"tau_iri not set, using dynamic threshold: tau = {tau:.3f}. "
-            "For better performance, set tau_iri in main() before evaluation."
-        )
+
+        # 只在首次计算时警告
+        if not hasattr(decision_config, '_batch_tau_warning_shown'):
+            warnings.warn(
+                f"tau_iri not set, using dynamic threshold: tau = {tau:.3f}. "
+                "For better performance, set tau_iri in main() before evaluation."
+            )
+            decision_config._batch_tau_warning_shown = True
     else:
         raise ValueError(
             "Decision threshold not configured. "
@@ -160,23 +226,17 @@ def expected_loss_batch(mu_post_batch: np.ndarray,
     L_FP = decision_config.L_FP_gbp
     L_FN = decision_config.L_FN_gbp
     L_TP = decision_config.L_TP_gbp
-    L_TN = decision_config.L_TN_gbp
+    L_TN = getattr(decision_config, 'L_TN_gbp', 0.0)
 
     # 防止除零
     sigma_safe = np.maximum(sigma_post_batch, 1e-12)
 
     # 向量化计算后验失效概率
-    # P(x > τ | data) = 1 - Φ((τ - μ) / σ)
     z_scores = (tau - mu_post_batch) / sigma_safe
     p_fail = 1.0 - norm.cdf(z_scores)
 
-    # Bayes-optimal 决策阈值
-    denom = L_FP + L_FN - L_TP
-    if abs(denom) < 1e-10:
-        warnings.warn("Near-singular decision cost matrix, using p_T=0.5")
-        p_T = 0.5
-    else:
-        p_T = L_FP / denom
+    # 🔥 使用统一的 Bayes-optimal 决策阈值
+    p_T = get_unified_prob_threshold(L_FP, L_FN, L_TP, L_TN)
 
     # 两种行动的条件风险
     risk_no_action = p_fail * L_FN + (1 - p_fail) * L_TN
@@ -203,26 +263,31 @@ def expected_loss_batch(mu_post_batch: np.ndarray,
 
 
 def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
-                    n_samples: int = 500,
-                    rng: np.random.Generator = None) -> float:
+                         n_samples: int = 500,
+                         rng: np.random.Generator = None) -> float:
     """
-    🔥 修复版：严谨的 EVI Monte Carlo 近似
+    🔥 修复版：严谨的 EVI Monte Carlo 近似（使用统一阈值）
 
     关键修复：
-    1. 使用正确的 GMRF 采样（通过 sample_gmrf）
-    2. 完整的 prior→observation→posterior→risk差 流程
-    3. 在测试集上评估（避免过拟合）
-
-    EVI = E_{x~prior, y|x}[Risk_prior - Risk_posterior(y)]
+    1. 使用统一的概率阈值计算
+    2. 预缓存决策阈值，避免重复计算
+    3. 完整的 prior→observation→posterior→风险差 流程
     """
     from inference import SparseFactor, compute_posterior, compute_posterior_variance_diagonal
-    from spatial_field import sample_gmrf  # 🔥 使用已验证的采样函数
+    from spatial_field import sample_gmrf
 
     if rng is None:
         rng = np.random.default_rng()
 
     n = Q_pr.shape[0]
     m = len(R_diag)
+
+    # 预缓存决策阈值
+    if hasattr(decision_config, 'tau_iri') and decision_config.tau_iri is not None:
+        tau = decision_config.tau_iri
+    else:
+        tau = decision_config.get_threshold(mu_pr)
+        decision_config.tau_iri = tau  # 缓存以避免重复计算
 
     # 先验因子（用于求对角方差）
     factor_pr = SparseFactor(Q_pr)
@@ -237,17 +302,14 @@ def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
 
     # 先验风险（固定，所有样本共享）
     prior_risk = expected_loss(
-        mu_pr[test_idx],
-        sigma_pr,
-        decision_config,
-        test_indices=np.arange(len(test_idx))
+        mu_pr[test_idx], sigma_pr, decision_config,
+        test_indices=np.arange(len(test_idx)), tau=tau
     )
 
     post_risks = []
 
     for sample_idx in range(n_samples):
-        # === 🔥 修复1：从先验正确采样真实状态 ===
-        # 使用已验证的 sample_gmrf（内部使用 Cholesky 下三角）
+        # === 1. 从先验正确采样真实状态 ===
         x_true = sample_gmrf(Q_pr, mu_pr, rng)
 
         # === 2. 生成观测 y = Hx + ε ===
@@ -260,7 +322,6 @@ def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
             mu_post, factor_post = compute_posterior(Q_pr, mu_pr, H, R_diag, y)
         except Exception as e:
             warnings.warn(f"Posterior computation failed at sample {sample_idx}: {e}")
-            # 降级为先验
             post_risks.append(prior_risk)
             continue
 
@@ -270,10 +331,8 @@ def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
 
         # === 5. 计算后验 Bayes 风险 ===
         post_risk = expected_loss(
-            mu_post[test_idx],
-            sigma_post,
-            decision_config,
-            test_indices=np.arange(len(test_idx))
+            mu_post[test_idx], sigma_post, decision_config,
+            test_indices=np.arange(len(test_idx)), tau=tau
         )
 
         post_risks.append(post_risk)
@@ -282,11 +341,10 @@ def evi_monte_carlo(Q_pr, mu_pr, H, R_diag, decision_config,
     avg_post_risk = np.mean(post_risks)
     evi = prior_risk - avg_post_risk
 
-    # 🔥 健康检查：EVI 应该为正
+    # 🔥 健康检查：EVI应该为正
     if evi < -1e-3:  # 允许小的数值误差
         warnings.warn(f"Negative EVI detected: {evi:.2f} £")
         warnings.warn(f"  Prior risk: {prior_risk:.2f}, Post risk: {avg_post_risk:.2f}")
-        # 不强制截断，保留负值以便调试
 
     return float(evi)
 

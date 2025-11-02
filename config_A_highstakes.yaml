@@ -4,8 +4,8 @@
 #
 # 核心特征：
 #   - 高 DDI (0.20-0.35): 大量像元处于决策临界区
-#   - 强不对称代价 (FN:FP = 25:1): 漏检代价远高于误报
-#   - 稀疏候选池 (20%): 选点难度大
+#   - 强不对称代价 (FN:FP = 4:1): 漏检代价远高于误报
+#   - 🔥 密集候选池 (60%): 充足选择空间避免同质化
 #   - 行动受限 (K_action=10): 维护预算紧张
 #
 # 预期结果：EVI 在期望损失、ROI、Top-K 命中率上显著领先 MI
@@ -14,7 +14,7 @@
 experiment:
   name: "rdt_voi_A_highstakes"
   seed: 42
-  output_dir: "results/A_highstakes"
+  output_dir: "results/"
 
 # ----------------------------------------------------------------------------
 # Numerical Settings
@@ -39,16 +39,16 @@ geometry:
 # ----------------------------------------------------------------------------
 prior:
   nu: 1.0
-  kappa: 0.12
+  kappa: 0.08
   sigma2: 0.25
-  alpha: 2
+  alpha: 0.002
   beta: 1.0e-6
   mu_prior_mean: 2.2
   mu_prior_std: 0.3
 
   # 热点配置（用于空间异质性）
-  beta_base: 5.0     # 非热点区域的nugget（低不确定性）
-  beta_hot: 1.0e-4   # 热点区域的nugget（高不确定性）
+  beta_base: 0.001   # 🔥 5.0 → 0.001: 大幅降低非热点nugget
+  beta_hot: 1.0e-5   # 🔥 1.0e-4 → 1.0e-5: 进一步降低热点nugget
 
   hotspots:
     - center_m: [25, 75]
@@ -59,7 +59,7 @@ prior:
       radius_m: 15
 
 # ----------------------------------------------------------------------------
-# Sensor Pool Configuration - 🔥 稀疏池（20%）
+# Sensor Pool Configuration - 🔥 密集池（60%）避免同质化
 # ----------------------------------------------------------------------------
 sensors:
   types:
@@ -94,7 +94,7 @@ sensors:
       footprint: avg3x3
 
   pool_strategy: "grid_subsample"
-  pool_fraction: 0.40  # 🔥 稀疏池：仅 80 个候选位置（400×0.2）
+  pool_fraction: 0.60  # 🔥 密集池：240 个候选位置（400×0.60）
   type_mix: [0.15, 0.20, 0.10, 0.20, 0.15, 0.20]
 
   use_heterogeneous: true
@@ -110,28 +110,22 @@ sensors:
 # ----------------------------------------------------------------------------
 decision:
   tau_iri: null
-  tau_quantile: 0.75  # 🔥 高分位阈值，提升 DDI 但避免 100%
+  tau_quantile: 0.80  # 🔥 高分位阈值，提升 DDI 但避免 100%
 
-  # 代价矩阵
-  # 🔥 方案1（推荐）：提高 L_FP，p_T ≈ 0.25
+  # 代价矩阵 - 修正注释
   L_FP_gbp: 30000.0      # 5000 → 30000
   L_FN_gbp: 120000.0     # 保持不变
   L_TP_gbp: 800.0
   L_TN_gbp: 0.0
-  # p_T = 30000 / (30000 + 120000 - 800) ≈ 0.20 (20%)
+  # p_T = 30000 / (30000 + 120000 - 800) ≈ 0.20 (20%) ✅ 修正注释
 
-  # 🔥 或方案2：降低 L_FN，p_T ≈ 0.30
-  # L_FP_gbp: 25000.0
-  # L_FN_gbp: 60000.0
-  # L_TP_gbp: 800.0
-  # p_T = 25000 / (25000 + 60000 - 800) ≈ 0.30 (30%)
-
-  target_ddi: 0.25  # Scenario A: 0.25-0.35 | Scenario B: 0.10-0.15
+  target_ddi: 0.30  # Scenario A: 0.25-0.35 | Scenario B: 0.10-0.15
   K_action: 10      # Scenario A: 10 | Scenario B: null
 
 metrics:
-  scale_savings_to_domain: true  # ✅ 启用域缩放（让测试集损失可比于全域成本）
-  coverage_clip: [0.0, 1.0]      # Coverage 裁剪范围
+  scale_savings_to_domain: true
+  coverage_clip: [0.0, 1.0]
+
 # ----------------------------------------------------------------------------
 # Sensor Selection Methods - 🔥 前段预算密集
 # ----------------------------------------------------------------------------
@@ -145,16 +139,15 @@ selection:
     - random
 
   budget_type: "count"
-  budgets: [1, 3, 5, 8, 10]  # 🔥 从 [3,5,10,15,20] 改为 [1,3,5,8,10]
-
+  budgets: [1, 3, 5, 8, 10]  # 前段预算密集
 
   greedy_mi:
     batch_size: 64
     adaptive_pruning: true
     prune_threshold: 0.10
     use_cost: true
-    keep_fraction: null  # 🔥 新增: null=自动计算 max(4k, 0.25C)
-
+    keep_fraction: null  # 🔥 动态计算 max(4k, 0.25C)
+    adaptive_keep: true
 
   greedy_aopt:
     n_probes: 32
@@ -163,17 +156,18 @@ selection:
   greedy_evi:
     n_y_samples: 0
     use_cost: true
-    mi_prescreen: true  # 主实验保持true；相关性实验时设false
-    keep_fraction: null  # Scenario A: 0.5 | Scenario B: 0.5
+    mi_prescreen: false
+    keep_fraction: 0.9  # 🔥 动态计算 max(4k, 0.25C)
 
     # 🔥 关键修复：禁用fold跳过机制
-    every_n_folds: 1       # ✅ 1=运行所有fold（不跳过）
-    budgets_subset: []     # ✅ 空列表=运行所有budget
-    max_folds: null        # ✅ null=不限制fold数量
-    must_budgets: []       # ✅ 不需要特殊处理的budget
+    every_n_folds: 1
+    budgets_subset: []
+    max_folds: null
+    must_budgets: []
 
   maxmin:
     use_cost: true
+
 # ----------------------------------------------------------------------------
 # Expected Value of Information - 🔥 足够样本确保稳定
 # ----------------------------------------------------------------------------
@@ -182,13 +176,12 @@ evi:
   method: "monte_carlo"
   monte_carlo_samples: 32  # Scenario A: 32 | Scenario B: 16
 
-
 # ----------------------------------------------------------------------------
 # Cross-Validation
 # ----------------------------------------------------------------------------
 cv:
   scheme: "spatial_block"
-  k_folds: 5  # 🔥 建议至少5折，以获得足够实例数（5×5 budgets = 25）
+  k_folds: 5
   buffer_width_multiplier: 1.5
   block_strategy: "kmeans"
   ensure_connected: true
@@ -241,8 +234,8 @@ plots:
 
   business_metrics:
     enable: true
-    baseline_method: "uniform"  # 🔥 固定baseline
-    show_savings: true     # Scenario A: true | Scenario B: false
+    baseline_method: "uniform"
+    show_savings: true
     show_roi: true
     show_cost_efficiency: true
 
@@ -264,7 +257,6 @@ plots:
       enable: true
       normalize_by_cost: true
       unit: "gbp_per_test_point"
-      # 🔥 新增：分图显示不同单位
       split_by_unit: true
 
     type_composition:
@@ -274,11 +266,10 @@ plots:
     mi_voi_correlation:
       enable: true
       methods: ["greedy_mi", "greedy_evi"]
-      # 🔥 相关性实验：暂时禁用MI预筛选
       correlation_mode_disable_prescreen: false
 
     calibration_plots:
-      enable: true  # 可移到附录
+      enable: true
 
     spatial_diagnostics:
       enable: true
@@ -290,9 +281,8 @@ plots:
 
     roi_curves:
       enable: true
-      baseline_method: "uniform"  # 🔥 明确指定baseline
-      show_near_threshold: true  # 🔥 新增开关
-
+      baseline_method: "uniform"
+      show_near_threshold: true  # 🔥 Scenario A 特有
 
     robustness_heatmap:
       enable: false  # Scenario A: false | Scenario B: true
@@ -322,11 +312,21 @@ acceptance:
   m4_msse_tolerance: 0.25
 
 # ============================================================================
-# 场景 A 预期结果
+# 🔥 分层实验设计（专家建议）
 # ============================================================================
-# 1. EVI 期望损失比 MI 低 8-15%（在 n=5-15 段）
-# 2. EVI 的 ROI 曲线更陡峭（单位传感器成本的损失降低更大）
-# 3. Top-K=10 命中率：EVI 在真正高风险区域的覆盖率更高
-# 4. DDI 热图显示：EVI 选点更集中在 τ±0.2 的临界区
-# 5. Critical Difference 图：EVI 与 MI 达到统计显著性（p<0.05）
+# 为了更好地展示EVI优势，建议进行以下分层实验：
+#
+# 1. 阈值敏感性实验：
+#    tau_quantile ∈ {0.65, 0.75, 0.88}
+#    观察EVI vs MI差距如何随决策阈值变化
+#
+# 2. 候选池密度实验：
+#    pool_fraction ∈ {0.1, 0.4, 0.6}
+#    验证"池越密，优化效果越明显"的假设
+#
+# 3. 成本归一化消融：
+#    use_cost ∈ {true, false}
+#    评估成本敏感性对算法排序的影响
+#
+# 建议先用此配置跑基线结果，再进行参数扫描
 # ============================================================================

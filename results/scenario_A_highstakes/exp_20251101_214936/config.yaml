@@ -1,0 +1,257 @@
+acceptance:
+  m1_budgets:
+  - 5
+  - 10
+  - 20
+  m1_check_diminishing: true
+  m1_check_monotonic: true
+  m1_grid_size: 100
+  m2_confidence_level: 0.95
+  m2_min_improvement_vs_random: 0.15
+  m3_max_suboptimality: 0.1
+  m3_small_instance_k: 5
+  m3_small_instance_n: 25
+  m4_coverage_tolerance: 0.1
+  m4_morans_alpha: 0.05
+  m4_msse_tolerance: 0.25
+cv:
+  block_strategy: kmeans
+  buffer_width_multiplier: 1.5
+  ensure_connected: true
+  k_folds: 5
+  morans_permutations: 999
+  scheme: spatial_block
+decision:
+  K_action: 10
+  L_FN_gbp: 120000.0
+  L_FP_gbp: 30000.0
+  L_TN_gbp: 0.0
+  L_TP_gbp: 800.0
+  target_ddi: 0.3
+  tau_iri: null
+  tau_quantile: 0.8
+diagnostics:
+  calibration:
+    coverage_curves: true
+    pit_histogram: true
+    reliability_diagram: true
+  morans_i:
+    alpha: 0.05
+    compute: true
+    permutations: 999
+evi:
+  compute_for:
+  - greedy_mi
+  - greedy_evi
+  method: monte_carlo
+  monte_carlo_samples: 32
+experiment:
+  name: rdt_voi_A_highstakes
+  output_dir: results/
+  seed: 42
+geometry:
+  h: 5.0
+  mode: grid2d
+  nx: 20
+  ny: 20
+metrics:
+  coverage_clip:
+  - 0.0
+  - 1.0
+  scale_savings_to_domain: true
+numerics:
+  cholesky_nugget: 1.0e-06
+  linear_solver_tol: 1.0e-08
+  logdet_method: cholmod
+  pcg_max_iter: 500
+plots:
+  budget_curves:
+    confidence_level: 0.95
+    metrics:
+    - rmse
+    - expected_loss_gbp
+    - coverage_90
+    show_confidence: true
+  business_metrics:
+    baseline_method: uniform
+    enable: true
+    show_cost_efficiency: true
+    show_roi: true
+    show_savings: true
+  critical_difference:
+    alpha: 0.05
+    test: nemenyi
+  critical_region:
+    enable: true
+    epsilon: 0.2
+    plot_heatmap: true
+  dpi: 300
+  effect_size:
+    enable: true
+    plot_heatmaps: true
+    plot_pairwise_table: true
+    top_k_comparisons: 20
+  expert_plots:
+    calibration_plots:
+      enable: true
+    ddi_overlay:
+      enable: true
+      methods_to_compare:
+      - greedy_evi
+      - greedy_mi
+    enable_all: true
+    marginal_efficiency:
+      enable: true
+      normalize_by_cost: true
+      split_by_unit: true
+      unit: gbp_per_test_point
+    mi_voi_correlation:
+      correlation_mode_disable_prescreen: false
+      enable: true
+      methods:
+      - greedy_mi
+      - greedy_evi
+    robustness_heatmap:
+      enable: false
+    roi_curves:
+      baseline_method: uniform
+      enable: true
+      show_near_threshold: true
+    sensor_placement_map:
+      budgets_to_show:
+      - 5
+      - 10
+      - 15
+      - 20
+      enable: true
+    spatial_diagnostics:
+      enable: true
+      show_morans_i: true
+    type_composition:
+      enable: true
+      show_cost_breakdown: true
+  performance_profile:
+    tau_values:
+    - 1.0
+    - 1.05
+    - 1.1
+    - 1.2
+    - 1.5
+    - 2.0
+    - 3.0
+    use_budget_fold_instances: true
+  save_formats:
+  - png
+  - pdf
+  style: seaborn-v0_8-paper
+prior:
+  alpha: 2
+  beta: 1.0e-06
+  beta_base: 0.001
+  beta_hot: 1.0e-05
+  hotspots:
+  - center_m:
+    - 25
+    - 75
+    radius_m: 20
+  - center_m:
+    - 75
+    - 25
+    radius_m: 25
+  - center_m:
+    - 50
+    - 50
+    radius_m: 15
+  kappa: 0.08
+  mu_prior_mean: 2.2
+  mu_prior_std: 0.3
+  nu: 1.0
+  sigma2: 0.25
+selection:
+  budget_type: count
+  budgets:
+  - 1
+  - 3
+  - 5
+  - 8
+  - 10
+  greedy_aopt:
+    n_probes: 32
+    use_cost: true
+  greedy_evi:
+    budgets_subset: []
+    every_n_folds: 1
+    keep_fraction: null
+    max_folds: null
+    mi_prescreen: true
+    must_budgets: []
+    n_y_samples: 0
+    use_cost: true
+  greedy_mi:
+    adaptive_keep: true
+    adaptive_pruning: true
+    batch_size: 64
+    keep_fraction: null
+    prune_threshold: 0.1
+    use_cost: true
+  maxmin:
+    use_cost: true
+  methods:
+  - greedy_evi
+  - greedy_mi
+  - greedy_aopt
+  - maxmin
+  - uniform
+  - random
+sensors:
+  cost_zones:
+  - allowed_types:
+    - inertial_profiler
+    - photogrammetry
+    center_m:
+    - 100
+    - 100
+    cost_multiplier: 1.5
+    noise_multiplier: 0.8
+    radius_m: 50
+  pool_fraction: 0.6
+  pool_strategy: grid_subsample
+  type_mix:
+  - 0.15
+  - 0.2
+  - 0.1
+  - 0.2
+  - 0.15
+  - 0.2
+  types:
+  - cost_gbp: 30
+    footprint: point
+    name: smartphone
+    noise_std: 0.5
+  - cost_gbp: 150
+    footprint: point
+    name: basic_point
+    noise_std: 0.12
+  - cost_gbp: 800
+    footprint: point
+    name: laser_profiler
+    noise_std: 0.035
+  - cost_gbp: 100
+    footprint: avg3x3
+    name: photogrammetry
+    noise_std: 0.2
+  - cost_gbp: 100
+    footprint: avg5x5
+    name: vehicle_avg
+    noise_std: 0.3
+  - cost_gbp: 300
+    footprint: avg3x3
+    name: inertial_profiler
+    noise_std: 0.12
+  use_heterogeneous: true
+uq:
+  bootstrap_method: spatial_block
+  bootstrap_samples: 1000
+  compute_crps: true
+  confidence_level: 0.95
+  coverage_percentile: 90

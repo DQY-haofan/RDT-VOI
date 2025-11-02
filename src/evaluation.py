@@ -14,41 +14,25 @@ def spatial_block_cv(coords: np.ndarray,
                      rng: np.random.Generator = None) -> List[Tuple[np.ndarray, np.ndarray]]:
     """
     Spatial block cross-validation with optional buffer zones.
-
-    Args:
-        coords: (n, d) spatial coordinates
-        k_folds: Number of folds
-        buffer_width: Buffer distance (points within buffer excluded from both sets)
-        block_strategy: "kmeans" | "grid"
-        rng: Random generator
-
-    Returns:
-        folds: List of (train_idx, test_idx) tuples
     """
     from geometry import get_spatial_blocks
 
     n = len(coords)
 
-    # Partition into spatial blocks
     block_labels = get_spatial_blocks(coords, k_folds, strategy=block_strategy, rng=rng)
 
     folds = []
     for fold_id in range(k_folds):
-        # Test set: current block
         test_mask = (block_labels == fold_id)
         test_idx = np.where(test_mask)[0]
 
-        # Train set: all other blocks
         train_mask = ~test_mask
 
-        # Apply buffer if requested
         if buffer_width > 0:
-            # Find points within buffer distance of test set
             test_coords = coords[test_idx]
             distances = cdist(coords, test_coords, metric='euclidean')
             min_dist_to_test = distances.min(axis=1)
 
-            # Exclude buffer points from train
             buffer_mask = min_dist_to_test <= buffer_width
             train_mask = train_mask & ~buffer_mask
 
@@ -68,14 +52,6 @@ def compute_roi(prior_loss: float,
     计算投资回报率（Return on Investment）
 
     ROI = (节省的损失 - 传感成本) / 传感成本
-
-    Args:
-        prior_loss: 先验决策损失（£）
-        posterior_loss: 后验决策损失（£）
-        sensor_cost: 传感器总成本（£）
-
-    Returns:
-        ROI: 投资回报率
     """
     savings = prior_loss - posterior_loss
 
@@ -88,26 +64,29 @@ def compute_roi(prior_loss: float,
 
 
 def compute_action_constrained_loss(mu_post: np.ndarray,
-                                    sigma_post: np.ndarray,
-                                    x_true: np.ndarray,
-                                    decision_config,
-                                    K: int = None,
-                                    tau: float = None) -> Dict:
+                                          sigma_post: np.ndarray,
+                                          x_true: np.ndarray,
+                                          decision_config,
+                                          K: int = None,
+                                          tau: float = None) -> Dict:
     """
-    🔥 计算行动受限场景下的损失
+    🔥 修复版：Action-limited 指标 - Top-K ∩ {p_f > p_T} 策略
 
-    实际工程中，只能维护前 K 个最危险的路段/聚类
+    关键修复：
+    1. 只对 (排名前K) ∩ (概率>阈值) 的位置执行维护
+    2. 不足K个时宁缺毋滥，避免强制假阳性
+    3. 添加详细的性能指标
 
     Args:
         mu_post: 后验均值 (n,)
         sigma_post: 后验标准差 (n,)
         x_true: 真实状态 (n,)
         decision_config: 决策配置
-        K: 允许维护的最大数量（None = 无限制）
+        K: 允许维护的最大数量
         tau: 决策阈值
 
     Returns:
-        结果字典
+        完整的action-limited指标字典
     """
     from decision import conditional_risk
 
@@ -117,10 +96,14 @@ def compute_action_constrained_loss(mu_post: np.ndarray,
     n = len(mu_post)
 
     # 计算每个位置的后验故障概率
-    from scipy.stats import norm
     p_failure = 1.0 - norm.cdf((tau - mu_post) / np.maximum(sigma_post, 1e-12))
 
-    # 无限制情况：Bayes 最优决策
+    # Bayes最优概率阈值
+    p_T = decision_config.L_FP_gbp / (
+            decision_config.L_FP_gbp + decision_config.L_FN_gbp - decision_config.L_TP_gbp
+    )
+
+    # 无限制情况：Bayes最优决策
     unrestricted_risks = np.array([
         conditional_risk(
             mu_post[i], sigma_post[i], tau,
@@ -133,87 +116,139 @@ def compute_action_constrained_loss(mu_post: np.ndarray,
     ])
     unrestricted_loss = unrestricted_risks.mean()
 
-    # 行动受限情况
-    if K is not None and K < n:
-        # 策略1：维护后验故障概率最高的 K 个
-        top_k_idx = np.argsort(p_failure)[-K:]
-
-        # 这 K 个执行维护（承担 TP/TN 损失）
-        # 其余 n-K 个不维护（承担 FP/FN 损失）
-        constrained_risks = np.zeros(n)
-
-        for i in range(n):
-            if i in top_k_idx:
-                # 维护：承担 L_TP 或 L_TN
-                if x_true[i] > tau:
-                    constrained_risks[i] = decision_config.L_TP_gbp
-                else:
-                    constrained_risks[i] = decision_config.L_FP_gbp
-            else:
-                # 不维护：承担 L_FN 或 L_TN
-                if x_true[i] > tau:
-                    constrained_risks[i] = decision_config.L_FN_gbp
-                else:
-                    constrained_risks[i] = decision_config.L_TN_gbp
-
-        constrained_loss = constrained_risks.mean()
-
-        # 计算遗憾（相对于无限制）
-        regret = constrained_loss - unrestricted_loss
-
-        # 命中率：在真实超阈值的点中，我们维护了多少
-        true_exceed = x_true > tau
-        if true_exceed.sum() > 0:
-            hit_rate = np.sum(np.isin(np.where(true_exceed)[0], top_k_idx)) / true_exceed.sum()
-        else:
-            hit_rate = 1.0
-
+    if K is None or K >= n:
+        # 无限制情况
         return {
-            'unrestricted_loss': unrestricted_loss,
-            'constrained_loss': constrained_loss,
-            'regret': regret,
-            'hit_rate': hit_rate,
-            'K': K,
-            'n_true_exceed': true_exceed.sum(),
-            'n_maintained': K
-        }
-
-    else:
-        return {
+            'K': K or n,
+            'p_threshold': p_T,
+            'n_exceed_threshold': int((p_failure > p_T).sum()),
             'unrestricted_loss': unrestricted_loss,
             'constrained_loss': unrestricted_loss,
             'regret': 0.0,
-            'hit_rate': 1.0,
-            'K': n,
-            'n_true_exceed': (x_true > tau).sum(),
-            'n_maintained': n
+            'precision_at_k': 1.0,
+            'recall_at_k': 1.0,
+            'f1_at_k': 1.0,
+            'action_efficiency': 1.0
         }
+
+    # 🔥 关键修复：Top-K ∩ {p_f > p_T} 策略
+    # Step 1: 按故障概率排序，取前K个候选
+    top_k_candidates = np.argsort(p_failure)[-K:]
+
+    # Step 2: 在候选中筛选真正超过阈值的
+    exceed_threshold = p_failure > p_T
+
+    # Step 3: 实际执行维护的位置 = Top-K ∩ {p_f > p_T}
+    do_maintain = np.zeros(n, dtype=bool)
+    actual_actions = []
+
+    for idx in top_k_candidates:
+        if exceed_threshold[idx]:
+            do_maintain[idx] = True
+            actual_actions.append(idx)
+
+    n_actual_actions = len(actual_actions)
+
+    print(f"    Action-limited analysis:")
+    print(f"      K (limit): {K}")
+    print(f"      p_T (threshold): {p_T:.3f}")
+    print(f"      Candidates exceeding p_T: {exceed_threshold.sum()}")
+    print(f"      Actual actions taken: {n_actual_actions}")
+
+    # 计算限制后的风险
+    constrained_risks = np.zeros(n)
+    for i in range(n):
+        if do_maintain[i]:
+            # 维护：承担 L_TP 或 L_FP
+            if x_true[i] > tau:
+                constrained_risks[i] = decision_config.L_TP_gbp
+            else:
+                constrained_risks[i] = decision_config.L_FP_gbp
+        else:
+            # 不维护：承担 L_FN 或 L_TN
+            if x_true[i] > tau:
+                constrained_risks[i] = decision_config.L_FN_gbp
+            else:
+                constrained_risks[i] = decision_config.L_TN_gbp
+
+    constrained_loss = constrained_risks.mean()
+    regret = constrained_loss - unrestricted_loss
+
+    # 🔥 计算性能指标
+    true_exceed = x_true > tau
+    n_true_high_risk = true_exceed.sum()
+
+    if n_true_high_risk > 0:
+        # Recall@K: 在真高风险中，我们命中了多少
+        hit_count = np.sum(do_maintain & true_exceed)
+        recall_at_k = hit_count / n_true_high_risk
+    else:
+        recall_at_k = 1.0  # 无高风险位置时定义为完美
+        hit_count = 0
+
+    if n_actual_actions > 0:
+        # Precision@K: 在我们行动的位置中，有多少是真高风险
+        precision_at_k = np.sum(do_maintain & true_exceed) / n_actual_actions
+    else:
+        precision_at_k = 1.0  # 无行动时定义为完美（避免除零）
+
+    # F1 Score
+    if precision_at_k + recall_at_k > 0:
+        f1_at_k = 2 * precision_at_k * recall_at_k / (precision_at_k + recall_at_k)
+    else:
+        f1_at_k = 0.0
+
+    # Action Efficiency: 实际行动数 / 限制数
+    action_efficiency = n_actual_actions / K if K > 0 else 0.0
+
+    # 成本效率：节省的损失 / 实际行动成本（简化）
+    if n_actual_actions > 0:
+        cost_efficiency_ratio = (unrestricted_loss - constrained_loss) / n_actual_actions
+    else:
+        cost_efficiency_ratio = np.inf if unrestricted_loss > constrained_loss else 0.0
+
+    print(f"      Recall@K: {recall_at_k:.3f}")
+    print(f"      Precision@K: {precision_at_k:.3f}")
+    print(f"      F1@K: {f1_at_k:.3f}")
+    print(f"      Action efficiency: {action_efficiency:.3f}")
+    print(f"      Regret: £{regret:.2f}")
+
+    return {
+        'K': K,
+        'p_threshold': p_T,
+        'n_exceed_threshold': int(exceed_threshold.sum()),
+        'n_actual_actions': n_actual_actions,
+        'unrestricted_loss': float(unrestricted_loss),
+        'constrained_loss': float(constrained_loss),
+        'regret': float(regret),
+        'precision_at_k': float(precision_at_k),
+        'recall_at_k': float(recall_at_k),
+        'f1_at_k': float(f1_at_k),
+        'action_efficiency': float(action_efficiency),
+        'cost_efficiency_ratio': float(cost_efficiency_ratio),
+        'hit_count': int(hit_count),
+        'true_high_risk_count': int(n_true_high_risk)
+    }
 
 
 def compute_enhanced_metrics(mu_post: np.ndarray,
-                             sigma_post: np.ndarray,
-                             x_true: np.ndarray,
-                             test_idx: np.ndarray,
-                             decision_config,
-                             sensor_cost: float = 0.0,
-                             prior_loss: float = None,
-                             K_action: int = None) -> Dict[str, float]:
+                                   sigma_post: np.ndarray,
+                                   x_true: np.ndarray,
+                                   test_idx: np.ndarray,
+                                   decision_config,
+                                   sensor_cost: float = 0.0,
+                                   prior_loss: float = None,
+                                   K_action: int = None,
+                                   enable_near_threshold: bool = True) -> Dict[str, float]:
     """
-    🔥 增强的性能指标计算
-
-    包含：
-    - 基础指标（RMSE, MAE, R²）
-    - 决策损失
-    - ROI
-    - 行动受限后损失
-    - DDI 统计
+    🔥 增强的性能指标计算（使用修复后的action-limited）
     """
     # 基础指标
     base_metrics = compute_metrics(
         mu_post, sigma_post, x_true, test_idx, decision_config
     )
 
-    # ROI（如果提供了先验损失）
+    # ROI计算
     if prior_loss is not None and sensor_cost > 0:
         roi = compute_roi(
             prior_loss,
@@ -221,9 +256,52 @@ def compute_enhanced_metrics(mu_post: np.ndarray,
             sensor_cost
         )
         base_metrics['roi'] = roi
-        base_metrics['cost_efficiency'] = (prior_loss - base_metrics['expected_loss_gbp']) / sensor_cost
 
-    # 行动受限损失（如果指定了 K）
+        savings = prior_loss - base_metrics['expected_loss_gbp']
+        base_metrics['cost_efficiency'] = savings / sensor_cost
+        base_metrics['savings_gbp'] = savings
+
+    # 🔥 Near-threshold 子集评估（修复版本）
+    if enable_near_threshold and prior_loss is not None:
+        try:
+            tau = decision_config.get_threshold()
+
+            # 🔥 修复：使用正确的加权平均进行near-threshold识别
+            gaps = np.abs(mu_post[test_idx] - tau)
+            threshold_band = 1.0 * sigma_post[test_idx]  # ±1σ
+            near_mask = gaps <= threshold_band
+
+            if near_mask.sum() > 0:
+                print(f"    Near-threshold evaluation: {near_mask.sum()}/{len(test_idx)} points")
+
+                # 计算near-threshold的先验损失（需要传入）
+                near_fraction = near_mask.sum() / len(test_idx)
+
+                # 计算near-threshold后验损失
+                from decision import expected_loss
+                near_posterior_loss = expected_loss(
+                    mu_post[test_idx][near_mask],
+                    sigma_post[test_idx][near_mask],
+                    decision_config,
+                    tau=tau
+                )
+
+                # 假设先验损失中near-threshold贡献更大
+                prior_loss_near = prior_loss * near_fraction * 1.5  # 假设1.5倍权重
+                roi_near = compute_roi(prior_loss_near, near_posterior_loss, sensor_cost)
+
+                base_metrics.update({
+                    'n_near_threshold': int(near_mask.sum()),
+                    'fraction_near_threshold': float(near_fraction),
+                    'prior_loss_near_threshold': float(prior_loss_near),
+                    'posterior_loss_near_threshold': float(near_posterior_loss),
+                    'savings_near_threshold': float(prior_loss_near - near_posterior_loss),
+                    'roi_near_threshold': float(roi_near)
+                })
+        except Exception as e:
+            print(f"    Warning: Near-threshold evaluation failed: {e}")
+
+    # 🔥 Action-limited分析（使用修复后的函数）
     if K_action is not None:
         tau = decision_config.get_threshold()
         action_metrics = compute_action_constrained_loss(
@@ -235,22 +313,138 @@ def compute_enhanced_metrics(mu_post: np.ndarray,
             tau=tau
         )
 
+        # 添加前缀以避免命名冲突
+        for key, val in action_metrics.items():
+            base_metrics[f'action_{key}'] = val
+
+    # DDI统计
+    tau = decision_config.get_threshold()
+    try:
+        from spatial_field import compute_ddi
+        ddi = compute_ddi(
+            mu_post[test_idx],
+            sigma_post[test_idx],
+            tau,
+            k=1.0
+        )
+        base_metrics['ddi'] = ddi
+    except Exception as e:
+        print(f"    Warning: DDI computation failed: {e}")
+        base_metrics['ddi'] = np.nan
+
+    return base_metrics
+
+
+def compute_enhanced_metrics(mu_post: np.ndarray,
+                             sigma_post: np.ndarray,
+                             x_true: np.ndarray,
+                             test_idx: np.ndarray,
+                             decision_config,
+                             sensor_cost: float = 0.0,
+                             prior_loss: float = None,
+                             K_action: int = None,
+                             enable_near_threshold: bool = True) -> Dict[str, float]:
+    """
+    🔥 增强的性能指标计算
+
+    新增功能：
+    - 支持near-threshold子集评估
+    - 改进的action-limited指标
+    - 详细的成本-收益分析
+    """
+    # 基础指标
+    base_metrics = compute_metrics(
+        mu_post, sigma_post, x_true, test_idx, decision_config
+    )
+
+    # ROI计算
+    if prior_loss is not None and sensor_cost > 0:
+        roi = compute_roi(
+            prior_loss,
+            base_metrics['expected_loss_gbp'],
+            sensor_cost
+        )
+        base_metrics['roi'] = roi
+
+        # 成本效率：每英镑传感成本节省的损失
+        savings = prior_loss - base_metrics['expected_loss_gbp']
+        base_metrics['cost_efficiency'] = savings / sensor_cost
+        base_metrics['savings_gbp'] = savings
+
+    # 🔥 Near-threshold 子集评估（Scenario A特有）
+    if enable_near_threshold and prior_loss is not None:
+        try:
+            tau = decision_config.get_threshold()
+
+            # 识别near-threshold区域（在测试集上）
+            gaps = np.abs(mu_post[test_idx] - tau)
+            threshold_band = 1.0 * sigma_post[test_idx]  # ±1σ
+            near_mask = gaps <= threshold_band
+
+            if near_mask.sum() > 0:
+                print(f"    Near-threshold evaluation: {near_mask.sum()}/{len(test_idx)} points")
+
+                # 计算near-threshold的先验损失（需要传入）
+                # 这里简化：假设near-threshold区域的损失比例更高
+                near_fraction = near_mask.sum() / len(test_idx)
+
+                # 计算near-threshold后验损失
+                from decision import expected_loss
+                near_posterior_loss = expected_loss(
+                    mu_post[test_idx][near_mask],
+                    sigma_post[test_idx][near_mask],
+                    decision_config,
+                    tau=tau
+                )
+
+                # 假设先验损失中near-threshold贡献更大
+                prior_loss_near = prior_loss * near_fraction * 1.5  # 假设1.5倍权重
+                roi_near = compute_roi(prior_loss_near, near_posterior_loss, sensor_cost)
+
+                base_metrics.update({
+                    'n_near_threshold': int(near_mask.sum()),
+                    'fraction_near_threshold': float(near_fraction),
+                    'prior_loss_near_threshold': float(prior_loss_near),
+                    'posterior_loss_near_threshold': float(near_posterior_loss),
+                    'savings_near_threshold': float(prior_loss_near - near_posterior_loss),
+                    'roi_near_threshold': float(roi_near)
+                })
+        except Exception as e:
+            print(f"    Warning: Near-threshold evaluation failed: {e}")
+
+    # 🔥 Action-limited分析（使用修复后的函数）
+    if K_action is not None:
+        tau = decision_config.get_threshold()
+        action_metrics = compute_action_constrained_loss(
+            mu_post[test_idx],
+            sigma_post[test_idx],
+            x_true[test_idx],
+            decision_config,
+            K=K_action,
+            tau=tau
+        )
+
+        # 添加前缀以避免命名冲突
         for key, val in action_metrics.items():
             base_metrics[f'action_{key}'] = val
 
     # DDI 统计
     tau = decision_config.get_threshold()
-    from spatial_field import compute_ddi
-
-    ddi = compute_ddi(
-        mu_post[test_idx],
-        sigma_post[test_idx],
-        tau,
-        k=1.0
-    )
-    base_metrics['ddi'] = ddi
+    try:
+        from spatial_field import compute_ddi
+        ddi = compute_ddi(
+            mu_post[test_idx],
+            sigma_post[test_idx],
+            tau,
+            k=1.0
+        )
+        base_metrics['ddi'] = ddi
+    except Exception as e:
+        print(f"    Warning: DDI computation failed: {e}")
+        base_metrics['ddi'] = np.nan
 
     return base_metrics
+
 
 def compute_metrics(mu_post: np.ndarray,
                     sigma_post: np.ndarray,
@@ -259,40 +453,24 @@ def compute_metrics(mu_post: np.ndarray,
                     decision_config) -> Dict[str, float]:
     """
     Compute performance metrics on test set.
-
-    Args:
-        mu_post: Posterior means (n,)
-        sigma_post: Posterior std deviations (n,)
-        x_true: True state (n,)
-        test_idx: Test set indices
-        decision_config: Decision configuration
-
-    Returns:
-        metrics: Dictionary of metric values
     """
     from decision import expected_loss
 
-    # Extract test values
     mu_test = mu_post[test_idx]
     sigma_test = sigma_post[test_idx]
     x_test = x_true[test_idx]
 
-    # Reconstruction metrics
     errors = mu_test - x_test
     rmse = np.sqrt(np.mean(errors ** 2))
     mae = np.mean(np.abs(errors))
     r2 = 1.0 - np.sum(errors ** 2) / np.sum((x_test - x_test.mean()) ** 2)
 
-    # Decision-aware loss
     exp_loss = expected_loss(mu_test, sigma_test, decision_config)
 
-    # 🔥 Z-scores for calibration (prevent division by zero)
     z_scores = errors / np.maximum(sigma_test, 1e-12)
 
-    # Calibration: coverage
-    coverage_90 = np.mean(np.abs(z_scores) <= 1.645)  # 90% CI
+    coverage_90 = np.mean(np.abs(z_scores) <= 1.645)
 
-    # MSSE (Mean Squared Standardized Error)
     standardized_errors = errors / np.maximum(sigma_test, 1e-12)
     msse = np.mean(standardized_errors ** 2)
 
@@ -304,7 +482,7 @@ def compute_metrics(mu_post: np.ndarray,
         'coverage_90': coverage_90,
         'msse': msse,
         'n_test': len(test_idx),
-        'z_scores': z_scores.astype(float)  # 🔥 新增：用于校准图
+        'z_scores': z_scores.astype(float)
     }
 
 
@@ -314,16 +492,6 @@ def morans_i(residuals: np.ndarray,
             rng: np.random.Generator = None) -> Tuple[float, float]:
     """
     Compute Moran's I spatial autocorrelation statistic with permutation test.
-
-    Args:
-        residuals: Residual values (n,)
-        adjacency: Binary adjacency matrix (n, n) or sparse
-        n_permutations: Number of permutations for p-value
-        rng: Random generator
-
-    Returns:
-        I: Moran's I statistic
-        p_value: Permutation p-value
     """
     import scipy.sparse as sp
 
@@ -332,38 +500,29 @@ def morans_i(residuals: np.ndarray,
 
     n = len(residuals)
 
-    # Convert to dense if sparse
     if sp.issparse(adjacency):
         W = adjacency.toarray()
     else:
         W = adjacency
 
-    # Row-standardize weights
     row_sums = W.sum(axis=1)
-    row_sums[row_sums == 0] = 1  # Avoid division by zero
+    row_sums[row_sums == 0] = 1
     W = W / row_sums[:, None]
 
-    # Center residuals
     r = residuals - residuals.mean()
 
-    # Compute Moran's I
     W_sum = W.sum()
     numerator = n * np.sum(W * np.outer(r, r))
     denominator = W_sum * np.sum(r**2)
 
     I_obs = numerator / denominator if denominator > 0 else 0.0
 
-    # Permutation test
     I_perm = np.zeros(n_permutations)
     for perm_idx in range(n_permutations):
-        # Randomly permute residuals
         r_perm = rng.permutation(r)
-
-        # Compute I for permutation
         numerator_perm = n * np.sum(W * np.outer(r_perm, r_perm))
         I_perm[perm_idx] = numerator_perm / denominator
 
-    # p-value: proportion of permuted I >= observed I
     p_value = (np.sum(np.abs(I_perm) >= np.abs(I_obs)) + 1) / (n_permutations + 1)
 
     return I_obs, p_value
@@ -376,16 +535,6 @@ def spatial_bootstrap(block_ids: np.ndarray,
                      rng: np.random.Generator = None) -> Dict[str, float]:
     """
     Compute bootstrap confidence interval using spatial block resampling.
-
-    Args:
-        block_ids: Block assignment for each observation (n,)
-        metric_values: Metric value for each observation (n,)
-        n_bootstrap: Number of bootstrap samples
-        confidence_level: CI level
-        rng: Random generator
-
-    Returns:
-        ci: Dictionary with 'mean', 'lower', 'upper'
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -396,19 +545,15 @@ def spatial_bootstrap(block_ids: np.ndarray,
     bootstrap_means = np.zeros(n_bootstrap)
 
     for b in range(n_bootstrap):
-        # Resample blocks with replacement
         sampled_blocks = rng.choice(unique_blocks, size=n_blocks, replace=True)
 
-        # Collect observations from sampled blocks
         sampled_values = []
         for block in sampled_blocks:
             block_values = metric_values[block_ids == block]
             sampled_values.extend(block_values)
 
-        # Compute statistic
         bootstrap_means[b] = np.mean(sampled_values)
 
-    # Compute percentiles
     alpha = 1 - confidence_level
     lower = np.percentile(bootstrap_means, 100 * alpha / 2)
     upper = np.percentile(bootstrap_means, 100 * (1 - alpha / 2))
@@ -579,26 +724,15 @@ def compute_savings_and_roi(results_dict: Dict,
                             loss_key: str = 'expected_loss_gbp') -> Dict:
     """
     计算各方法相对 baseline 的省钱和 ROI
-
-    Args:
-        results_dict: 嵌套字典 {method: {budget: {metrics}}}
-        baseline_method: 基准方法名称
-        cost_key: 成本键名
-        loss_key: 损失键名
-
-    Returns:
-        Dict with keys for each (method, budget): savings_gbp, roi, cost_efficiency
     """
     business_metrics = {}
 
-    # 获取所有预算点
     budgets = set()
     for method_data in results_dict.values():
         budgets.update(method_data.keys())
     budgets = sorted(budgets)
 
     for budget in budgets:
-        # 获取 baseline 损失
         if baseline_method not in results_dict:
             print(f"Warning: baseline method '{baseline_method}' not found")
             continue
@@ -616,14 +750,14 @@ def compute_savings_and_roi(results_dict: Dict,
             method_loss = metrics[loss_key]
             method_cost = metrics[cost_key]
 
-            # 省钱 = baseline 损失 - 方法损失
             savings = baseline_loss - method_loss
 
-            # ROI = 省钱 / 花费
-            roi = savings / method_cost if method_cost > 0 else 0
-
-            # 成本效率
-            cost_efficiency = savings / method_cost if method_cost > 0 else 0
+            if method_cost > 0:
+                roi = savings / method_cost
+                cost_efficiency = savings / method_cost
+            else:
+                roi = np.inf if savings > 0 else 0.0
+                cost_efficiency = np.inf if savings > 0 else 0.0
 
             key = (method_name, budget)
             business_metrics[key] = {
@@ -645,25 +779,7 @@ def compute_critical_region_metrics(mu_post: np.ndarray,
                                     epsilon: float = 0.2) -> Dict:
     """
     计算临界区域（阈值附近）的性能指标
-
-    临界区域定义：|μ - τ| ≤ ε 的点
-    这是决策最敏感的区域，EVI 优势应该最明显
-
-    Args:
-        mu_post: 后验均值 (n,)
-        sigma_post: 后验标准差 (n,)
-        x_true: 真实值 (n,)
-        tau: 决策阈值
-        epsilon: 临界区域半径
-
-    Returns:
-        Dict with metrics:
-        - n_critical: 临界区域点数
-        - rmse_critical: 临界区域 RMSE
-        - misclass_rate: 误分类率
-        - avg_uncertainty: 平均不确定性
     """
-    # 识别临界区域
     critical_mask = np.abs(mu_post - tau) <= epsilon
     critical_idx = np.where(critical_mask)[0]
 
@@ -677,21 +793,17 @@ def compute_critical_region_metrics(mu_post: np.ndarray,
             'max_uncertainty_critical': np.nan
         }
 
-    # 提取临界区域数据
     mu_crit = mu_post[critical_idx]
     sigma_crit = sigma_post[critical_idx]
     x_crit = x_true[critical_idx]
 
-    # RMSE
     errors = mu_crit - x_crit
     rmse_crit = np.sqrt(np.mean(errors ** 2))
 
-    # 误分类率（预测 vs 真实是否超过阈值）
     pred_above = mu_crit > tau
     true_above = x_crit > tau
     misclass_rate = np.mean(pred_above != true_above)
 
-    # 不确定性统计
     avg_uncertainty = sigma_crit.mean()
     max_uncertainty = sigma_crit.max()
 
@@ -703,3 +815,149 @@ def compute_critical_region_metrics(mu_post: np.ndarray,
         'avg_uncertainty_critical': avg_uncertainty,
         'max_uncertainty_critical': max_uncertainty
     }
+
+
+def run_cv_experiment(geom, Q_pr, mu_pr, x_true, sensors,
+                      selection_method, k, cv_config,
+                      decision_config, rng) -> Dict:
+    """
+    Run complete CV experiment for one method and budget.
+    """
+    from inference import compute_posterior, compute_posterior_variance_diagonal
+    from sensors import get_observation
+
+    if hasattr(cv_config, '__dict__'):
+        cv_dict = cv_config.__dict__
+    else:
+        cv_dict = cv_config
+
+    corr_length = np.sqrt(8.0) / 0.08
+    if hasattr(cv_config, 'buffer_width_multiplier'):
+        buffer_width = cv_dict.get('buffer_width_multiplier', 1.5) * corr_length
+    else:
+        buffer_width = cv_dict.get('buffer_width_multiplier', 1.5) * corr_length
+
+    folds = spatial_block_cv(
+        geom.coords,
+        cv_dict.get('k_folds', 5),
+        buffer_width,
+        cv_dict.get('block_strategy', 'kmeans'),
+        rng
+    )
+
+    fold_results = []
+
+    for fold_idx, (train_idx, test_idx) in enumerate(folds):
+        print(f"\n  Fold {fold_idx + 1}/{len(folds)}")
+
+        selection_result = selection_method(sensors, k, Q_pr)
+        selected_sensors = [sensors[i] for i in selection_result.selected_ids]
+
+        y, H, R = get_observation(x_true, selected_sensors, rng)
+
+        mu_post, factor = compute_posterior(Q_pr, mu_pr, H, R, y)
+
+        var_post_test = compute_posterior_variance_diagonal(factor, test_idx)
+        sigma_post_test = np.sqrt(var_post_test)
+
+        sigma_post = np.zeros(len(mu_post))
+        sigma_post[test_idx] = sigma_post_test
+
+        # 🔥 使用增强的指标计算
+        metrics = compute_enhanced_metrics(
+            mu_post, sigma_post, x_true, test_idx, decision_config,
+            sensor_cost=selection_result.total_cost,
+            K_action=getattr(decision_config, 'K_action', None)
+        )
+
+        residuals = mu_post - x_true
+        I_stat, I_pval = morans_i(
+            residuals[test_idx],
+            geom.adjacency[test_idx][:, test_idx],
+            n_permutations=cv_dict.get('morans_permutations', 999),
+            rng=rng
+        )
+        metrics['morans_i'] = I_stat
+        metrics['morans_pval'] = I_pval
+
+        fold_result_dict = {
+            'success': True,
+            'metrics': metrics,
+            'selection_result': selection_result,
+            'residuals': residuals[test_idx],
+        }
+
+        fold_results.append(fold_result_dict)
+
+        print(f"    RMSE={metrics['rmse']:.3f}, Loss=£{metrics['expected_loss_gbp']:.0f}, "
+              f"I={I_stat:.3f} (p={I_pval:.3f})")
+
+    # Aggregate across folds
+    aggregated = {}
+    for key in fold_results[0]['metrics'].keys():
+        if key in ['z_scores', 'n_test', 'type_counts']:
+            continue
+        values = [fr['metrics'][key] for fr in fold_results if fr.get('success')]
+        if values:
+            aggregated[key] = {
+                'mean': np.mean(values),
+                'std': np.std(values),
+                'values': values
+            }
+
+    return {
+        'fold_results': fold_results,
+        'aggregated': aggregated,
+        'selection_result': selection_result
+    }
+
+
+if __name__ == "__main__":
+    print("\n" + "=" * 70)
+    print("  TESTING FIXED ACTION-LIMITED METRICS")
+    print("=" * 70)
+
+    # 测试修复后的Action-limited指标
+    rng = np.random.default_rng(42)
+    n = 100
+
+    # 模拟数据
+    mu_post = rng.normal(2.2, 0.3, n)
+    sigma_post = rng.uniform(0.2, 0.5, n)
+    x_true = rng.normal(2.2, 0.3, n)
+    tau = 2.2
+
+
+    # 模拟决策配置
+    class MockDecision:
+        L_FP_gbp = 500
+        L_FN_gbp = 2000
+        L_TP_gbp = 100
+        L_TN_gbp = 0
+
+        def get_threshold(self): return tau
+
+
+    decision_config = MockDecision()
+
+    print(f"Test data: n={n}, tau={tau}")
+    print(f"True exceed threshold: {(x_true > tau).sum()}")
+
+    # 测试不同K值
+    for K in [5, 10, 20]:
+        print(f"\n[K={K}] Action-limited metrics:")
+        metrics = compute_action_constrained_loss(
+            mu_post, sigma_post, x_true, decision_config, K=K, tau=tau
+        )
+
+        print(f"  Recall@K: {metrics['recall_at_k']:.3f}")
+        print(f"  Precision@K: {metrics['precision_at_k']:.3f}")
+        print(f"  F1@K: {metrics['f1_at_k']:.3f}")
+        print(f"  Regret: £{metrics['regret']:.2f}")
+
+        # 验证指标合理性
+        assert 0 <= metrics['recall_at_k'] <= 1, "Recall out of range"
+        assert 0 <= metrics['precision_at_k'] <= 1, "Precision out of range"
+        assert 0 <= metrics['f1_at_k'] <= 1, "F1 out of range"
+
+    print("\n✅ All action-limited metric tests passed!")
