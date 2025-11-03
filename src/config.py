@@ -8,6 +8,7 @@ Configuration management for RDT-VoI simulation (Enhanced version)
 3. 保持向后兼容（load_scenario_config 等函数名不变）
 4. 新增 apply_parameter_overrides() 功能
 """
+import warnings
 
 import yaml
 from pathlib import Path
@@ -101,41 +102,74 @@ class SensorsConfig:
 
 @dataclass
 class DecisionConfig:
-    """Decision model parameters."""
-    L_TP_gbp: float
-    L_FP_gbp: float
-    L_FN_gbp: float
-    L_TN_gbp: float
-    tau_iri: float = None
-    tau_quantile: float = None
-    K_action: int = None
-    target_ddi: float = 0.0
-
-    def __post_init__(self):
-        if self.tau_iri is None and self.tau_quantile is None:
-            raise ValueError("Must specify either tau_iri or tau_quantile")
-        if self.tau_iri is not None and self.tau_quantile is not None:
-            print(f"  Warning: Both tau_iri and tau_quantile specified. "
-                  f"Using tau_quantile={self.tau_quantile}")
-        if self.tau_quantile is not None:
-            if not (0 < self.tau_quantile < 1):
-                raise ValueError(f"tau_quantile must be in (0, 1), got {self.tau_quantile}")
-
-    def get_threshold(self, mu_prior=None):
-        """获取决策阈值"""
-        if self.tau_quantile is not None:
-            if mu_prior is None:
-                raise ValueError("tau_quantile mode requires mu_prior")
-            tau = float(np.quantile(mu_prior, self.tau_quantile))
-            print(f"  Dynamic threshold: τ = quantile(μ_prior, {self.tau_quantile}) = {tau:.3f}")
-            return tau
-        else:
-            return self.tau_iri
+    """Decision-theoretic parameters."""
+    L_FP_gbp: float  # False positive cost
+    L_FN_gbp: float  # False negative cost
+    L_TP_gbp: float  # True positive cost
+    L_TN_gbp: float = 0.0  # True negative cost
+    tau_quantile: float = 0.75  # Quantile for threshold
+    tau_iri: Optional[float] = None  # 🔥 锁定的决策阈值
+    target_ddi: Optional[float] = None  # 🔥 目标DDI
+    K_action: Optional[int] = None  # 🔥 行动限制
 
     @property
     def prob_threshold(self) -> float:
-        """Bayes-optimal probability threshold."""
-        return self.L_FP_gbp / (self.L_FP_gbp + self.L_FN_gbp - self.L_TP_gbp)
+        """Compute Bayes-optimal probability threshold."""
+        numerator = self.L_FP_gbp - self.L_TN_gbp
+        denominator = (self.L_FP_gbp - self.L_TN_gbp) + (self.L_FN_gbp - self.L_TP_gbp)
+
+        if abs(denominator) < 1e-10:
+            import warnings
+            warnings.warn("Near-singular decision cost matrix, using p_T=0.5")
+            return 0.5
+
+        p_T = numerator / denominator
+        return np.clip(p_T, 0.0, 1.0)
+
+    def get_threshold(self, mu: np.ndarray) -> float:
+        """从成本映射计算阈值"""
+        p_T = self.prob_threshold
+        tau = float(np.quantile(mu, p_T))
+        return tau
+
+
+@dataclass
+class EconomicsConfig:
+    """
+    🔥 P1-4：经济尺度配置
+
+    用于将评估域（测试集）的损失缩放到业务域（全网络）的等价时间跨度
+
+    Attributes:
+        network_km: 业务网络总长度（公里）
+        test_km: 单次CV fold测试域覆盖长度（公里）
+        horizon_years: 决策评估期（年）
+        eval_period_days: 单次评估对应的时间周期（天）
+
+    示例：
+        如果网络200km，测试覆盖35km，评估期10年，单次评估7天：
+        scale_factor = (200/35) * (10*365/7) ≈ 2940
+    """
+    network_km: float = 200.0  # 全网络长度
+    test_km: float = 35.0  # 测试域长度
+    horizon_years: float = 10.0  # 评估期（年）
+    eval_period_days: float = 7.0  # 单次评估周期（天）
+
+    @property
+    def spatial_scale(self) -> float:
+        """空间缩放因子"""
+        return self.network_km / self.test_km
+
+    @property
+    def temporal_scale(self) -> float:
+        """时间缩放因子"""
+        horizon_days = self.horizon_years * 365
+        return horizon_days / self.eval_period_days
+
+    @property
+    def domain_scale_factor(self) -> float:
+        """综合缩放因子"""
+        return self.spatial_scale * self.temporal_scale
 
 
 @dataclass
@@ -312,9 +346,315 @@ class Config:
             self.metrics = MetricsConfig()
 
         # 🔥 新增：参数扫描预设
+        # 🔥 新增：参数扫描预设
         self.parameter_scan_presets = self._raw.get('parameter_scan_presets', {})
 
-        self.validate()
+        # 🔥 【必须添加】economics 解析
+        if 'economics' in self._raw:
+            self.economics = EconomicsConfig(**self._raw['economics'])
+        else:
+            self.economics = None
+        # 🔥 【添加结束】
+
+        self.validate()  # ← 这行必须在最后
+
+    def get_rng(self) -> np.random.Generator:
+        """Get seeded random number generator."""
+        return np.random.default_rng(self.experiment.seed)
+
+        # 🔥 新增方法1: 锁定决策阈值
+
+    def lock_decision_threshold(self, mu_prior: np.ndarray = None, verbose: bool = True):
+        """
+        🔥 P0-3：锁定决策阈值（全局统一）
+
+        必须在任何评估/选择算法运行前调用一次。
+        之后所有函数使用统一的tau_iri，避免动态计算导致的不一致。
+
+        Args:
+            mu_prior: 先验均值（可选，用于从分位数计算tau）
+            verbose: 是否打印锁定信息
+
+        使用方法：
+            在main.py中，构建先验后立即调用：
+
+            ```python
+            Q_pr, mu_pr = build_prior(geom, config.prior)
+            config.lock_decision_threshold(mu_pr)  # 🔥 关键步骤
+            ```
+
+        注意：
+            - 如果tau_iri已设置，不会重复计算
+            - 如果使用tau_quantile，会自动计算并缓存tau_iri
+            - 锁定后，tau_quantile将被禁用（避免不一致）
+        """
+        # 如果已锁定，跳过
+        if hasattr(self.decision, 'tau_iri') and self.decision.tau_iri is not None:
+            if verbose:
+                print(f"  ℹ️  Decision threshold already locked: τ = {self.decision.tau_iri:.3f}")
+            return
+
+        # 从分位数计算阈值
+        if hasattr(self.decision, 'tau_quantile') and self.decision.tau_quantile is not None:
+            if mu_prior is None:
+                raise ValueError(
+                    "mu_prior is required when tau_quantile is set. "
+                    "Call lock_decision_threshold(mu_pr) after building prior."
+                )
+
+            tau = float(np.quantile(mu_prior, self.decision.tau_quantile))
+            self.decision.tau_iri = tau
+
+            if verbose:
+                print(f"  🔒 Decision threshold locked from quantile {self.decision.tau_quantile:.2f}")
+                print(f"     τ_IRI = {tau:.3f}")
+
+            # 🔥 关键：禁用tau_quantile，避免后续函数误用
+            self.decision.tau_quantile = None
+
+        else:
+            raise ValueError(
+                "Cannot lock threshold: neither tau_iri nor tau_quantile is set in config. "
+                "Set one of them in baseline_config.yaml."
+            )
+
+    def get_domain_scale_factor(self, verbose: bool = False) -> float:
+        """
+        🔥 P1-4：获取域缩放因子
+
+        将评估域（测试集）的损失缩放到业务域（全网络）的等价时间跨度
+
+        Returns:
+            domain_scale_factor: 缩放因子（≥1）
+
+        使用方法：
+            在evaluation.py中计算指标时使用：
+
+            ```python
+            scale_factor = config.get_domain_scale_factor()
+            metrics = compute_enhanced_metrics(
+                ...,
+                domain_scale_factor=scale_factor
+            )
+            ```
+        """
+        if not hasattr(self, 'economics'):
+            if verbose:
+                warnings.warn(
+                    "No 'economics' section in config. "
+                    "Using default scale_factor=1.0 (no scaling). "
+                    "Add economics section to baseline_config.yaml to enable scaling."
+                )
+            return 1.0
+
+        # 使用EconomicsConfig的属性
+        scale_factor = self.economics.domain_scale_factor
+
+        if verbose:
+            print(f"  📊 Domain scaling:")
+            print(f"     Spatial: {self.economics.spatial_scale:.1f}x "
+                  f"({self.economics.network_km}km / {self.economics.test_km}km)")
+            print(f"     Temporal: {self.economics.temporal_scale:.1f}x "
+                  f"({self.economics.horizon_years}y / {self.economics.eval_period_days}d)")
+            print(f"     Combined: {scale_factor:.0f}x")
+
+        # 健康检查
+        if scale_factor < 1.0:
+            warnings.warn(f"Computed scale_factor={scale_factor:.2f} < 1, clamping to 1.0")
+            scale_factor = 1.0
+
+        return scale_factor
+
+    def validate_economics_config(self) -> bool:
+        """
+        验证economics配置的合理性
+
+        Returns:
+            True if valid, False otherwise
+        """
+        if not hasattr(self, 'economics'):
+            return False
+
+        econ = self.economics
+
+        # 检查必需字段
+        required_fields = ['network_km', 'test_km', 'horizon_years', 'eval_period_days']
+        for field in required_fields:
+            if not hasattr(econ, field):
+                warnings.warn(f"Economics config missing field: {field}")
+                return False
+
+        # 合理性检查
+        if econ.network_km <= econ.test_km:
+            warnings.warn(
+                f"network_km ({econ.network_km}) should be > test_km ({econ.test_km})"
+            )
+            return False
+
+        if econ.horizon_years <= 0 or econ.eval_period_days <= 0:
+            warnings.warn("horizon_years and eval_period_days must be positive")
+            return False
+
+        if econ.eval_period_days > econ.horizon_years * 365:
+            warnings.warn("eval_period_days should not exceed horizon in days")
+            return False
+
+        return True
+
+    def print_config_summary(self, include_economics: bool = True):
+        """
+        🔥 增强的配置摘要打印
+
+        Args:
+            include_economics: 是否包含经济尺度信息
+        """
+        print("\n" + "=" * 70)
+        print("  CONFIGURATION SUMMARY")
+        print("=" * 70)
+
+        print(f"\n[Experiment]")
+        print(f"  Name: {self.experiment.name}")
+        print(f"  Seed: {self.experiment.seed}")
+
+        print(f"\n[Geometry]")
+        print(f"  Mode: {self.geometry.mode}")
+        if self.geometry.mode == "grid2d":
+            print(f"  Grid: {self.geometry.nx}×{self.geometry.ny} = {self.geometry.n_total} cells")
+            print(f"  Spacing: {self.geometry.h}m")
+
+        print(f"\n[Prior]")
+        print(f"  Correlation length: {self.prior.correlation_length:.1f}m")
+        print(f"  Target variance: σ² = {self.prior.sigma2:.3f}")
+        print(f"  Spatial smoothing: α = {self.prior.alpha:.2e}")
+        print(f"  Nugget: β_base = {self.prior.beta_base:.2e}, β_hot = {self.prior.beta_hot:.2e}")
+        if self.prior.hotspots:
+            print(f"  Hotspots: {len(self.prior.hotspots)} regions")
+
+        print(f"\n[Sensors]")
+        print(f"  Types: {len(self.sensors.types)}")
+        print(f"  Pool strategy: {self.sensors.pool_strategy}")
+        print(f"  Pool fraction: {self.sensors.pool_fraction:.1%}")
+
+        print(f"\n[Decision]")
+        print(f"  L_FP: £{self.decision.L_FP_gbp:,.0f}")
+        print(f"  L_FN: £{self.decision.L_FN_gbp:,.0f}")
+        print(f"  L_TP: £{self.decision.L_TP_gbp:,.0f}")
+        print(f"  FN/FP ratio: {self.decision.L_FN_gbp / self.decision.L_FP_gbp:.1f}:1")
+        print(f"  Prob threshold: p_T = {self.decision.prob_threshold:.3f}")
+
+        if hasattr(self.decision, 'tau_iri') and self.decision.tau_iri is not None:
+            print(f"  🔒 Threshold locked: τ = {self.decision.tau_iri:.3f}")
+
+        if hasattr(self.decision, 'target_ddi') and self.decision.target_ddi is not None:
+            print(f"  Target DDI: {self.decision.target_ddi:.1%}")
+
+        if hasattr(self.decision, 'K_action') and self.decision.K_action is not None:
+            print(f"  Action limit: K = {self.decision.K_action}")
+
+        # 🔥 Economics信息
+        if include_economics and hasattr(self, 'economics'):
+            print(f"\n[Economics]")
+            scale_factor = self.get_domain_scale_factor(verbose=False)
+            print(f"  Network span: {self.economics.network_km}km")
+            print(f"  Test span: {self.economics.test_km}km")
+            print(f"  Evaluation horizon: {self.economics.horizon_years}y")
+            print(f"  Eval period: {self.economics.eval_period_days}d")
+            print(f"  → Domain scale factor: {scale_factor:.0f}x")
+
+        print(f"\n[Selection]")
+        print(f"  Methods: {', '.join(self.selection.methods)}")
+        print(f"  Budgets: {self.selection.budgets}")
+
+        print(f"\n[Cross-Validation]")
+        print(f"  Scheme: {self.cv.scheme}")
+        print(f"  Folds: {self.cv.k_folds}")
+
+        print("=" * 70 + "\n")
+
+    # ============================================================================
+    # 🔥 Config类构造函数的增强（添加economics解析）
+    # ============================================================================
+
+    def _parse_config_with_economics(self, cfg_dict: dict):
+        """
+        🔥 增强的配置解析，添加economics支持
+
+        在Config.__init__()中调用此函数来解析economics部分
+
+        使用方法：
+            在Config.__init__()的最后添加：
+
+            ```python
+            # 解析economics（如果存在）
+            if 'economics' in cfg_dict:
+                self.economics = EconomicsConfig(**cfg_dict['economics'])
+            else:
+                self.economics = None  # 可选
+            ```
+        """
+        if 'economics' in cfg_dict:
+            econ_dict = cfg_dict['economics']
+            self.economics = EconomicsConfig(**econ_dict)
+        else:
+            # 使用默认值（可选，或设为None）
+            self.economics = None
+
+
+    def verify_threshold_locked(self) -> bool:
+        """
+        验证阈值是否已锁定
+
+        Returns:
+            True if threshold is locked, False otherwise
+        """
+        if not hasattr(self, 'decision'):
+            return False
+
+        return (hasattr(self.decision, 'tau_iri') and
+                self.decision.tau_iri is not None and
+                np.isfinite(self.decision.tau_iri))
+
+        # 🔥 新增方法3: 获取已锁定的阈值
+
+    def get_locked_threshold(self) -> float:
+        """
+        获取已锁定的阈值
+
+        Returns:
+            tau: 锁定的阈值
+
+        Raises:
+            RuntimeError: 如果阈值未锁定
+        """
+        if not self.verify_threshold_locked():
+            raise RuntimeError(
+                "Threshold not locked! Call lock_decision_threshold() first."
+            )
+        return self.decision.tau_iri
+
+    def _parse_config_with_economics(self, cfg_dict: dict):
+        """
+        🔥 增强的配置解析，添加economics支持
+
+        在Config.__init__()中调用此函数来解析economics部分
+
+        使用方法：
+            在Config.__init__()的最后添加：
+
+            ```python
+            # 解析economics（如果存在）
+            if 'economics' in cfg_dict:
+                self.economics = EconomicsConfig(**cfg_dict['economics'])
+            else:
+                self.economics = None  # 可选
+            ```
+        """
+        if 'economics' in cfg_dict:
+            econ_dict = cfg_dict['economics']
+            self.economics = EconomicsConfig(**econ_dict)
+        else:
+            # 使用默认值（可选，或设为None）
+            self.economics = None
 
     def _find_config(self, config_name: str) -> Path:
         """搜索配置文件"""
@@ -651,50 +991,54 @@ def detect_scenario_from_config(cfg) -> str:
 # 测试和示例用法
 # ============================================================================
 
+
 if __name__ == "__main__":
-    print("🔧 Testing enhanced configuration system...")
+    print("\n" + "=" * 70)
+    print("  TESTING CONFIG ENHANCEMENTS")
+    print("=" * 70)
 
-    # 测试基准配置加载
-    print("\n[1] Loading baseline config...")
-    cfg = load_config()
-    print(f"  Loaded: {cfg.experiment.name}")
-    print(f"  DDI: {cfg.decision.target_ddi}")
-    print(f"  L_FN/L_FP ratio: {cfg.decision.L_FN_gbp / cfg.decision.L_FP_gbp:.1f}")
+    # Test 1: EconomicsConfig
+    print("\n[Test 1] Economics configuration")
+    econ = EconomicsConfig(
+        network_km=200,
+        test_km=35,
+        horizon_years=10,
+        eval_period_days=7
+    )
 
-    # 测试参数覆盖
-    print("\n[2] Testing parameter overrides...")
-    overrides = {
-        'target_ddi': 0.35,
-        'L_FN_gbp': 150000,
-        'grid_size': 25
-    }
-    cfg_modified = cfg.apply_parameter_overrides(overrides)
-    print(f"  Modified DDI: {cfg_modified.decision.target_ddi}")
-    print(f"  Modified L_FN: {cfg_modified.decision.L_FN_gbp}")
-    print(f"  Modified grid: {cfg_modified.geometry.nx}x{cfg_modified.geometry.ny}")
+    print(f"  Spatial scale: {econ.spatial_scale:.1f}x")
+    print(f"  Temporal scale: {econ.temporal_scale:.1f}x")
+    print(f"  Domain scale factor: {econ.domain_scale_factor:.0f}x")
 
-    # 测试预设应用
-    print("\n[3] Testing preset application...")
-    cfg_high_stakes = cfg.apply_preset('high_stakes')
-    print(f"  High-stakes DDI: {cfg_high_stakes.decision.target_ddi}")
-    print(f"  High-stakes L_FN: {cfg_high_stakes.decision.L_FN_gbp}")
+    # Test 2: 使用真实的 Config 对象（而不是 Mock）
+    print("\n[Test 2] Threshold locking with real Config")
+    try:
+        # 加载真实配置
+        cfg = load_config("baseline_config.yaml")
 
-    # 测试参数扫描组合生成
-    print("\n[4] Testing parameter scan combinations...")
-    scan_params = {
-        'target_ddi': [0.1, 0.2, 0.3],
-        'L_FN_gbp': [30000, 60000]
-    }
-    combinations = generate_parameter_combinations(scan_params)
-    print(f"  Generated {len(combinations)} combinations:")
-    for i, combo in enumerate(combinations):
-        print(f"    {i+1}: {combo}")
+        # 模拟先验
+        mu_pr = np.random.normal(2.2, 0.3, 100)
 
-    # 测试向后兼容
-    print("\n[5] Testing backward compatibility...")
-    cfg_scenario_a = load_scenario_config('A')
-    cfg_scenario_b = load_scenario_config('B')
-    print(f"  Scenario A DDI: {cfg_scenario_a.decision.target_ddi}")
-    print(f"  Scenario B DDI: {cfg_scenario_b.decision.target_ddi}")
+        # 锁定阈值
+        cfg.lock_decision_threshold(mu_pr, verbose=True)
 
-    print("\n✅ All tests passed!")
+        # 验证
+        assert cfg.decision.tau_iri is not None, "tau_iri should be set"
+        print(f"  ✓ Threshold locked: τ = {cfg.decision.tau_iri:.3f}")
+
+        # Test 3: Domain scale factor
+        print("\n[Test 3] Domain scale factor")
+        scale = cfg.get_domain_scale_factor(verbose=True)
+        assert scale > 1, "Scale factor should be > 1"
+        print(f"  ✓ Scale factor: {scale:.0f}")
+
+        # Test 4: Economics validation
+        print("\n[Test 4] Economics validation")
+        is_valid = cfg.validate_economics_config()
+        print(f"  Economics config valid: {is_valid}")
+
+        print("\n✅ All config enhancement tests passed!")
+
+    except FileNotFoundError:
+        print("  ⚠️  Could not find baseline_config.yaml, skipping real config test")
+        print("  Run this test from the project root directory")

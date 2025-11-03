@@ -42,9 +42,10 @@ import multiprocessing as mp
 import time
 import itertools
 import scipy.sparse as sp
+# 🔥 添加项目根目录到Python路径
+project_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(project_root))
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent))
 
 from config import load_config, generate_parameter_combinations, parse_scan_parameter
 from geometry import build_grid2d_geometry
@@ -954,19 +955,28 @@ def run_method_evaluation(method_name: str, cfg, geom, Q_pr, mu_pr,
 
 def run_single_experiment(cfg, args, exp_index=None, total_experiments=None):
     """
-    🔥 运行单个实验配置
+    🔥 运行单个实验配置（完整修复版）
+
+    修复要点：
+    1. 先应用DDI控制（如果需要），然后锁定阈值
+    2. 基于最终的先验分布锁定阈值，而不是初始先验
+    3. 完善的异常检测和诊断
     """
-    exp_prefix = f"[{exp_index+1}/{total_experiments}] " if exp_index is not None else ""
+    exp_prefix = f"[{exp_index + 1}/{total_experiments}] " if exp_index is not None else ""
 
     if not args.quiet:
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print(f"  {exp_prefix}EXPERIMENT: {cfg.experiment.name}")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
 
     t_start = datetime.now()
 
     # 创建输出目录
-    output_dir = create_output_dir_from_config(cfg, args.config or "baseline_config.yaml", args.output)
+    output_dir = create_output_dir_from_config(
+        cfg,
+        args.config or "baseline_config.yaml",
+        args.output
+    )
     if not args.quiet:
         print(f"\n📁 Output: {output_dir}")
 
@@ -976,7 +986,10 @@ def run_single_experiment(cfg, args, exp_index=None, total_experiments=None):
 
     rng = cfg.get_rng()
 
-    # 构建域和先验
+    # ========================================================================
+    # 🔥 【核心修复】构建域和先验的正确顺序
+    # ========================================================================
+
     if not args.quiet:
         print(f"\n🌐 Building domain: {cfg.geometry.nx}×{cfg.geometry.ny}")
     geom = build_grid2d_geometry(cfg.geometry.nx, cfg.geometry.ny, cfg.geometry.h)
@@ -984,34 +997,198 @@ def run_single_experiment(cfg, args, exp_index=None, total_experiments=None):
     if not args.quiet:
         print(f"🔧 Building prior...")
 
-    # DDI控制的先验构建
-    if hasattr(cfg.decision, 'target_ddi') and cfg.decision.target_ddi > 0:
-        Q_temp, mu_temp = build_prior(geom, cfg.prior)
-        tau = cfg.decision.get_threshold(mu_temp)
-        Q_pr, mu_pr = build_prior_with_ddi(
-            geom, cfg.prior, tau=tau, target_ddi=cfg.decision.target_ddi
-        )
-    else:
-        Q_pr, mu_pr = build_prior(geom, cfg.prior)
+    # 步骤1：判断是否需要DDI控制
+    use_ddi = (hasattr(cfg.decision, 'target_ddi') and
+               cfg.decision.target_ddi is not None and
+               cfg.decision.target_ddi > 0)
 
-    # 缓存阈值
-    tau = cfg.decision.get_threshold(mu_pr)
-    cfg.decision.tau_iri = tau
+    if use_ddi:
+        # ====================================================================
+        # 🔥 情况A：需要DDI控制
+        # 顺序：构建初始先验 → DDI控制 → 锁定阈值
+        # ====================================================================
+
+        # 1. 构建初始先验
+        Q_temp, mu_temp = build_prior(geom, cfg.prior)
+
+        # 2. 计算临时阈值（用于DDI控制，不锁定）
+        if hasattr(cfg.decision, 'tau_quantile') and cfg.decision.tau_quantile is not None:
+            tau_temp = float(np.quantile(mu_temp, cfg.decision.tau_quantile))
+            if not args.quiet:
+                print(f"  📊 Initial prior for DDI control:")
+                print(f"     mean={mu_temp.mean():.3f}, std={mu_temp.std():.3f}")
+                print(f"     Using tau_quantile={cfg.decision.tau_quantile:.2f} "
+                      f"→ τ_temp={tau_temp:.3f}")
+        else:
+            # 回退到成本映射
+            p_T = cfg.decision.prob_threshold
+            tau_temp = float(np.quantile(mu_temp, p_T))
+            if not args.quiet:
+                print(f"  📊 Using cost-based threshold: p_T={p_T:.3f} "
+                      f"→ τ_temp={tau_temp:.3f}")
+
+        # 3. 应用DDI控制
+        if not args.quiet:
+            print(f"  🎯 Applying DDI control (target={cfg.decision.target_ddi:.1%})...")
+
+        try:
+            Q_pr, mu_pr = build_prior_with_ddi(
+                geom, cfg.prior, tau=tau_temp, target_ddi=cfg.decision.target_ddi
+            )
+
+            if not args.quiet:
+                print(f"  ✓ DDI control applied")
+                print(f"     Final prior: mean={mu_pr.mean():.3f}, std={mu_pr.std():.3f}")
+
+        except Exception as e:
+            if not args.quiet:
+                print(f"  ⚠️  DDI control failed: {e}")
+                print(f"  Falling back to standard prior without DDI control")
+            Q_pr, mu_pr = Q_temp, mu_temp
+            use_ddi = False  # 标记DDI控制失败
+
+        # 4. 🔥 关键：基于DDI控制后的最终先验锁定阈值
+        if not args.quiet:
+            print(f"  🔒 Locking threshold based on DDI-adjusted prior...")
+        cfg.lock_decision_threshold(mu_pr, verbose=not args.quiet)
+
+    else:
+        # ====================================================================
+        # 🔥 情况B：不需要DDI控制
+        # 顺序：构建先验 → 锁定阈值
+        # ====================================================================
+
+        Q_pr, mu_pr = build_prior(geom, cfg.prior)
+        cfg.lock_decision_threshold(mu_pr, verbose=not args.quiet)
+
+    # ========================================================================
+    # 健康检查和诊断
+    # ========================================================================
+
+    tau = cfg.decision.tau_iri
+
+    # 计算先验统计信息
+    mu_stats = {
+        'min': mu_pr.min(),
+        'max': mu_pr.max(),
+        'mean': mu_pr.mean(),
+        'median': np.median(mu_pr),
+        'std': mu_pr.std(),
+        'q10': np.quantile(mu_pr, 0.1),
+        'q50': np.quantile(mu_pr, 0.5),
+        'q90': np.quantile(mu_pr, 0.9),
+    }
+
+    # 检查1：阈值是否在合理范围
+    threshold_issues = []
+
+    if tau < 0:
+        threshold_issues.append(f"Threshold is negative (τ={tau:.3f})")
+    elif tau > 5:
+        threshold_issues.append(f"Threshold exceeds typical IRI range (τ={tau:.3f} > 5)")
+
+    # 检查2：阈值是否与先验分布匹配
+    if tau < mu_stats['q10']:
+        threshold_issues.append(f"Threshold below 10th percentile ({tau:.3f} < {mu_stats['q10']:.3f})")
+    elif tau > mu_stats['max']:
+        threshold_issues.append(f"Threshold exceeds maximum value ({tau:.3f} > {mu_stats['max']:.3f})")
+
+    # 检查3：先验分布是否合理
+    if mu_stats['mean'] < -2 or mu_stats['mean'] > 5:
+        threshold_issues.append(f"Prior mean unusual ({mu_stats['mean']:.3f})")
+
+    if mu_stats['median'] < -1 or mu_stats['median'] > 4:
+        threshold_issues.append(f"Prior median unusual ({mu_stats['median']:.3f})")
+
+    # 如果有问题，显示详细诊断
+    if threshold_issues:
+        print(f"\n  ⚠️  THRESHOLD DIAGNOSTICS")
+        print(f"  {'=' * 68}")
+        print(f"  Locked threshold: τ = {tau:.3f}")
+        print(f"\n  Issues detected:")
+        for issue in threshold_issues:
+            print(f"    • {issue}")
+
+        print(f"\n  📊 Prior distribution:")
+        print(f"    Range: [{mu_stats['min']:.3f}, {mu_stats['max']:.3f}]")
+        print(f"    Mean: {mu_stats['mean']:.3f}, Median: {mu_stats['median']:.3f}, Std: {mu_stats['std']:.3f}")
+        print(f"    Quantiles: p10={mu_stats['q10']:.3f}, p50={mu_stats['q50']:.3f}, p90={mu_stats['q90']:.3f}")
+
+        if use_ddi:
+            print(f"\n  ℹ️  DDI control was applied (target={cfg.decision.target_ddi:.1%})")
+            print(f"  Recommendations:")
+            print(f"    1. Lower target_ddi (try 0.10-0.20 instead of {cfg.decision.target_ddi:.2f})")
+            print(f"    2. Disable DDI control (set target_ddi: null)")
+            print(f"    3. Adjust tau_quantile (try 0.75-0.80 instead of current value)")
+            print(f"    4. Modify prior.mu_prior_mean to center distribution better")
+        else:
+            print(f"\n  ℹ️  No DDI control")
+            print(f"  Recommendations:")
+            print(f"    1. Check prior.mu_prior_mean in config (affects distribution center)")
+            print(f"    2. Adjust tau_quantile (try lower values like 0.75)")
+            print(f"    3. Verify prior variance settings")
+
+        print(f"  {'=' * 68}")
+
+        # 严重问题时可以选择终止
+        if tau < -5 or tau > 10:
+            print(f"\n  ❌ CRITICAL: Threshold extremely unusual, aborting experiment")
+            print(f"  Please fix configuration before proceeding")
+            sys.exit(1)
 
     if not args.quiet:
         print(f"✅ Prior setup complete (τ={tau:.3f})")
 
+    # ========================================================================
+    # 计算完整的先验标准差（用于后续评估）
+    # ========================================================================
+
+    from inference import SparseFactor, compute_posterior_variance_diagonal
+
+    factor_pr = SparseFactor(Q_pr)
+    var_pr = compute_posterior_variance_diagonal(factor_pr, indices=None)
+    sigma_pr = np.sqrt(np.maximum(var_pr, 1e-12))
+
+    # 可选：获取域缩放因子
+    if hasattr(cfg, 'economics') and cfg.economics is not None:
+        scale_factor = cfg.get_domain_scale_factor(verbose=not args.quiet)
+    else:
+        scale_factor = 1.0
+
+    # ========================================================================
     # 生成真实状态和传感器
+    # ========================================================================
+
     x_true = sample_gmrf(Q_pr, mu_pr, rng)
     np.save(output_dir / 'x_true.npy', x_true)
 
     sensors = generate_sensor_pool(geom, cfg.sensors, rng)
 
+    if not args.quiet:
+        print(f"  Generated {len(sensors)} heterogeneous sensors:")
+
+        # 传感器类型统计
+        type_counts = {}
+        for s in sensors:
+            type_counts[s.type_name] = type_counts.get(s.type_name, 0) + 1
+
+        print(f"    Type distribution:")
+        for stype, count in sorted(type_counts.items()):
+            print(f"      {stype}: {count} ({count / len(sensors) * 100:.1f}%)")
+
+        costs = [s.cost for s in sensors]
+        noises = [s.noise_var ** 0.5 for s in sensors]
+        print(f"    Cost range: £{min(costs):.0f} - £{max(costs):.0f}")
+        print(f"    Noise std range: {min(noises):.3f} - {max(noises):.3f}")
+
     # 全局测试集
     n_test = min(200, geom.n)
     test_idx_global = rng.choice(geom.n, size=n_test, replace=False)
 
+    # ========================================================================
     # 运行方法评估
+    # ========================================================================
+
     if not args.quiet:
         print(f"\n🚀 Running methods: {', '.join(cfg.selection.methods)}")
 
@@ -1042,9 +1219,15 @@ def run_single_experiment(cfg, args, exp_index=None, total_experiments=None):
         except Exception as e:
             if not args.quiet:
                 print(f"❌ {method_name} failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
             continue
 
+    # ========================================================================
     # 保存结果
+    # ========================================================================
+
+    import pickle
     with open(output_dir / 'results_raw.pkl', 'wb') as f:
         pickle.dump(all_results, f)
 
@@ -1060,7 +1243,10 @@ def run_single_experiment(cfg, args, exp_index=None, total_experiments=None):
             print(f"⚠️ DataFrame conversion failed: {e}")
         df_results = pd.DataFrame()
 
+    # ========================================================================
     # 可视化
+    # ========================================================================
+
     if not args.skip_viz and not df_results.empty:
         if not args.quiet:
             print(f"\n📊 Generating visualizations...")
@@ -1083,7 +1269,10 @@ def run_single_experiment(cfg, args, exp_index=None, total_experiments=None):
             if not args.quiet:
                 print(f"❌ Visualization failed: {str(e)}")
 
+    # ========================================================================
     # 实验总结
+    # ========================================================================
+
     total_elapsed = (datetime.now() - t_start).total_seconds()
     if not args.quiet:
         print(f"\n{exp_prefix}✅ Experiment completed in {total_elapsed:.1f}s")
@@ -1094,9 +1283,11 @@ def run_single_experiment(cfg, args, exp_index=None, total_experiments=None):
         'output_dir': output_dir,
         'results': all_results,
         'elapsed_time': total_elapsed,
-        'success': len(all_results) > 0
+        'success': len(all_results) > 0,
+        'threshold': tau,
+        'prior_stats': mu_stats,
+        'domain_scale_factor': scale_factor
     }
-
 
 # ============================================================================
 # 主函数

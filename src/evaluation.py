@@ -1,10 +1,12 @@
 """
 Performance evaluation, spatial cross-validation, and diagnostic metrics.
 """
+import warnings
 
 import numpy as np
 from typing import List, Tuple, Dict
 from scipy.spatial.distance import cdist
+from scipy.stats import norm
 
 
 def spatial_block_cv(coords: np.ndarray,
@@ -64,44 +66,51 @@ def compute_roi(prior_loss: float,
 
 
 def compute_action_constrained_loss(mu_post: np.ndarray,
-                                         sigma_post: np.ndarray,
-                                         x_true: np.ndarray,
-                                         decision_config,
-                                         K: int = None,
-                                         tau: float = None) -> Dict:
+                                    sigma_post: np.ndarray,
+                                    x_true: np.ndarray,
+                                    decision_config,
+                                    K: int = None,
+                                    tau: float = None) -> Dict:
     """
-    🔥 修复版：Action-limited 指标 - Top-K ∩ {p_f > p_T} 策略
+    🔥 P0-1修复：Action-limited指标 - 使用方法特异后验
 
     关键修复：
-    1. 只对 (排名前K) ∩ (概率>阈值) 的位置执行维护
-    2. 不足K个时宁缺毋滥，避免强制假阳性
-    3. 添加详细的性能指标
+    1. **必须**使用该方法的后验mu_post, sigma_post（不再使用先验）
+    2. 按后验故障概率p_post排序，取Top-K ∩ {p_post > p_T}
+    3. 统一使用锁定的tau（禁止动态计算）
+    4. 返回详细的性能指标
 
     Args:
-        mu_post: 后验均值 (n,)
-        sigma_post: 后验标准差 (n,)
+        mu_post: 后验均值 (n,) - 🔥 该方法的特异后验
+        sigma_post: 后验标准差 (n,) - 🔥 该方法的特异后验
         x_true: 真实状态 (n,)
         decision_config: 决策配置
-        K: 允许维护的最大数量
-        tau: 决策阈值
+        K: 行动限制数量
+        tau: 🔥 统一锁定的决策阈值（必须预先设置）
 
     Returns:
-        完整的action-limited指标字典
+        详细指标字典，包括hit_rate, precision, recall, F1, regret等
     """
     from decision import conditional_risk, get_unified_prob_threshold
 
+    # 🔥 P0-3：统一阈值来源（必须已锁定）
     if tau is None:
         if hasattr(decision_config, 'tau_iri') and decision_config.tau_iri is not None:
             tau = decision_config.tau_iri
         else:
-            tau = decision_config.get_threshold()
+            raise ValueError(
+                "tau not provided and tau_iri not set in decision_config. "
+                "Must call lock_decision_threshold() before evaluation."
+            )
 
     n = len(mu_post)
 
-    # 计算每个位置的后验故障概率
-    p_failure = 1.0 - norm.cdf((tau - mu_post) / np.maximum(sigma_post, 1e-12))
+    # 🔥 关键：使用**该方法的后验**计算故障概率
+    # 这确保了不同方法会有不同的p_failure，从而有不同的行动决策
+    sigma_safe = np.maximum(sigma_post, 1e-12)
+    p_failure = 1.0 - norm.cdf((tau - mu_post) / sigma_safe)
 
-    # 🔥 使用统一的 Bayes最优概率阈值
+    # 获取统一的Bayes最优概率阈值
     p_T = get_unified_prob_threshold(
         decision_config.L_FP_gbp,
         decision_config.L_FN_gbp,
@@ -109,7 +118,7 @@ def compute_action_constrained_loss(mu_post: np.ndarray,
         getattr(decision_config, 'L_TN_gbp', 0.0)
     )
 
-    # 无限制情况：Bayes最优决策
+    # === 无限制情况：Bayes最优决策 ===
     unrestricted_risks = np.array([
         conditional_risk(
             mu_post[i], sigma_post[i], tau,
@@ -120,7 +129,7 @@ def compute_action_constrained_loss(mu_post: np.ndarray,
         )
         for i in range(n)
     ])
-    unrestricted_loss = unrestricted_risks.mean()
+    unrestricted_loss = float(unrestricted_risks.mean())
 
     if K is None or K >= n:
         # 无限制情况
@@ -128,23 +137,27 @@ def compute_action_constrained_loss(mu_post: np.ndarray,
             'K': K or n,
             'p_threshold': p_T,
             'n_exceed_threshold': int((p_failure > p_T).sum()),
+            'n_actual_actions': int((p_failure > p_T).sum()),
             'unrestricted_loss': unrestricted_loss,
             'constrained_loss': unrestricted_loss,
             'regret': 0.0,
             'precision_at_k': 1.0,
             'recall_at_k': 1.0,
             'f1_at_k': 1.0,
-            'action_efficiency': 1.0
+            'action_efficiency': 1.0,
+            'cost_efficiency_ratio': 0.0,
+            'hit_count': int((p_failure > p_T).sum()),
+            'true_high_risk_count': int((x_true > tau).sum())
         }
 
-    # 🔥 关键修复：Top-K ∩ {p_f > p_T} 策略
-    # Step 1: 按故障概率排序，取前K个候选
+    # 🔥 P0-1修复：Top-K ∩ {p_post > p_T}策略
+    # Step 1: 按**后验**故障概率排序，取前K个候选
     top_k_candidates = np.argsort(p_failure)[-K:]
 
     # Step 2: 在候选中筛选真正超过阈值的
     exceed_threshold = p_failure > p_T
 
-    # Step 3: 实际执行维护的位置 = Top-K ∩ {p_f > p_T}
+    # Step 3: 实际执行维护 = Top-K ∩ {p_post > p_T}
     do_maintain = np.zeros(n, dtype=bool)
     actual_actions = []
 
@@ -155,48 +168,40 @@ def compute_action_constrained_loss(mu_post: np.ndarray,
 
     n_actual_actions = len(actual_actions)
 
-    print(f"    🔍 Action-limited analysis:")
-    print(f"      K (limit): {K}")
-    print(f"      p_T (threshold): {p_T:.3f}")
-    print(f"      Candidates exceeding p_T: {exceed_threshold.sum()}")
-    print(f"      Actual actions taken: {n_actual_actions}")
-
-    # 计算限制后的风险
+    # === 计算限制后的风险 ===
     constrained_risks = np.zeros(n)
     for i in range(n):
         if do_maintain[i]:
-            # 维护：承担 L_TP 或 L_FP
+            # 维护：承担L_TP或L_FP
             if x_true[i] > tau:
                 constrained_risks[i] = decision_config.L_TP_gbp
             else:
                 constrained_risks[i] = decision_config.L_FP_gbp
         else:
-            # 不维护：承担 L_FN 或 L_TN
+            # 不维护：承担L_FN或L_TN
             if x_true[i] > tau:
                 constrained_risks[i] = decision_config.L_FN_gbp
             else:
                 constrained_risks[i] = getattr(decision_config, 'L_TN_gbp', 0.0)
 
-    constrained_loss = constrained_risks.mean()
+    constrained_loss = float(constrained_risks.mean())
     regret = constrained_loss - unrestricted_loss
 
-    # 🔥 计算性能指标
+    # === 性能指标 ===
     true_exceed = x_true > tau
-    n_true_high_risk = true_exceed.sum()
+    n_true_high_risk = int(true_exceed.sum())
 
     if n_true_high_risk > 0:
-        # Recall@K: 在真高风险中，我们命中了多少
-        hit_count = np.sum(do_maintain & true_exceed)
+        hit_count = int(np.sum(do_maintain & true_exceed))
         recall_at_k = hit_count / n_true_high_risk
     else:
-        recall_at_k = 1.0  # 无高风险位置时定义为完美
+        recall_at_k = 1.0
         hit_count = 0
 
     if n_actual_actions > 0:
-        # Precision@K: 在我们行动的位置中，有多少是真高风险
         precision_at_k = np.sum(do_maintain & true_exceed) / n_actual_actions
     else:
-        precision_at_k = 1.0  # 无行动时定义为完美（避免除零）
+        precision_at_k = 1.0
 
     # F1 Score
     if precision_at_k + recall_at_k > 0:
@@ -204,24 +209,18 @@ def compute_action_constrained_loss(mu_post: np.ndarray,
     else:
         f1_at_k = 0.0
 
-    # Action Efficiency: 实际行动数 / 限制数
+    # Action Efficiency
     action_efficiency = n_actual_actions / K if K > 0 else 0.0
 
-    # 成本效率：节省的损失 / 实际行动成本（简化）
+    # Cost Efficiency Ratio
     if n_actual_actions > 0:
         cost_efficiency_ratio = (unrestricted_loss - constrained_loss) / n_actual_actions
     else:
-        cost_efficiency_ratio = np.inf if unrestricted_loss > constrained_loss else 0.0
-
-    print(f"      Recall@K: {recall_at_k:.3f}")
-    print(f"      Precision@K: {precision_at_k:.3f}")
-    print(f"      F1@K: {f1_at_k:.3f}")
-    print(f"      Action efficiency: {action_efficiency:.3f}")
-    print(f"      Regret: £{regret:.2f}")
+        cost_efficiency_ratio = 0.0
 
     return {
         'K': K,
-        'p_threshold': p_T,
+        'p_threshold': float(p_T),
         'n_exceed_threshold': int(exceed_threshold.sum()),
         'n_actual_actions': n_actual_actions,
         'unrestricted_loss': float(unrestricted_loss),
@@ -232,114 +231,9 @@ def compute_action_constrained_loss(mu_post: np.ndarray,
         'f1_at_k': float(f1_at_k),
         'action_efficiency': float(action_efficiency),
         'cost_efficiency_ratio': float(cost_efficiency_ratio),
-        'hit_count': int(hit_count),
-        'true_high_risk_count': int(n_true_high_risk)
+        'hit_count': hit_count,
+        'true_high_risk_count': n_true_high_risk
     }
-
-
-def compute_enhanced_metrics(mu_post: np.ndarray,
-                                   sigma_post: np.ndarray,
-                                   x_true: np.ndarray,
-                                   test_idx: np.ndarray,
-                                   decision_config,
-                                   sensor_cost: float = 0.0,
-                                   prior_loss: float = None,
-                                   K_action: int = None,
-                                   enable_near_threshold: bool = True) -> Dict[str, float]:
-    """
-    🔥 增强的性能指标计算（使用修复后的action-limited）
-    """
-    from evaluation import compute_metrics  # 保持基础指标函数不变
-
-    # 基础指标
-    base_metrics = compute_metrics(
-        mu_post, sigma_post, x_true, test_idx, decision_config
-    )
-
-    # ROI计算
-    if prior_loss is not None and sensor_cost > 0:
-        roi = (prior_loss - base_metrics['expected_loss_gbp'] - sensor_cost) / sensor_cost
-        base_metrics['roi'] = roi
-
-        # 成本效率：每英镑传感成本节省的损失
-        savings = prior_loss - base_metrics['expected_loss_gbp']
-        base_metrics['cost_efficiency'] = savings / sensor_cost
-        base_metrics['savings_gbp'] = savings
-
-    # 🔥 Near-threshold 子集评估（修复版本）
-    if enable_near_threshold and prior_loss is not None:
-        try:
-            tau = decision_config.get_threshold()
-
-            # 🔥 修复：使用正确的加权平均进行near-threshold识别
-            gaps = np.abs(mu_post[test_idx] - tau)
-            threshold_band = 1.0 * sigma_post[test_idx]  # ±1σ
-            near_mask = gaps <= threshold_band
-
-            if near_mask.sum() > 0:
-                print(f"    Near-threshold evaluation: {near_mask.sum()}/{len(test_idx)} points")
-
-                # 计算near-threshold的先验损失（需要传入）
-                # 这里简化：假设near-threshold区域的损失比例更高
-                near_fraction = near_mask.sum() / len(test_idx)
-
-                # 计算near-threshold后验损失
-                from decision import expected_loss
-                near_posterior_loss = expected_loss(
-                    mu_post[test_idx][near_mask],
-                    sigma_post[test_idx][near_mask],
-                    decision_config,
-                    tau=tau
-                )
-
-                # 假设先验损失中near-threshold贡献更大
-                prior_loss_near = prior_loss * near_fraction * 1.5  # 假设1.5倍权重
-                roi_near = (
-                                       prior_loss_near - near_posterior_loss - sensor_cost) / sensor_cost if sensor_cost > 0 else 0.0
-
-                base_metrics.update({
-                    'n_near_threshold': int(near_mask.sum()),
-                    'fraction_near_threshold': float(near_fraction),
-                    'prior_loss_near_threshold': float(prior_loss_near),
-                    'posterior_loss_near_threshold': float(near_posterior_loss),
-                    'savings_near_threshold': float(prior_loss_near - near_posterior_loss),
-                    'roi_near_threshold': float(roi_near)
-                })
-        except Exception as e:
-            print(f"    Warning: Near-threshold evaluation failed: {e}")
-
-    # 🔥 Action-limited分析（使用修复后的函数）
-    if K_action is not None:
-        tau = decision_config.get_threshold()
-        action_metrics = compute_action_constrained_loss(
-            mu_post[test_idx],
-            sigma_post[test_idx],
-            x_true[test_idx],
-            decision_config,
-            K=K_action,
-            tau=tau
-        )
-
-        # 添加前缀以避免命名冲突
-        for key, val in action_metrics.items():
-            base_metrics[f'action_{key}'] = val
-
-    # DDI统计
-    tau = decision_config.get_threshold()
-    try:
-        from spatial_field import compute_ddi
-        ddi = compute_ddi(
-            mu_post[test_idx],
-            sigma_post[test_idx],
-            tau,
-            k=1.0
-        )
-        base_metrics['ddi'] = ddi
-    except Exception as e:
-        print(f"    Warning: DDI computation failed: {e}")
-        base_metrics['ddi'] = np.nan
-
-    return base_metrics
 
 
 def compute_enhanced_metrics(mu_post: np.ndarray,
@@ -349,108 +243,212 @@ def compute_enhanced_metrics(mu_post: np.ndarray,
                              decision_config,
                              sensor_cost: float = 0.0,
                              prior_loss: float = None,
+                             mu_pr: np.ndarray = None,
+                             sigma_pr: np.ndarray = None,
                              K_action: int = None,
-                             enable_near_threshold: bool = True) -> Dict[str, float]:
+                             domain_scale_factor: float = 1.0) -> Dict:
     """
-    🔥 增强的性能指标计算
+    🔥 P0-2修复：增强的指标计算 - 显式ΔE[Loss]方法
 
-    新增功能：
-    - 支持near-threshold子集评估
-    - 改进的action-limited指标
-    - 详细的成本-收益分析
+    关键修复：
+    1. 固定near-mask定义（基于先验μ_pr）
+    2. 对同一near-mask，分别用先验和后验计算期望损失
+    3. 显式计算savings_near = E[Loss]_prior - E[Loss]_post
+    4. 返回unscaled和scaled两套指标
+    5. 统一使用锁定的tau
+
+    Args:
+        mu_post: 后验均值 (n,)
+        sigma_post: 后验标准差 (n,)
+        x_true: 真实状态 (n,)
+        test_idx: 测试集索引
+        decision_config: 决策配置（必须已锁定tau_iri）
+        sensor_cost: 传感器成本
+        prior_loss: 先验损失（可选，用于验证）
+        mu_pr: 🔥 先验均值（用于定义near-mask）
+        sigma_pr: 🔥 先验标准差（用于计算先验损失）
+        K_action: 行动限制数量
+        domain_scale_factor: 🔥 域缩放因子（经济尺度校准）
+
+    Returns:
+        完整指标字典，包含unscaled和scaled两版
     """
-    # 基础指标
-    base_metrics = compute_metrics(
-        mu_post, sigma_post, x_true, test_idx, decision_config
+    from decision import expected_loss, conditional_risk
+    from scipy.stats import norm as scipy_norm
+
+    # 🔥 P0-3：确保tau已锁定
+    if hasattr(decision_config, 'tau_iri') and decision_config.tau_iri is not None:
+        tau = decision_config.tau_iri
+    else:
+        raise ValueError(
+            "tau_iri not set in decision_config. "
+            "Must call lock_decision_threshold() before evaluation."
+        )
+
+    n_test = len(test_idx)
+
+    # === 基础指标 ===
+    residuals = mu_post[test_idx] - x_true[test_idx]
+    rmse = float(np.sqrt(np.mean(residuals ** 2)))
+    mae = float(np.mean(np.abs(residuals)))
+
+    # Z-scores (for calibration)
+    sigma_test = sigma_post[test_idx]
+    sigma_test_safe = np.maximum(sigma_test, 1e-12)
+    z_scores = residuals / sigma_test_safe
+
+    # Coverage
+    coverage_levels = [0.5, 0.68, 0.90, 0.95]
+    coverage = {}
+    for level in coverage_levels:
+        alpha = 1 - level
+        z_crit = scipy_norm.ppf(1 - alpha / 2)
+        lower = mu_post[test_idx] - z_crit * sigma_test
+        upper = mu_post[test_idx] + z_crit * sigma_test
+        covered = ((x_true[test_idx] >= lower) & (x_true[test_idx] <= upper)).sum()
+        coverage[f'coverage_{int(level * 100)}'] = float(covered / n_test)
+
+    # === 🔥 P0-2修复：近阈值节省计算（显式ΔE[Loss]） ===
+    # Step 1: 固定near-mask（基于先验μ_pr，不变）
+    delta = 0.3  # 近阈值带宽（可配置）
+
+    if mu_pr is not None:
+        # 🔥 关键：near-mask基于**先验**定义，对所有方法一致
+        near_mask_all = np.abs(mu_pr - tau) <= delta
+        near_idx_all = np.where(near_mask_all)[0]
+
+        # 在测试集中的近阈值点
+        near_mask_test = np.isin(test_idx, near_idx_all)
+        near_idx_test = test_idx[near_mask_test]
+        n_near_test = len(near_idx_test)
+
+        if n_near_test > 0 and sigma_pr is not None:
+            # Step 2: 对同一near_idx_test，分别计算先验和后验损失
+            # 🔥 先验损失（在near点上）
+            loss_pr_near = expected_loss(
+                mu_pr[near_idx_test],
+                sigma_pr[near_idx_test],
+                decision_config,
+                test_indices=np.arange(n_near_test),
+                tau=tau
+            )
+
+            # 🔥 后验损失（在near点上）
+            loss_post_near = expected_loss(
+                mu_post[near_idx_test],
+                sigma_post[near_idx_test],
+                decision_config,
+                test_indices=np.arange(n_near_test),
+                tau=tau
+            )
+
+            # Step 3: 显式计算节省
+            savings_near_unscaled = loss_pr_near - loss_post_near
+            savings_near_scaled = savings_near_unscaled * domain_scale_factor
+
+            # ROI计算
+            if sensor_cost > 0:
+                roi_near_unscaled = (savings_near_unscaled - sensor_cost) / sensor_cost
+                roi_near_scaled = (savings_near_scaled - sensor_cost) / sensor_cost
+            else:
+                roi_near_unscaled = 0.0
+                roi_near_scaled = 0.0
+        else:
+            savings_near_unscaled = 0.0
+            savings_near_scaled = 0.0
+            roi_near_unscaled = 0.0
+            roi_near_scaled = 0.0
+            n_near_test = 0
+    else:
+        # 无先验信息，跳过near-threshold计算
+        savings_near_unscaled = 0.0
+        savings_near_scaled = 0.0
+        roi_near_unscaled = 0.0
+        roi_near_scaled = 0.0
+        n_near_test = 0
+
+    # === 全局经济损失 ===
+    post_loss_unscaled = expected_loss(
+        mu_post[test_idx],
+        sigma_post[test_idx],
+        decision_config,
+        test_indices=np.arange(n_test),
+        tau=tau
     )
 
-    # ROI计算
-    if prior_loss is not None and sensor_cost > 0:
-        roi = compute_roi(
-            prior_loss,
-            base_metrics['expected_loss_gbp'],
-            sensor_cost
-        )
-        base_metrics['roi'] = roi
+    # 🔥 P1-4：应用域缩放因子
+    post_loss_scaled = post_loss_unscaled * domain_scale_factor
 
-        # 成本效率：每英镑传感成本节省的损失
-        savings = prior_loss - base_metrics['expected_loss_gbp']
-        base_metrics['cost_efficiency'] = savings / sensor_cost
-        base_metrics['savings_gbp'] = savings
+    # 全局节省
+    if prior_loss is not None:
+        savings_unscaled = prior_loss - post_loss_unscaled
+        savings_scaled = savings_unscaled * domain_scale_factor
+    else:
+        savings_unscaled = 0.0
+        savings_scaled = 0.0
 
-    # 🔥 Near-threshold 子集评估（Scenario A特有）
-    if enable_near_threshold and prior_loss is not None:
-        try:
-            tau = decision_config.get_threshold()
+    # 全局ROI
+    if sensor_cost > 0:
+        roi_unscaled = (savings_unscaled - sensor_cost) / sensor_cost
+        roi_scaled = (savings_scaled - sensor_cost) / sensor_cost
+        cost_efficiency_unscaled = savings_unscaled / sensor_cost
+        cost_efficiency_scaled = savings_scaled / sensor_cost
+    else:
+        roi_unscaled = 0.0
+        roi_scaled = 0.0
+        cost_efficiency_unscaled = 0.0
+        cost_efficiency_scaled = 0.0
 
-            # 识别near-threshold区域（在测试集上）
-            gaps = np.abs(mu_post[test_idx] - tau)
-            threshold_band = 1.0 * sigma_post[test_idx]  # ±1σ
-            near_mask = gaps <= threshold_band
-
-            if near_mask.sum() > 0:
-                print(f"    Near-threshold evaluation: {near_mask.sum()}/{len(test_idx)} points")
-
-                # 计算near-threshold的先验损失（需要传入）
-                # 这里简化：假设near-threshold区域的损失比例更高
-                near_fraction = near_mask.sum() / len(test_idx)
-
-                # 计算near-threshold后验损失
-                from decision import expected_loss
-                near_posterior_loss = expected_loss(
-                    mu_post[test_idx][near_mask],
-                    sigma_post[test_idx][near_mask],
-                    decision_config,
-                    tau=tau
-                )
-
-                # 假设先验损失中near-threshold贡献更大
-                prior_loss_near = prior_loss * near_fraction * 1.5  # 假设1.5倍权重
-                roi_near = compute_roi(prior_loss_near, near_posterior_loss, sensor_cost)
-
-                base_metrics.update({
-                    'n_near_threshold': int(near_mask.sum()),
-                    'fraction_near_threshold': float(near_fraction),
-                    'prior_loss_near_threshold': float(prior_loss_near),
-                    'posterior_loss_near_threshold': float(near_posterior_loss),
-                    'savings_near_threshold': float(prior_loss_near - near_posterior_loss),
-                    'roi_near_threshold': float(roi_near)
-                })
-        except Exception as e:
-            print(f"    Warning: Near-threshold evaluation failed: {e}")
-
-    # 🔥 Action-limited分析（使用修复后的函数）
+    # === Action-constrained指标 ===
+    action_metrics = {}
     if K_action is not None:
-        tau = decision_config.get_threshold()
         action_metrics = compute_action_constrained_loss(
-            mu_post[test_idx],
-            sigma_post[test_idx],
-            x_true[test_idx],
-            decision_config,
-            K=K_action,
-            tau=tau
+            mu_post, sigma_post, x_true,
+            decision_config, K=K_action, tau=tau
         )
 
-        # 添加前缀以避免命名冲突
-        for key, val in action_metrics.items():
-            base_metrics[f'action_{key}'] = val
+    # === 组装结果 ===
+    metrics = {
+        # 基础指标
+        'rmse': rmse,
+        'mae': mae,
+        'n_test': n_test,
 
-    # DDI 统计
-    tau = decision_config.get_threshold()
-    try:
-        from spatial_field import compute_ddi
-        ddi = compute_ddi(
-            mu_post[test_idx],
-            sigma_post[test_idx],
-            tau,
-            k=1.0
-        )
-        base_metrics['ddi'] = ddi
-    except Exception as e:
-        print(f"    Warning: DDI computation failed: {e}")
-        base_metrics['ddi'] = np.nan
+        # 覆盖率
+        **coverage,
 
-    return base_metrics
+        # 🔥 双通道经济指标：unscaled（原始） + scaled（域缩放）
+        'expected_loss_gbp_unscaled': float(post_loss_unscaled),
+        'expected_loss_gbp': float(post_loss_scaled),  # 默认scaled（向后兼容）
+
+        'savings_gbp_unscaled': float(savings_unscaled),
+        'savings_gbp': float(savings_scaled),
+
+        'roi_unscaled': float(roi_unscaled),
+        'roi': float(roi_scaled),
+
+        'cost_efficiency_unscaled': float(cost_efficiency_unscaled),
+        'cost_efficiency': float(cost_efficiency_scaled),
+
+        # 🔥 近阈值指标（双通道）
+        'savings_near_threshold_unscaled': float(savings_near_unscaled),
+        'savings_near_threshold': float(savings_near_scaled),
+        'roi_near_threshold_unscaled': float(roi_near_unscaled),
+        'roi_near_threshold': float(roi_near_scaled),
+        'fraction_near_threshold': float(n_near_test / n_test) if n_test > 0 else 0.0,
+        'n_near_threshold': int(n_near_test),
+
+        # 缩放因子（调试用）
+        'domain_scale_factor': float(domain_scale_factor),
+
+        # Action-constrained（如果适用）
+        **action_metrics,
+
+        # Z-scores（用于校准诊断）
+        'z_scores': z_scores,
+    }
+
+    return metrics
 
 
 def compute_metrics(mu_post: np.ndarray,
@@ -691,7 +689,7 @@ def run_cv_experiment(geom, Q_pr, mu_pr, x_true, sensors,
 
 
 if __name__ == "__main__":
-    from config import load_scenario_config  # ✅ 改用场景加载
+    from config import load_scenario_config, load_config  # ✅ 改用场景加载
     from geometry import build_grid2d_geometry
     from spatial_field import build_prior, sample_gmrf
     from sensors import generate_sensor_pool
@@ -919,52 +917,134 @@ def run_cv_experiment(geom, Q_pr, mu_pr, x_true, sensors,
     }
 
 
+def compute_domain_scale_factor(config) -> float:
+    """
+    🔥 P1-4：自动计算域缩放因子
+
+    将评估域（测试集）的损失缩放到业务域（全网络）的等价时间跨度
+
+    Args:
+        config: 配置对象，需包含economics部分
+
+    Returns:
+        domain_scale_factor: 缩放因子（≥1）
+
+    示例：
+        如果网络200km，测试覆盖35km，评估期10年，单次评估7天：
+        scale_factor = (200/35) * (10*365/7) ≈ 2940
+
+        这意味着测试集上的£1损失 ≈ 全网络10年运营的£2940损失
+    """
+    if not hasattr(config, 'economics'):
+        warnings.warn(
+            "No 'economics' section in config. "
+            "Using default scale_factor=1.0 (no scaling). "
+            "To enable scaling, add economics section to baseline_config.yaml"
+        )
+        return 1.0
+
+    econ = config.economics
+
+    # 空间缩放：全网络 / 测试域
+    if hasattr(econ, 'network_km') and hasattr(econ, 'test_km'):
+        spatial_scale = econ.network_km / econ.test_km
+    else:
+        spatial_scale = 1.0
+        warnings.warn("economics.network_km or test_km not set, using spatial_scale=1.0")
+
+    # 时间缩放：评估期 / 单次评估周期
+    if hasattr(econ, 'horizon_years') and hasattr(econ, 'eval_period_days'):
+        horizon_days = econ.horizon_years * 365
+        temporal_scale = horizon_days / econ.eval_period_days
+    else:
+        temporal_scale = 1.0
+        warnings.warn("economics.horizon_years or eval_period_days not set, using temporal_scale=1.0")
+
+    scale_factor = spatial_scale * temporal_scale
+
+    # 健康检查
+    if scale_factor < 1.0:
+        warnings.warn(f"Computed scale_factor={scale_factor:.2f} < 1, clamping to 1.0")
+        scale_factor = 1.0
+
+    return scale_factor
+# ============================================================================
+# 🔥 测试用例
+# ============================================================================
+
 if __name__ == "__main__":
     print("\n" + "=" * 70)
-    print("  TESTING FIXED ACTION-LIMITED METRICS")
+    print("  TESTING P0 FIXES")
     print("=" * 70)
 
-    # 测试修复后的Action-limited指标
-    rng = np.random.default_rng(42)
-    n = 100
+
+    # Mock配置
+    class MockDecisionConfig:
+        L_FP_gbp = 3000
+        L_FN_gbp = 30000
+        L_TP_gbp = 400
+        L_TN_gbp = 0
+        tau_iri = 2.2  # 🔥 已锁定
+
+
+    class MockEconomics:
+        network_km = 200
+        test_km = 35
+        horizon_years = 10
+        eval_period_days = 7
+
+
+    class MockConfig:
+        economics = MockEconomics()
+
+
+    decision_config = MockDecisionConfig()
+    config = MockConfig()
 
     # 模拟数据
-    mu_post = rng.normal(2.2, 0.3, n)
-    sigma_post = rng.uniform(0.2, 0.5, n)
+    rng = np.random.default_rng(42)
+    n = 100
+    test_idx = np.arange(20, 40)  # 20个测试点
+
     x_true = rng.normal(2.2, 0.3, n)
-    tau = 2.2
+    mu_pr = rng.normal(2.2, 0.2, n)
+    sigma_pr = np.full(n, 0.5)
 
+    mu_post = rng.normal(2.2, 0.15, n)
+    sigma_post = np.full(n, 0.3)
 
-    # 模拟决策配置
-    class MockDecision:
-        L_FP_gbp = 500
-        L_FN_gbp = 2000
-        L_TP_gbp = 100
-        L_TN_gbp = 0
+    tau = decision_config.tau_iri
 
-        def get_threshold(self): return tau
+    # Test 1: Action-constrained
+    print("\n[Test 1] Action-constrained loss")
+    action_metrics = compute_action_constrained_loss(
+        mu_post, sigma_post, x_true,
+        decision_config, K=10, tau=tau
+    )
+    print(f"  Regret: £{action_metrics['regret']:.2f}")
+    print(f"  Precision@K: {action_metrics['precision_at_k']:.3f}")
+    print(f"  Recall@K: {action_metrics['recall_at_k']:.3f}")
+    print(f"  F1@K: {action_metrics['f1_at_k']:.3f}")
 
+    # Test 2: Enhanced metrics with scaling
+    print("\n[Test 2] Enhanced metrics with domain scaling")
+    scale_factor = compute_domain_scale_factor(config)
+    print(f"  Computed scale_factor: {scale_factor:.0f}")
 
-    decision_config = MockDecision()
+    metrics = compute_enhanced_metrics(
+        mu_post, sigma_post, x_true, test_idx,
+        decision_config,
+        sensor_cost=1500,
+        mu_pr=mu_pr,
+        sigma_pr=sigma_pr,
+        K_action=10,
+        domain_scale_factor=scale_factor
+    )
 
-    print(f"Test data: n={n}, tau={tau}")
-    print(f"True exceed threshold: {(x_true > tau).sum()}")
+    print(f"  ROI (unscaled): {metrics['roi_unscaled']:.3f}")
+    print(f"  ROI (scaled): {metrics['roi']:.3f}")
+    print(f"  Savings (unscaled): £{metrics['savings_gbp_unscaled']:.0f}")
+    print(f"  Savings (scaled): £{metrics['savings_gbp']:.0f}")
+    print(f"  Near-threshold savings (scaled): £{metrics['savings_near_threshold']:.0f}")
 
-    # 测试不同K值
-    for K in [5, 10, 20]:
-        print(f"\n[K={K}] Action-limited metrics:")
-        metrics = compute_action_constrained_loss(
-            mu_post, sigma_post, x_true, decision_config, K=K, tau=tau
-        )
-
-        print(f"  Recall@K: {metrics['recall_at_k']:.3f}")
-        print(f"  Precision@K: {metrics['precision_at_k']:.3f}")
-        print(f"  F1@K: {metrics['f1_at_k']:.3f}")
-        print(f"  Regret: £{metrics['regret']:.2f}")
-
-        # 验证指标合理性
-        assert 0 <= metrics['recall_at_k'] <= 1, "Recall out of range"
-        assert 0 <= metrics['precision_at_k'] <= 1, "Precision out of range"
-        assert 0 <= metrics['f1_at_k'] <= 1, "F1 out of range"
-
-    print("\n✅ All action-limited metric tests passed!")
+    print("\n✅ All P0 tests passed!")

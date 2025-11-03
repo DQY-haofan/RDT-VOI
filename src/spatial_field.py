@@ -15,11 +15,11 @@ prior:
   beta_hot: 1.0e-6   # 热点 nugget（热点区域）
   hotspots:
     - center_m: [60, 60]
-      radius_m: 40
+      radius: 40
     - center_m: [140, 60]
-      radius_m: 30
+      radius: 30
     - center_m: [100, 140]
-      radius_m: 35
+      radius: 35
 """
 
 import numpy as np
@@ -586,8 +586,8 @@ def apply_nodewise_nugget(geom, prior_config) -> sp.spmatrix:
         xy = geom.coords
 
         for hs in prior_config.hotspots:
-            center = np.array(hs['center_m'], dtype=float)
-            radius = float(hs['radius_m'])
+            center = np.array(hs['center'], dtype=float)
+            radius = float(hs['radius'])
 
             distances_sq = np.sum((xy - center)**2, axis=1)
             mask = distances_sq <= radius**2

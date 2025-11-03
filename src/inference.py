@@ -281,11 +281,21 @@ def compute_posterior(Q_pr: sp.spmatrix,
     return mu_post, factor
 
 
-def compute_posterior_variance_diagonal(factor: SparseFactor,
-                                       indices: np.ndarray = None,
-                                       batch_size: int = 100) -> np.ndarray:
+def compute_posterior_variance_diagonal(factor,
+                                        indices: np.ndarray = None,
+                                        batch_size: int = 100) -> np.ndarray:
     """
     批量计算对角方差（加速版）
+
+    🔥 P0-4修复：统一添加非负钳位保护
+
+    Args:
+        factor: SparseFactor对象
+        indices: 需要计算方差的索引（None=全部）
+        batch_size: 批处理大小
+
+    Returns:
+        var_diag: 对角方差数组（已钳位到>=1e-12）
     """
     n = factor.n
     if indices is None:
@@ -311,6 +321,9 @@ def compute_posterior_variance_diagonal(factor: SparseFactor,
         for i, idx in enumerate(batch_indices):
             var_diag[batch_start + i] = Z_batch[idx, i]
 
+    # 🔥 P0-4修复：统一添加非负钳位
+    var_diag = np.maximum(var_diag, 1e-12)
+
     return var_diag
 
 
@@ -327,3 +340,5 @@ def compute_mutual_information(Q_pr: sp.spmatrix,
 
     mi = 0.5 * (factor_post.logdet() - factor_pr.logdet())
     return mi
+
+

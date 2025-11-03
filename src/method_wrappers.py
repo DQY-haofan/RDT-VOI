@@ -13,45 +13,6 @@ import scipy.sparse as sp
 # 🔥 修复：使用顶层类替代嵌套函数（支持 pickle）
 # ============================================================================
 
-class GreedyMIWrapper:
-    """Greedy MI selection wrapper (pickle-safe)"""
-
-    def __init__(self, config):
-        self.config = config
-        self.batch_size = 64
-        self.lazy = True
-        self.use_cost = True  # 🔥 新增
-        self.keep_fraction = None  # ✅ 改为 None（让 selection.py 自动计算）
-
-        if hasattr(config.selection, 'greedy_mi'):
-            mi_cfg = config.selection.greedy_mi
-            self.batch_size = mi_cfg.get('batch_size', 64)
-            self.use_cost = mi_cfg.get('use_cost', True)
-
-            # ✅ 修复：显式检查 None
-            keep_frac_raw = mi_cfg.get('keep_fraction')
-            if keep_frac_raw is not None:
-                self.keep_fraction = keep_frac_raw
-            # 否则保持 None，让 selection.py 动态计算
-
-    def __call__(self, sensors, k, Q_pr, mu_pr=None):
-        from selection import greedy_mi
-
-        n_sensors = len(sensors)
-        costs = np.array([s.cost for s in sensors], dtype=float)
-        assert len(costs) == n_sensors
-
-        return greedy_mi(
-            sensors=sensors,
-            k=k,
-            Q_pr=Q_pr,
-            costs=costs,
-            lazy=self.lazy,
-            batch_size=self.batch_size,
-            use_cost=self.use_cost,  # 🔥 新增
-            keep_fraction=self.keep_fraction  # 🔥 新增
-        )
-
 class GreedyAoptWrapper:
     """Greedy A-optimal wrapper (pickle-safe)"""
 
@@ -72,13 +33,54 @@ class GreedyAoptWrapper:
         costs = np.array([s.cost for s in sensors], dtype=float)
         assert len(costs) == n_sensors
 
+        # 🔥 P0-3修复：传递rng
+        rng = self.config.get_rng()
+
         return greedy_aopt(
             sensors=sensors,
             k=k,
             Q_pr=Q_pr,
             costs=costs,
             n_probes=self.n_probes,
-            use_cost=self.use_cost
+            use_cost=self.use_cost,
+            rng=rng  # 🔥 新增参数
+        )
+
+class GreedyMIWrapper:
+    """Greedy MI selection wrapper (pickle-safe)"""
+
+    def __init__(self, config):
+        self.config = config
+        self.batch_size = 64
+        self.lazy = True
+        self.use_cost = True
+        self.keep_fraction = None
+
+        if hasattr(config.selection, 'greedy_mi'):
+            mi_cfg = config.selection.greedy_mi
+            self.batch_size = mi_cfg.get('batch_size', 64)
+            self.use_cost = mi_cfg.get('use_cost', True)
+
+            keep_frac_raw = mi_cfg.get('keep_fraction')
+            if keep_frac_raw is not None:
+                self.keep_fraction = keep_frac_raw
+
+    def __call__(self, sensors, k, Q_pr, mu_pr=None):
+        from selection import greedy_mi
+
+        n_sensors = len(sensors)
+        costs = np.array([s.cost for s in sensors], dtype=float)
+        assert len(costs) == n_sensors
+
+        return greedy_mi(
+            sensors=sensors,
+            k=k,
+            Q_pr=Q_pr,
+            costs=costs,
+            lazy=self.lazy,
+            batch_size=self.batch_size,
+            use_cost=self.use_cost,
+            keep_fraction=self.keep_fraction
         )
 
 
@@ -91,11 +93,10 @@ class GreedyEVIWrapper:
         self.x_true = x_true
         self.test_idx = test_idx
 
-        # EVI 参数
         self.n_y_samples = 0
         self.use_cost = True
         self.mi_prescreen = True
-        self.keep_fraction = None  # ✅ 改为 None（让 selection.py 自动计算）
+        self.keep_fraction = None
 
         if hasattr(config.selection, 'greedy_evi'):
             evi_cfg = config.selection.greedy_evi
@@ -103,11 +104,9 @@ class GreedyEVIWrapper:
             self.use_cost = evi_cfg.get('use_cost', True)
             self.mi_prescreen = evi_cfg.get('mi_prescreen', True)
 
-            # ✅ 修复：显式检查 None
             keep_frac_raw = evi_cfg.get('keep_fraction')
             if keep_frac_raw is not None:
                 self.keep_fraction = keep_frac_raw
-            # 否则保持 None
 
     def __call__(self, sensors, k, Q_pr, mu_pr):
         from selection import greedy_evi_myopic_fast
@@ -116,6 +115,7 @@ class GreedyEVIWrapper:
         costs = np.array([s.cost for s in sensors], dtype=float)
         assert len(costs) == n_sensors
 
+        # ✅ 已经使用config.get_rng()
         rng = self.config.get_rng()
 
         return greedy_evi_myopic_fast(
@@ -129,10 +129,11 @@ class GreedyEVIWrapper:
             n_y_samples=self.n_y_samples,
             use_cost=self.use_cost,
             mi_prescreen=self.mi_prescreen,
-            keep_fraction=self.keep_fraction,  # 现在是 None 或有效值
+            keep_fraction=self.keep_fraction,
             rng=rng,
             verbose=False
         )
+
 
 class MaxminWrapper:
     """Maxmin k-center wrapper (pickle-safe)"""
@@ -171,6 +172,7 @@ class UniformWrapper:
     def __call__(self, sensors, k, Q_pr, mu_pr=None):
         from selection import SelectionResult
 
+        # ✅ 已经使用config.get_rng()
         rng = self.config.get_rng()
         n_sensors = len(sensors)
 
@@ -198,6 +200,7 @@ class RandomWrapper:
     def __call__(self, sensors, k, Q_pr, mu_pr=None):
         from selection import SelectionResult
 
+        # ✅ 已经使用config.get_rng()
         rng = self.config.get_rng()
         n_sensors = len(sensors)
         costs = np.array([s.cost for s in sensors], dtype=float)
@@ -218,7 +221,6 @@ class RandomWrapper:
             total_cost=total_cost,
             method_name="Random"
         )
-
 
 
 # ============================================================================
@@ -328,11 +330,15 @@ def should_use_evi(method_name: str, budget: int, fold_idx: int,
 
 
 def _stratified_test_sampling(geom, Q_pr, config, n_test: int = 300) -> np.ndarray:
-    """分层测试集采样"""
+    """
+    分层测试集采样
+
+    ✅ 已经正确使用config.get_rng()
+    """
     from inference import SparseFactor, compute_posterior_variance_diagonal
 
     n = geom.n
-    rng = config.get_rng()
+    rng = config.get_rng()  # ✅ 正确使用
 
     n_probes = min(16, n // 10)
     if n_probes < 4:
